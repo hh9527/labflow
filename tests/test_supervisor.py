@@ -13,7 +13,7 @@ from labflow.state import SCHEMA, bind_plan, save_state
 from labflow.supervisor import (
     EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
 )
-from labflow.task_cli import pull, refresh_artifact, validate_workflow
+from labflow.task_cli import assign_task, refresh_artifact, task_records, validate_workflow
 from labflow.timeline_projection import closed_message_events
 from labflow.timeline_store import TimelineWriter, read, statistics
 
@@ -53,16 +53,18 @@ class ReducerTest(unittest.TestCase):
             "backend_id": "ses_a1",
         }))
 
-        self.assertEqual([effect.kind for effect in prompted], ["prompt_session"])
+        self.assertEqual([effect.kind for effect in prompted], ["dispatch_task"])
+        self.assertEqual(prompted[0].artifact, "output.a1")
         self.assertEqual(state.executions["plan@1"].requests, ("approval",))
         self.assertEqual(state.executions["plan@1"].optional_requests, ("feedback",))
 
         reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
             "key": prompted[0].key,
-            "effect_kind": "prompt_session",
+            "effect_kind": "dispatch_task",
             "role": "a1",
             "title": "a1",
             "backend_id": "ses_a1",
+            "delivered": True,
         }))
         # OpenCode can briefly remain idle after accepting prompt_async.
         repeated = reduce(state, LifecycleEvent("session_observed", "plan@1", {
@@ -194,8 +196,9 @@ class ReducerTest(unittest.TestCase):
             "title": "a1", "backend_id": "ses_a1",
         }))[0]
         reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
-            "key": prompted.key, "effect_kind": "prompt_session", "role": "a1",
+            "key": prompted.key, "effect_kind": "dispatch_task", "role": "a1",
             "title": "a1", "backend_id": "ses_a1",
+            "delivered": True,
         }))
 
         retried = reduce(state, LifecycleEvent("session_observed", "plan@1", {
@@ -203,7 +206,7 @@ class ReducerTest(unittest.TestCase):
             "status": "idle", "completed_turn": True,
         }))
 
-        self.assertEqual([effect.kind for effect in retried], ["prompt_session"])
+        self.assertEqual([effect.kind for effect in retried], ["dispatch_task"])
         self.assertNotEqual(prompted.key, retried[0].key)
 
 
@@ -690,14 +693,55 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 "a1", parent_id="ses_root", agent="a1",
             )
             client.prompt_session.assert_called_once()
+            prompt = client.prompt_session.call_args.args[1]
+            self.assertIn("目标：完成 artifact `output.a1`", prompt)
+            self.assertIn("任务要求：build", prompt)
+            self.assertIn("`input`：本轮已更新", prompt)
+            self.assertIn("`labflow agent submit a1 output.a1`", prompt)
+            self.assertNotIn('"target"', prompt)
+            active = task_records(workspace)["active"]
+            self.assertEqual(active[0]["artifacts"], ["output.a1"])
             self.assertIn("input", supervisor.state.executions["demo@1"].artifacts)
+
+    def test_failed_prompt_keeps_task_for_supervisor_restart_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            self._dag(root, workspace)
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            client.prompt_session.side_effect = OSError("delivery failed")
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    with self.assertRaisesRegex(OSError, "delivery failed"):
+                        supervisor.step()
+            finally:
+                supervisor.close()
+
+            first = task_records(workspace)["active"][0]
+            client.prompt_session.side_effect = None
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            second = task_records(workspace)["active"][0]
+            self.assertEqual(second["task_id"], first["task_id"])
+            self.assertEqual(client.prompt_session.call_count, 2)
 
     def test_dag_timeline_records_artifact_task_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / "ws" / "demo@1"
             workspace.mkdir(parents=True)
             workflow = self._dag(root, workspace)
-            pull(workspace, workflow, "a1", False, 0)
+            assign_task(workspace, workflow, "a1", "output.a1")
             client = mock.Mock()
             client.statuses.return_value = {"ses_root": {"type": "idle"}}
             client.children.return_value = []

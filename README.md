@@ -17,7 +17,7 @@ protocol are independent of the application, language, and domain under test.
 Labflow has two distinct execution modes:
 
 ```text
-dag-mode      A Supervisor maintains role Sessions; Artifact pressure drives pull/submit work.
+dag-mode      A Supervisor maintains role Sessions and delivers Artifact work through prompts.
 benchmark-mode  A Questioner and Answerer run a fixed, answer-free problem suite.
 ```
 
@@ -163,20 +163,16 @@ Role file permissions are derived from the same graph. The Assets of Artifacts o
 read/write; the Assets of their direct inputs are read-only. A write grant wins when a path occurs
 in both sets. Plans therefore do not maintain separate role `read` or `write` lists.
 
-## Agent Loop
+## Task Delivery
 
-An Agent repeatedly runs:
-
-```bash
-labflow agent pull a1
-labflow agent submit a1 output.a1
-```
-
-A successful pull returns the complete direct input and input Asset sets:
+An Agent does not poll for work. When a role Session is idle and owns a runnable Artifact, the
+Supervisor atomically assigns one Task and sends a text prompt containing the target, its
+instruction, the complete direct input state, changed Assets, and the exact submit command. The
+underlying Task record has this structure:
 
 ```json
 {
-  "target": { "name": "output.a1" },
+  "target": { "name": "output.a1", "instruction": "Produce the first output" },
   "inputs": [
     { "name": "input", "fresh": true },
     { "name": "notes", "fresh": null }
@@ -192,9 +188,11 @@ A successful pull returns the complete direct input and input Asset sets:
 when an optional input does not yet exist. `updated` follows the same Artifact publication boundary
 for Assets. Labflow does not hash Asset contents to infer workflow changes.
 
-When no work becomes available before the bounded timeout, pull returns JSON `null`. The Agent then
-ends its current turn. When new Artifact work becomes runnable, the Supervisor resumes the same
-Session with a fixed instruction to pull again. A busy Session is never interrupted or prompted.
+The Agent completes exactly the delivered Task, runs `labflow agent submit <role> <artifact>`, and
+ends its Turn. It does not claim or wait for another Task. A later runnable Artifact causes another
+Supervisor prompt. A busy Session is never interrupted. Assignment and stale-Task replacement use
+the same lock as Artifact evaluation; failed prompt delivery leaves the active Task available for
+deterministic redelivery.
 
 Host pull distinguishes blocking `requests` from `opt_requests`. A Host Artifact used only through
 optional inputs appears in `opt_requests`; it remains visible but does not wake a waiting Host pull.

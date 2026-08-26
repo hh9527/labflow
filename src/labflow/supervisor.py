@@ -14,9 +14,9 @@ from typing import Any, Iterator
 from .client import Client
 from .config import ControlError, repository_root
 from .events import pending_optional_requests, pending_requests
-from .runtime_opencode import resume_prompt
+from .runtime_opencode import task_prompt
 from .state import atomic_json, load_lab_config, load_state, validate_title
-from .task_cli import task_records, workflow_status
+from .task_cli import TaskError, assign_task, task_records, workflow_status
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
 
@@ -36,6 +36,7 @@ class Effect:
     role: str
     title: str
     backend_id: str | None = None
+    artifact: str | None = None
 
 
 @dataclass
@@ -65,6 +66,7 @@ class ExecutionState:
     active: bool
     dag: bool
     roles: tuple[str, ...]
+    workflow: dict[str, Any] | None = None
     dag_revision: str | None = None
     artifacts: dict[str, int] = field(default_factory=dict)
     runnable: dict[str, tuple[tuple[str, int], ...]] = field(default_factory=dict)
@@ -191,7 +193,8 @@ def _reconcile_role(state: SupervisorState, execution: ExecutionState,
     effect = Effect(
         _effect_key("prompt", execution.title, session.title, runnable,
                     session.idle_epoch),
-        "prompt_session", execution.title, role, session.title, session.backend_id,
+        "dispatch_task", execution.title, role, session.title, session.backend_id,
+        runnable[0][0],
     )
     return [effect] if _requested(state, effect) else []
 
@@ -223,6 +226,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             bool(data.get("active")),
             bool(data.get("dag")),
             tuple(data.get("roles", ())),
+            workflow=data.get("workflow"),
             dag_revision=data.get("dag_revision"),
             artifacts=previous.artifacts if previous else {},
             sessions=previous.sessions if previous else {},
@@ -321,8 +325,8 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             session.observed = False
             session.idle_epoch += 1
             return _reconcile_role(state, execution, role)
-        if event.data.get("effect_kind") == "prompt_session":
-            session.status = "prompted"
+        if event.data.get("effect_kind") == "dispatch_task":
+            session.status = "prompted" if event.data.get("delivered") else "idle"
         return []
     return []
 
@@ -428,6 +432,7 @@ class Supervisor:
             "active": active,
             "dag": (desired / "artifacts").is_dir() and isinstance(workflow, dict),
             "roles": roles,
+            "workflow": workflow,
             "dag_revision": _workflow_revision(workflow),
         })
         return event, value
@@ -664,6 +669,7 @@ class Supervisor:
                             execution.root_session_id)
             try:
                 backend_id = effect.backend_id
+                delivered = True
                 if effect.kind == "create_session":
                     response = client.create_session(
                         effect.title, parent_id=execution.root_session_id,
@@ -672,10 +678,18 @@ class Supervisor:
                     backend_id = response.get("id") if isinstance(response, dict) else None
                     if not isinstance(backend_id, str):
                         raise ControlError("OpenCode returned an invalid Session identity", 69)
-                elif effect.kind == "prompt_session":
-                    if not backend_id:
-                        raise ControlError("prompt effect has no backend Session identity")
-                    client.prompt_session(backend_id, resume_prompt(effect.role), agent=effect.role)
+                elif effect.kind == "dispatch_task":
+                    if not backend_id or not effect.artifact or execution.workflow is None:
+                        raise ControlError("task dispatch effect is incomplete")
+                    task = assign_task(
+                        Path(execution.workspace), execution.workflow,
+                        effect.role, effect.artifact,
+                    )
+                    delivered = task is not None
+                    if task is not None:
+                        client.prompt_session(
+                            backend_id, task_prompt(effect.role, task), agent=effect.role,
+                        )
                 else:
                     raise ControlError(f"unknown Supervisor effect: {effect.kind}")
                 pending.extend(reduce(self.state, LifecycleEvent(
@@ -683,9 +697,10 @@ class Supervisor:
                         "key": effect.key, "effect_kind": effect.kind,
                         "role": effect.role, "title": effect.title,
                         "backend_id": backend_id,
+                        "delivered": delivered,
                     },
                 )))
-            except (ControlError, OSError) as exc:
+            except (ControlError, TaskError, OSError) as exc:
                 reduce(self.state, LifecycleEvent(
                     "effect_failed", effect.execution, {
                         "key": effect.key, "effect_kind": effect.kind,

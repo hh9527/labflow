@@ -53,7 +53,8 @@ from labflow.events import event_detail, project_events
 from labflow.permissions import preflight_permissions
 from labflow.reporting import submit_report
 from labflow.task_cli import (
-    evaluate, load_workflow, refresh_artifact, pull, submit, task_records, validate_workflow,
+    assign_task, evaluate, load_workflow, refresh_artifact, submit, task_records,
+    validate_workflow,
     workflow_status,
 )
 from labflow.watch import WatchWindow, acp_events, message_events, watch_progress
@@ -147,19 +148,12 @@ class ServerTest(unittest.TestCase):
 
 
 class ConfigStateTest(unittest.TestCase):
-    PULL_MESSAGE = [{
-        "info": {"role": "assistant"},
-        "parts": [{"type": "tool", "tool": "bash", "state": {
-            "status": "running", "input": {"command": "labflow agent pull a5"},
-        }}],
-    }]
-
     @staticmethod
     def write_plan(plan: Path) -> None:
         plan.mkdir(parents=True)
         (plan / "roles").mkdir()
         (plan / "host").mkdir()
-        (plan / "roles" / "a1.md").write_text("Keep pulling work.\n", encoding="utf-8")
+        (plan / "roles" / "a1.md").write_text("Complete delivered work.\n", encoding="utf-8")
         (plan / "host" / "secret.md").write_text("hidden\n", encoding="utf-8")
         (plan / "seed.txt").write_text("seed\n", encoding="utf-8")
         (plan / "experiment.json").write_text(json.dumps({
@@ -167,8 +161,8 @@ class ConfigStateTest(unittest.TestCase):
             "workspace": ["seed.txt"],
             "roles": {"a1": {
                 "description": "worker", "instructions": "roles/a1.md",
-                "commands": ["labflow agent pull a1", "labflow agent submit a1 *"],
-                "preflight": ["labflow agent pull a1", "labflow agent submit a1 *"],
+                "commands": ["labflow agent submit a1 *"],
+                "preflight": ["labflow agent submit a1 *"],
             }},
             "assets": [{"source": "tool", "path": "bin/tool", "mode": "0555"}],
             "validation": [], "observe": ["bin"],
@@ -268,7 +262,6 @@ class ConfigStateTest(unittest.TestCase):
             {"ses_a5": {"type": "busy"}},
         ]
         client.create_session.return_value = {"id": "ses_a5_new"}
-        client.session_messages.return_value = self.PULL_MESSAGE
         context = mock.Mock()
         context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
                          "session_id": "ses_coordinator", "execution_base": "demo",
@@ -276,16 +269,16 @@ class ConfigStateTest(unittest.TestCase):
         client.sessions.return_value = []
         context.client.return_value = client
 
-        result = _resume(context, "a5", .01)
+        result = _resume(context, "a5")
         self.assertEqual(result["session_id"], "ses_a5")
-        self.assertTrue(result["loop_observed"])
-        client.prompt_session.assert_called_once()
+        self.assertEqual((result["action"], result["managed_by"]),
+                         ("retained", "supervisor"))
+        client.prompt_session.assert_not_called()
 
     def test_resume_is_idempotent_for_a_busy_role(self):
         client = mock.Mock()
         client.children.return_value = [{"id": "ses_a5", "agent": "a5"}]
         client.statuses.return_value = {"ses_a5": {"type": "busy"}}
-        client.session_messages.return_value = self.PULL_MESSAGE
         context = mock.Mock()
         context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]}}
         context.client.return_value = client
@@ -303,7 +296,6 @@ class ConfigStateTest(unittest.TestCase):
             {"ses_a5_old": {"type": "idle"}},
             {"ses_a5_old": {"type": "idle"}, "ses_a5_new": {"type": "busy"}},
         ]
-        client.session_messages.return_value = self.PULL_MESSAGE
         client.create_session.return_value = {"id": "ses_a5_new"}
         context = mock.Mock()
         context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
@@ -312,16 +304,14 @@ class ConfigStateTest(unittest.TestCase):
         client.sessions.return_value = []
         context.client.return_value = client
 
-        result = _resume(context, "a5", .01, force=True)
+        result = _resume(context, "a5", force=True)
 
         self.assertEqual((result["action"], result["session_id"]),
                          ("recreated", "ses_a5_new"))
         client.abort_session.assert_called_once_with("ses_a5_old")
-        client.prompt_session.assert_called_once_with(
-            "ses_a5_new", mock.ANY, agent="a5"
-        )
+        client.prompt_session.assert_not_called()
         client.create_session.assert_called_once_with(
-            "demo.a5@1", parent_id="ses_coordinator"
+            "demo.a5@1", parent_id="ses_coordinator", agent="a5"
         )
 
     def test_resume_rejects_unknown_role_and_recreates_missing_session(self):
@@ -337,17 +327,17 @@ class ConfigStateTest(unittest.TestCase):
         client = mock.Mock()
         client.children.side_effect = [[], [{"id": "ses_a5_new", "agent": "a5"}]]
         client.statuses.side_effect = [{}, {"ses_a5_new": {"type": "busy"}}]
-        client.session_messages.return_value = self.PULL_MESSAGE
         client.create_session.return_value = {"id": "ses_a5_new"}
         client.sessions.return_value = []
         context.client.return_value = client
-        result = _resume(context, "a5", .01)
+        result = _resume(context, "a5")
         self.assertEqual((result["action"], result["session_id"]), ("recreated", "ses_a5_new"))
-        client.prompt_session.assert_called_once_with(
-            "ses_a5_new", mock.ANY, agent="a5"
+        client.prompt_session.assert_not_called()
+        client.create_session.assert_called_once_with(
+            "demo.a5@1", parent_id="ses_coordinator", agent="a5"
         )
 
-    def test_resume_replaces_an_existing_session_that_does_not_reenter_loop(self):
+    def test_resume_retains_an_existing_idle_supervisor_managed_session(self):
         client = mock.Mock()
         old = {"id": "ses_a5_old", "agent": "a5"}
         new = {"id": "ses_a5_new", "agent": "a5"}
@@ -357,7 +347,6 @@ class ConfigStateTest(unittest.TestCase):
             {"ses_a5_old": {"type": "idle"}},
             {"ses_a5_old": {"type": "idle"}, "ses_a5_new": {"type": "busy"}},
         ]
-        client.session_messages.return_value = self.PULL_MESSAGE
         client.create_session.return_value = {"id": "ses_a5_new"}
         context = mock.Mock()
         context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
@@ -365,12 +354,11 @@ class ConfigStateTest(unittest.TestCase):
                          "lab_root": "/tmp/lab"}
         client.sessions.return_value = []
         context.client.return_value = client
-        with mock.patch("labflow.cli_host.time.monotonic",
-                        side_effect=[0, 1, 1, 1]):
-            result = _resume(context, "a5", .5)
-        self.assertEqual((result["action"], result["session_id"]), ("recreated", "ses_a5_new"))
-        self.assertEqual(client.prompt_session.call_args_list[0].args[0], "ses_a5_old")
-        self.assertEqual(client.prompt_session.call_args_list[1].args[0], "ses_a5_new")
+        result = _resume(context, "a5")
+        self.assertEqual((result["action"], result["session_id"]),
+                         ("retained", "ses_a5_old"))
+        client.prompt_session.assert_not_called()
+        client.create_session.assert_not_called()
 
     def test_start_requires_lab_and_plan_identity(self):
         args = control_parser().parse_args(["start", "t1", "sample-plan"])
@@ -613,7 +601,7 @@ class ConfigStateTest(unittest.TestCase):
             (source_workspace / "NOTES.md").write_text("process notes", encoding="utf-8")
             refresh_artifact(source_workspace, workflow, "input-1")
             (source_workspace / "output.txt").write_text("result", encoding="utf-8")
-            pull(source_workspace, workflow, "a1", False, None)
+            assign_task(source_workspace, workflow, "a1", "output-1.a1")
             submit(source_workspace, workflow, "a1", ["output-1.a1"])
             refresh_artifact(source_workspace, workflow, "output-2")
             save_state(source_root, {
@@ -943,6 +931,12 @@ class ConfigStateTest(unittest.TestCase):
             )
             self.assertEqual(load_workflow(workspace), state["workflow"])
             self.assertTrue((workspace / ".opencode/agents/a1.md").is_file())
+            role_text = (workspace / ".opencode/agents/a1.md").read_text()
+            coordinator_text = (workspace / ".opencode/agents/coordinator.md").read_text()
+            self.assertNotIn("labflow agent pull", role_text)
+            self.assertIn("Supervisor 会主动投递", role_text)
+            self.assertIn('"task":"deny"', coordinator_text)
+            self.assertIn("不要启动 sub-agent", coordinator_text)
             self.assertEqual((workspace / "bin/tool").read_text(), "tool")
             self.assertEqual((workspace / "seed.txt").read_text(), "seed\n")
             self.assertFalse((workspace / "host/secret.md").exists())
@@ -1408,7 +1402,7 @@ class StatusSummaryTest(unittest.TestCase):
                 },
             })
             refresh_artifact(workspace, workflow, "input-0")
-            pull(workspace, workflow, "a1", False, None)
+            assign_task(workspace, workflow, "a1", "output-1.a1")
             submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={
                 "title": "demo@1", "lab_name": "t1",
@@ -1417,7 +1411,7 @@ class StatusSummaryTest(unittest.TestCase):
             })
             context.root = workspace / "execution"
             metrics = {"aggregate": {"tokens": {"fresh": 10}}}
-            detail = {"agents": [{"role": "a1", "state": "waiting_on_pull"}],
+            detail = {"agents": [{"role": "a1", "state": "idle"}],
                       "records": {"active": [], "history": []}}
             with mock.patch("labflow.cli_host._metrics",
                             return_value=(metrics, detail)):
@@ -1484,7 +1478,7 @@ class StatusSummaryTest(unittest.TestCase):
                 },
             })
             refresh_artifact(workspace, workflow, "input-0")
-            pull(workspace, workflow, "a1", False, None)
+            assign_task(workspace, workflow, "a1", "output-1.a1")
             started_at_ns = task_records(workspace)["active"][0]["started_at_ns"]
             submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={

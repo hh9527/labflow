@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import tempfile
-import threading
-import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 
 from labflow.task_cli import (
-    TaskError, evaluate, load_workflow, main, parser, pull, refresh_artifact,
+    TaskError, assign_task, evaluate, load_workflow, parser, refresh_artifact,
     remove_artifact, restore_artifacts, role_asset_permissions, submit, task_records,
     validate_workflow,
 )
@@ -57,16 +55,18 @@ class ArtifactWorkflowTest(unittest.TestCase):
         (root / "experiment.json").write_text(json.dumps({"workflow": raw}), encoding="utf-8")
         return value
 
-    def test_pull_lists_complete_inputs_and_assets_with_change_flags(self):
+    def test_assignment_lists_complete_inputs_and_assets_with_change_flags(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = self.prepare(root)
             self.assertEqual(load_workflow(root), value)
             refresh_artifact(root, value, "input-0")
 
-            first = pull(root, value, "a1", False, None)
+            first = assign_task(root, value, "a1", "output-1.a1")
             assert first is not None
-            self.assertEqual(first["target"], {"name": "output-1.a1"})
+            self.assertEqual(first["target"], {
+                "name": "output-1.a1", "instruction": "Create result-1.txt",
+            })
             self.assertEqual(first["inputs"], [
                 {"name": "input-0", "fresh": True},
                 {"name": "input-optional", "fresh": None},
@@ -78,7 +78,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             (root / "notes.txt").write_text("new input", encoding="utf-8")
             refresh_artifact(root, value, "input-optional")
 
-            second = pull(root, value, "a1", False, None)
+            second = assign_task(root, value, "a1", "output-1.a1")
             assert second is not None
             self.assertEqual(second["inputs"], [
                 {"name": "input-0", "fresh": False},
@@ -105,7 +105,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             (root / "shared.txt").write_text("shared", encoding="utf-8")
             refresh_artifact(root, workflow, "left")
             refresh_artifact(root, workflow, "right")
-            result = pull(root, workflow, "a1", False, None)
+            result = assign_task(root, workflow, "a1", "work.a1")
             assert result is not None
             self.assertEqual(result["assets"], [{"path": "shared.txt", "updated": True}])
 
@@ -127,33 +127,13 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "read": ["model/"], "write": ["model/"],
         })
 
-    def test_pull_timeout_returns_null(self):
+    def test_assignment_returns_none_when_target_is_not_runnable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = self.prepare(root)
-            self.assertIsNone(pull(root, value, "a2", True, 0))
-            output = StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(main(["--root", str(root), "pull", "a2", "--timeout", "0"]), 0)
-            self.assertEqual(output.getvalue().strip(), "null")
+            self.assertIsNone(assign_task(root, value, "a2", "output-2.a2"))
 
-    def test_pull_waits_until_work_is_runnable(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            value = self.prepare(root)
-            result = []
-            worker = threading.Thread(
-                target=lambda: result.append(pull(root, value, "a1", True, None)), daemon=True,
-            )
-            worker.start()
-            time.sleep(.05)
-            self.assertTrue(worker.is_alive())
-            refresh_artifact(root, value, "input-0")
-            worker.join(2)
-            self.assertFalse(worker.is_alive())
-            self.assertEqual(result[0]["target"], {"name": "output-1.a1"})
-
-    def test_pull_returns_one_target_in_declaration_order(self):
+    def test_assignment_completes_one_target_at_a_time(self):
         workflow = validate_workflow({
             "schema": "labflow.workflow/v1", "roles": ["a1"],
             "artifacts": {
@@ -168,14 +148,42 @@ class ArtifactWorkflowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             refresh_artifact(root, workflow, "input")
-            first = pull(root, workflow, "a1", False, None)
+            first = assign_task(root, workflow, "a1", "first.a1")
             assert first is not None
-            self.assertEqual(first["target"], {"name": "first.a1"})
+            self.assertEqual(first["target"], {"name": "first.a1", "instruction": "first"})
             (root / "first.txt").write_text("first", encoding="utf-8")
             submit(root, workflow, "a1", ["first.a1"])
-            second = pull(root, workflow, "a1", False, None)
+            second = assign_task(root, workflow, "a1", "second.a1")
             assert second is not None
-            self.assertEqual(second["target"], {"name": "second.a1"})
+            self.assertEqual(second["target"], {
+                "name": "second.a1", "instruction": "second",
+            })
+
+    def test_assignment_reuses_active_task_when_another_target_is_preferred(self):
+        workflow = validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["a1"],
+            "artifacts": {
+                "input": {"desc": "input"},
+                "first.a1": {"desc": "first", "input": ["input"],
+                             "instruction": "first"},
+                "second.a1": {"desc": "second", "input": ["input"],
+                              "instruction": "second"},
+            },
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            refresh_artifact(root, workflow, "input")
+            first = assign_task(root, workflow, "a1", "first.a1")
+            assert first is not None
+            task_id = task_records(root)["active"][0]["task_id"]
+
+            reused = assign_task(root, workflow, "a1", "second.a1")
+
+            assert reused is not None
+            self.assertEqual(reused["target"], {
+                "name": "first.a1", "instruction": "first",
+            })
+            self.assertEqual(task_records(root)["active"][0]["task_id"], task_id)
 
     def test_ownership_and_asset_types_are_enforced(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -184,7 +192,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             with self.assertRaisesRegex(TaskError, "role-owned"):
                 refresh_artifact(root, value, "output-1.a1")
             refresh_artifact(root, value, "input-0")
-            pull(root, value, "a1", False, None)
+            assign_task(root, value, "a1", "output-1.a1")
             (root / "result-1.txt").mkdir()
             with self.assertRaisesRegex(TaskError, "assets are incomplete"):
                 submit(root, value, "a1", ["output-1.a1"])
@@ -194,7 +202,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             root = Path(temporary)
             value = self.prepare(root)
             refresh_artifact(root, value, "input-0")
-            pull(root, value, "a1", False, None)
+            assign_task(root, value, "a1", "output-1.a1")
             (root / "result-1.txt").write_text("host supplied", encoding="utf-8")
             result = refresh_artifact(root, value, "output-1.a1", force=True)
             self.assertTrue(result["host_forced"])
@@ -217,11 +225,11 @@ class ArtifactWorkflowTest(unittest.TestCase):
             root = Path(temporary)
             value = self.prepare(root)
             refresh_artifact(root, value, "input-0")
-            pull(root, value, "a1", False, None)
+            assign_task(root, value, "a1", "output-1.a1")
             first = task_records(root)["active"][0]["task_id"]
             (root / "notes.txt").write_text("new", encoding="utf-8")
             refresh_artifact(root, value, "input-optional")
-            pull(root, value, "a1", False, None)
+            assign_task(root, value, "a1", "output-1.a1")
             second = task_records(root)["active"][0]["task_id"]
             self.assertNotEqual(first, second)
             self.assertEqual(task_records(root)["history"][0]["status"], "stale")
@@ -251,20 +259,14 @@ class ArtifactWorkflowTest(unittest.TestCase):
             validate_workflow(base)
 
     def test_cli_exposes_dag_and_benchmark_agent_commands(self):
-        self.assertEqual(parser().parse_args(["pull", "a1"]).timeout, 60.0)
         self.assertEqual(parser().parse_args(["submit", "a1", "output-1.a1"]).artifacts, ["output-1.a1"])
         self.assertEqual(parser().parse_args(["status"]).command, "status")
         self.assertEqual(parser().parse_args(["start-problem", "0001"]).problem, "0001")
         self.assertEqual(parser().parse_args(["end-problem", "error"]).outcome, "error")
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parser().parse_args(["mark-done", "a1", "output-1"])
-
-    def test_pull_timeout_cannot_exceed_heartbeat_bound(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            value = self.prepare(root)
-            with self.assertRaisesRegex(TaskError, "between 0 and 60"):
-                pull(root, value, "a2", True, 61)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser().parse_args(["pull", "a1"])
 
 
 if __name__ == "__main__":
