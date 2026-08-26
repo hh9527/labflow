@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .client import Client
 from .config import ControlError, repository_root
 from .events import pending_optional_requests, pending_requests
 from .runtime_opencode import resume_prompt
 from .state import atomic_json, load_lab_config, load_state, validate_title
-from .task_cli import evaluate
+from .task_cli import workflow_status
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
 
@@ -39,6 +41,7 @@ class Effect:
 @dataclass
 class EffectState:
     status: str
+    execution: str
     error: str | None = None
 
 
@@ -49,6 +52,8 @@ class SessionState:
     backend_id: str | None = None
     status: str = "missing"
     idle_epoch: int = 0
+    missing_epoch: int = 0
+    observed: bool = False
     error: str | None = None
 
 
@@ -66,6 +71,7 @@ class ExecutionState:
     optional_requests: tuple[str, ...] = ()
     sessions: dict[str, SessionState] = field(default_factory=dict)
     observed_sessions: dict[str, SessionState] = field(default_factory=dict)
+    sessions_initialized: bool = False
 
 
 @dataclass
@@ -80,21 +86,37 @@ def _effect_key(*values: Any) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+@contextmanager
+def supervisor_lock(root: Path) -> Iterator[None]:
+    """Ensure one process owns reconciliation and Timeline writes for a Lab."""
+    path = root / ".supervisor.lock"
+    with path.open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ControlError("another Supervisor already owns this laboratory", 75) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _requested(state: SupervisorState, effect: Effect) -> bool:
     if effect.key in state.effects:
         return False
-    state.effects[effect.key] = EffectState("requested")
+    state.effects[effect.key] = EffectState("requested", effect.execution)
     return True
 
 
 def _reconcile_role(state: SupervisorState, execution: ExecutionState,
                     role: str) -> list[Effect]:
-    if not execution.active or not execution.dag or not execution.root_session_id:
+    if (not execution.active or not execution.dag or not execution.root_session_id
+            or not execution.sessions_initialized):
         return []
     session = execution.sessions.setdefault(role, SessionState(role, role))
     if session.status == "missing":
         effect = Effect(
-            _effect_key("create", execution.title, role),
+            _effect_key("create", execution.title, role, session.missing_epoch),
             "create_session", execution.title, role, role,
         )
         return [effect] if _requested(state, effect) else []
@@ -121,6 +143,10 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
     """Mutate one event-loop-owned state object and return external work."""
     if event.kind == "execution_deleted":
         state.executions.pop(event.execution, None)
+        state.effects = {
+            key: record for key, record in state.effects.items()
+            if record.execution != event.execution
+        }
         return []
     if event.kind == "execution_updated":
         data = event.data
@@ -134,10 +160,12 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             tuple(data.get("roles", ())),
             artifacts=previous.artifacts if previous else {},
             sessions=previous.sessions if previous else {},
-            runnable=previous.runnable if previous else {},
-            requests=previous.requests if previous else (),
-            optional_requests=previous.optional_requests if previous else (),
+            runnable=(previous.runnable if previous and data.get("dag") else {}),
+            requests=(previous.requests if previous and data.get("dag") else ()),
+            optional_requests=(previous.optional_requests
+                               if previous and data.get("dag") else ()),
             observed_sessions=previous.observed_sessions if previous else {},
+            sessions_initialized=previous.sessions_initialized if previous else False,
         )
         state.executions[event.execution] = execution
         return _reconcile_execution(state, execution)
@@ -159,6 +187,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         execution.artifacts.pop(str(event.data["artifact"]), None)
         return []
     if event.kind == "observed_sessions_updated":
+        execution.sessions_initialized = True
         execution.observed_sessions = {
             str(item["backend_id"]): SessionState(
                 str(item["role"]), str(item["title"]),
@@ -173,20 +202,28 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         status = str(event.data["status"])
         session = execution.sessions.setdefault(role, SessionState(role, role))
         # prompt_async may be accepted just before OpenCode reports busy.
-        if session.status == "prompted" and status == "idle":
+        if (session.status == "prompted" and status == "idle"
+                and not event.data.get("completed_turn")):
             return []
         if status == "idle" and session.status != "idle":
             session.idle_epoch += 1
         session.status = status
         session.title = str(event.data["title"])
         session.backend_id = str(event.data["backend_id"])
+        session.observed = True
         session.error = event.data.get("error")
         return _reconcile_role(state, execution, role)
     if event.kind == "session_missing":
         role = str(event.data["role"])
         session = execution.sessions.setdefault(role, SessionState(role, role))
+        # A successful create may precede visibility in the backend's child index.
+        if session.backend_id is not None and not session.observed:
+            return []
+        if session.status not in ("missing", "failed"):
+            session.missing_epoch += 1
         session.status = "missing"
         session.backend_id = None
+        session.observed = False
         return _reconcile_role(state, execution, role)
     if event.kind in ("effect_succeeded", "effect_failed"):
         key = str(event.data["key"])
@@ -208,6 +245,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             session.backend_id = str(event.data["backend_id"])
             session.title = str(event.data["title"])
             session.status = "idle"
+            session.observed = False
             session.idle_epoch += 1
             return _reconcile_role(state, execution, role)
         if event.data.get("effect_kind") == "prompt_session":
@@ -324,7 +362,7 @@ class Supervisor:
         workflow = value.get("workflow")
         if not isinstance(workflow, dict):
             return None
-        artifacts = evaluate(Path(value["workspace"]), workflow)
+        artifacts = workflow_status(Path(value["workspace"]), workflow)
         runnable: dict[str, list[tuple[str, int]]] = {}
         for name, status in artifacts["artifacts"].items():
             if status["runnable"]:
@@ -373,28 +411,10 @@ class Supervisor:
             "observed_sessions_updated", title, {"sessions": observed},
         ))
         effects: list[Effect] = []
-        observed_roles = set()
+        completed_turns: set[str] = set()
         for session in sessions:
             session_id = session["id"]
             role = session["role"]
-            if self.state.executions[title].dag and role in self.state.executions[title].roles:
-                if role in observed_roles:
-                    effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_observed", title, {
-                            "role": role, "title": session["title"],
-                            "backend_id": session_id, "status": "failed",
-                            "error": f"duplicate Session for role {role}",
-                        },
-                    )))
-                else:
-                    observed_roles.add(role)
-                    effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_observed", title, {
-                            "role": role, "title": session["title"],
-                            "backend_id": session_id,
-                            "status": statuses.get(session_id, {"type": "idle"}).get("type", "idle"),
-                        },
-                    )))
             messages = client.session_messages(session_id)
             for message in messages:
                 info = message.get("info", {})
@@ -404,6 +424,8 @@ class Supervisor:
                 if (not isinstance(message_id, str) or not isinstance(completed, (int, float))
                         or identity in self.state.seen_messages):
                     continue
+                if info.get("role") == "assistant":
+                    completed_turns.add(session_id)
                 records = closed_message_events(
                     title, session["title"], role, message,
                 )
@@ -412,9 +434,30 @@ class Supervisor:
                 self.state.seen_messages.add(identity)
         if self.state.executions[title].dag:
             for role in self.state.executions[title].roles:
-                if role not in observed_roles:
+                matches = [session for session in sessions if session["role"] == role]
+                if not matches:
                     effects.extend(reduce(self.state, LifecycleEvent(
                         "session_missing", title, {"role": role},
+                    )))
+                elif len(matches) == 1:
+                    session = matches[0]
+                    effects.extend(reduce(self.state, LifecycleEvent(
+                        "session_observed", title, {
+                            "role": role, "title": session["title"],
+                            "backend_id": session["id"],
+                            "status": statuses.get(
+                                session["id"], {"type": "idle"}
+                            ).get("type", "idle"),
+                            "completed_turn": session["id"] in completed_turns,
+                        },
+                    )))
+                else:
+                    effects.extend(reduce(self.state, LifecycleEvent(
+                        "session_observed", title, {
+                            "role": role, "title": role,
+                            "backend_id": matches[0]["id"], "status": "failed",
+                            "error": f"duplicate Session for role {role}",
+                        },
                     )))
         return effects
 
@@ -468,6 +511,11 @@ class Supervisor:
                 "dag": execution.dag,
                 "requests": list(execution.requests),
                 "optional_requests": list(execution.optional_requests),
+                "errors": [{
+                    "role": session.role,
+                    "error": session.error,
+                } for session in execution.sessions.values()
+                    if session.status == "failed" and session.error],
                 "sessions": [{
                     "backend_id": session.backend_id,
                     "title": session.title,
@@ -487,11 +535,11 @@ class Supervisor:
             effects = reduce(self.state, event)
             for artifact_event in self._artifact_events(title, path):
                 effects.extend(reduce(self.state, artifact_event))
+            effects.extend(self._observe_sessions(title, value))
             workflow = (self._workflow_event(title, value)
                         if self.state.executions[title].dag else None)
             if workflow is not None:
                 effects.extend(reduce(self.state, workflow))
-            effects.extend(self._observe_sessions(title, value))
             self._execute(effects)
         atomic_json(self.root / "supervisor-status.json", self._status())
 
@@ -520,9 +568,14 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
         if args.poll_interval <= 0 or args.poll_interval > 60:
             raise ControlError("poll interval must be greater than 0 and at most 60 seconds", 64)
         Client(f"http://127.0.0.1:{config['port']}", config["root"]).health()
-        supervisor = Supervisor(Path(config["root"]), config["port"],
-                                poll_interval=args.poll_interval)
-        supervisor.run(once=args.once)
+        with supervisor_lock(Path(config["root"])):
+            supervisor = Supervisor(Path(config["root"]), config["port"],
+                                    poll_interval=args.poll_interval)
+            try:
+                supervisor.run(once=args.once)
+            finally:
+                supervisor.close()
+                supervisor = None
         return 0
     except (ControlError, RuntimeError, OSError, ValueError) as exc:
         print(f"{prog}: {exc}", file=sys.stderr)

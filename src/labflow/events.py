@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +22,7 @@ def _brief(value: str, limit: int = 240) -> str:
 
 def _since(event: dict[str, Any], since: int) -> bool:
     updated = event.get("at")
-    created = event.get("created_at")
-    return (isinstance(updated, int) and isinstance(created, int)
-            and updated >= since)
+    return isinstance(updated, int) and updated >= since
 
 
 def _thinking_events(
@@ -172,10 +169,9 @@ def _json_events(directory: Path, kind: str) -> list[tuple[Path, dict[str, Any]]
 def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
     lab_root = context.state.get("lab_root")
     title = context.state.get("title")
-    if isinstance(lab_root, str) and isinstance(title, str):
-        database = Path(lab_root) / "timeline.sqlite3"
-        if database.is_file():
-            return read_timeline(database, title, since_ms)
+    database = (Path(lab_root) / "timeline.sqlite3"
+                if isinstance(lab_root, str) and isinstance(title, str) else None)
+    has_timeline = database is not None and database.is_file()
     workspace = Path(context.state["workspace"])
     result = _task_events(workspace)
     for path, value in _json_events(context.root / "artifact-events", "artifact"):
@@ -200,6 +196,22 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
                 "action": value.get("kind"),
                 "targets": len(value.get("targets", [])),
             })
+    if has_timeline:
+        result.extend(read_timeline(database, title, since_ms))
+    else:
+        result.extend(_backend_events(context))
+    result = [event for event in result if _since(event, since_ms)]
+    order = {"thinking": 0, "action": 1, "reply": 2, "task": 3,
+             "artifact": 4, "host_action": 5}
+    result.sort(key=lambda event: (
+        event["at"], event.get("created_at", event["at"]),
+        order.get(event["type"], 99), event["id"]
+    ))
+    return result
+
+
+def _backend_events(context: Context) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
     try:
         client = context.client()
         if context.state.get("execution", {}).get("kind") == "benchmark-mode":
@@ -233,12 +245,6 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
     except ControlError:
         # Local task/artifact history remains queryable after the external runtime exits.
         pass
-    result = [event for event in result if _since(event, since_ms)]
-    order = {"thinking": 0, "action": 1, "reply": 2, "task": 3,
-             "artifact": 4, "host_action": 5}
-    result.sort(key=lambda event: (
-        event["at"], event["created_at"], order.get(event["type"], 99), event["id"]
-    ))
     return result
 
 
@@ -275,7 +281,8 @@ def _find_message(context: Context, session: str, message_id: str) -> dict[str, 
 
 
 def event_detail(context: Context, event_id: str) -> dict[str, Any]:
-    if not re.fullmatch(r"[A-Za-z0-9_.:@-]+", event_id):
+    if (not event_id or len(event_id) > 1024
+            or any(ord(character) < 32 or ord(character) == 127 for character in event_id)):
         raise ControlError(f"invalid event id: {event_id}", 64)
     lab_root = context.state.get("lab_root")
     title = context.state.get("title")

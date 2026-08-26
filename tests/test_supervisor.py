@@ -7,9 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from labflow.config import ControlError
 from labflow.events import event_detail, project_events
 from labflow.state import SCHEMA, bind_plan, save_state
-from labflow.supervisor import LifecycleEvent, Supervisor, SupervisorState, reduce
+from labflow.supervisor import (
+    EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
+)
 from labflow.task_cli import refresh_artifact, validate_workflow
 from labflow.timeline_projection import closed_message_events
 from labflow.timeline_store import TimelineWriter, read, statistics
@@ -28,6 +31,11 @@ class ReducerTest(unittest.TestCase):
     def test_mutates_state_and_deduplicates_create_and_prompt_effects(self):
         state = SupervisorState()
 
+        created = reduce(state, self.execution())
+        self.assertEqual(created, [])
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
         created = reduce(state, self.execution())
         self.assertEqual([effect.kind for effect in created], ["create_session"])
         self.assertEqual(reduce(state, self.execution()), [])
@@ -67,6 +75,149 @@ class ReducerTest(unittest.TestCase):
         event = self.execution()
         event = LifecycleEvent(event.kind, event.execution, {**event.data, "dag": False})
         self.assertEqual(reduce(state, event), [])
+
+    def test_disabling_dag_clears_pressure_and_host_requests(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        reduce(state, LifecycleEvent("workflow_observed", "plan@1", {
+            "runnable": {"a1": [("output.a1", 11)]},
+            "requests": ["approval"], "optional_requests": ["feedback"],
+        }))
+        disabled = self.execution()
+        disabled = LifecycleEvent(disabled.kind, disabled.execution, {
+            **disabled.data, "dag": False,
+        })
+
+        self.assertEqual(reduce(state, disabled), [])
+        execution = state.executions["plan@1"]
+        self.assertEqual(execution.runnable, {})
+        self.assertEqual(execution.requests, ())
+        self.assertEqual(execution.optional_requests, ())
+
+    def test_deleting_execution_forgets_only_its_effects(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        created = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))[0]
+        state.effects["other"] = EffectState("succeeded", "another@1")
+
+        reduce(state, LifecycleEvent("execution_deleted", "plan@1"))
+
+        self.assertNotIn("plan@1", state.executions)
+        self.assertNotIn(created.key, state.effects)
+        self.assertIn("other", state.effects)
+
+    def test_failed_effect_marks_role_failed(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        created = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))[0]
+
+        reduce(state, LifecycleEvent("effect_failed", "plan@1", {
+            "key": created.key, "effect_kind": "create_session", "role": "a1",
+            "error": "backend unavailable",
+        }))
+
+        self.assertEqual(state.effects[created.key].status, "failed")
+        self.assertEqual(state.executions["plan@1"].sessions["a1"].status, "failed")
+
+    def test_disappeared_session_gets_a_new_create_epoch(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        first = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))[0]
+        reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
+            "key": first.key, "effect_kind": "create_session", "role": "a1",
+            "title": "a1", "backend_id": "ses_a1",
+        }))
+        reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1",
+            "status": "idle",
+        }))
+
+        second = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))
+
+        self.assertEqual([effect.kind for effect in second], ["create_session"])
+        self.assertNotEqual(first.key, second[0].key)
+
+    def test_created_session_is_not_duplicated_before_backend_visibility(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        created = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))[0]
+        reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
+            "key": created.key, "effect_kind": "create_session", "role": "a1",
+            "title": "a1", "backend_id": "ses_a1",
+        }))
+
+        self.assertEqual(reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        )), [])
+        self.assertEqual(state.executions["plan@1"].sessions["a1"].backend_id,
+                         "ses_a1")
+
+    def test_completed_turn_recovers_when_busy_transition_was_missed(self):
+        state = SupervisorState()
+        reduce(state, self.execution())
+        reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
+            "sessions": [],
+        }))
+        created = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))[0]
+        reduce(state, LifecycleEvent("workflow_observed", "plan@1", {
+            "runnable": {"a1": [("output.a1", 11)]},
+        }))
+        prompted = reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
+            "key": created.key, "effect_kind": "create_session", "role": "a1",
+            "title": "a1", "backend_id": "ses_a1",
+        }))[0]
+        reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
+            "key": prompted.key, "effect_kind": "prompt_session", "role": "a1",
+            "title": "a1", "backend_id": "ses_a1",
+        }))
+
+        retried = reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1",
+            "status": "idle", "completed_turn": True,
+        }))
+
+        self.assertEqual([effect.kind for effect in retried], ["prompt_session"])
+        self.assertNotEqual(prompted.key, retried[0].key)
+
+
+class SupervisorOwnershipTest(unittest.TestCase):
+    def test_only_one_supervisor_can_own_a_laboratory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with supervisor_lock(root):
+                with self.assertRaisesRegex(ControlError, "already owns"):
+                    with supervisor_lock(root):
+                        self.fail("second Supervisor unexpectedly acquired the Lab")
+
+            with supervisor_lock(root):
+                pass
 
 
 class TimelineProjectionTest(unittest.TestCase):
@@ -115,6 +266,14 @@ class TimelineProjectionTest(unittest.TestCase):
         self.assertEqual(action["paths"], ["result/output.json"])
         self.assertFalse(action["success"])
 
+    def test_incomplete_message_and_action_are_not_projected(self):
+        message = self.message()
+        message["info"]["time"].pop("completed")
+        message["parts"][1]["state"]["status"] = "running"
+        message["parts"][1]["state"]["time"].pop("end")
+
+        self.assertEqual(closed_message_events("plan@1", "a1", "a1", message), [])
+
 
 class TimelineStoreTest(unittest.TestCase):
     def test_writer_appends_and_deduplicates_without_reader_state(self):
@@ -149,8 +308,10 @@ class TimelineStoreTest(unittest.TestCase):
                 "summary": "done",
             }])
             writer.close()
-            context = mock.Mock(state={
-                "lab_root": str(root), "title": "plan@1", "workspace": str(root / "ws"),
+            workspace = root / "ws"
+            workspace.mkdir()
+            context = mock.Mock(root=root / "control", state={
+                "lab_root": str(root), "title": "plan@1", "workspace": str(workspace),
             })
 
             events = project_events(context, 100)
@@ -158,6 +319,55 @@ class TimelineStoreTest(unittest.TestCase):
 
             self.assertEqual(events[0]["session"], "a1")
             self.assertEqual(detail["detail"]["tokens"], 3)
+
+    def test_host_projection_merges_timeline_and_operational_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws"
+            workspace.mkdir()
+            event_root = root / "control" / "artifact-events"
+            event_root.mkdir(parents=True)
+            (event_root / "1.json").write_text(json.dumps({
+                "schema": "labflow.artifact-event/v1", "number": 1,
+                "artifact": "input", "reason": "refresh", "mtime_ns": 150_000_000,
+            }))
+            writer = TimelineWriter(root / "timeline.sqlite3", flush_seconds=.01)
+            writer.submit([{
+                "id": "reply:plan@1:a1:msg:complete",
+                "execution": "plan@1", "session": "a1", "role": "a1",
+                "type": "reply", "at": 200, "duration": 0, "summary": "done",
+            }])
+            writer.close()
+            context = mock.Mock(
+                root=root / "control",
+                state={"lab_root": str(root), "title": "plan@1",
+                       "workspace": str(workspace)},
+            )
+
+            events = project_events(context, 100)
+
+            self.assertEqual([event["type"] for event in events], ["artifact", "reply"])
+            context.client.assert_not_called()
+
+    def test_unicode_timeline_identity_can_be_read_by_event_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws"
+            workspace.mkdir()
+            event_id = "reply:plan@1:启动 a1:msg:complete"
+            writer = TimelineWriter(root / "timeline.sqlite3", flush_seconds=.01)
+            writer.submit([{
+                "id": event_id, "execution": "plan@1", "session": "启动 a1",
+                "role": "a1", "type": "reply", "at": 200, "duration": 0,
+            }])
+            writer.close()
+            context = mock.Mock(
+                root=root / "control",
+                state={"lab_root": str(root), "title": "plan@1",
+                       "workspace": str(workspace)},
+            )
+
+            detail = event_detail(context, event_id)
+
+            self.assertEqual(detail["detail"]["session"], "启动 a1")
 
     def test_statistics_aggregate_timing_tokens_commands_and_failures(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -194,6 +404,24 @@ class SupervisorRuntimeTest(unittest.TestCase):
             "session_id": "ses_root", "workflow": workflow,
             "execution": execution,
         })
+
+    def _dag(self, root: Path, workspace: Path) -> dict:
+        desired = root / "supervisor" / "demo@1" / "artifacts"
+        desired.mkdir(parents=True)
+        control = workspace / "control"
+        control.mkdir()
+        (control / "artifacts").symlink_to(desired, target_is_directory=True)
+        workflow = validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["a1"],
+            "artifacts": {
+                "input": {"desc": "input"},
+                "output.a1": {"desc": "output", "input": ["input"],
+                              "instruction": "build"},
+            },
+        })
+        refresh_artifact(workspace, workflow, "input")
+        self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+        return workflow
 
     def test_observe_only_goal_collects_existing_sessions_without_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -339,21 +567,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / "ws" / "demo@1"
             workspace.mkdir(parents=True)
-            desired = root / "supervisor" / "demo@1" / "artifacts"
-            desired.mkdir(parents=True)
-            control = workspace / "control"
-            control.mkdir()
-            (control / "artifacts").symlink_to(desired, target_is_directory=True)
-            workflow = validate_workflow({
-                "schema": "labflow.workflow/v1", "roles": ["a1"],
-                "artifacts": {
-                    "input": {"desc": "input"},
-                    "output.a1": {"desc": "output", "input": ["input"],
-                                  "instruction": "build"},
-                },
-            })
-            refresh_artifact(workspace, workflow, "input")
-            self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+            self._dag(root, workspace)
             client = mock.Mock()
             client.statuses.return_value = {"ses_root": {"type": "idle"}}
             client.children.return_value = []
@@ -371,6 +585,112 @@ class SupervisorRuntimeTest(unittest.TestCase):
             )
             client.prompt_session.assert_called_once()
             self.assertIn("input", supervisor.state.executions["demo@1"].artifacts)
+
+    def test_dag_startup_reuses_existing_role_without_duplicate_create_or_prompt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            self._dag(root, workspace)
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step(); supervisor.step()
+            finally:
+                supervisor.close()
+
+            client.create_session.assert_not_called()
+            client.prompt_session.assert_called_once()
+
+    def test_dag_refresh_waits_for_busy_role_then_prompts_when_idle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            workflow = self._dag(root, workspace)
+            refresh_artifact(workspace, workflow, "output.a1", force=True)
+            client = mock.Mock()
+            client.statuses.side_effect = [
+                {"ses_a1": {"type": "idle"}},
+                {"ses_a1": {"type": "busy"}},
+                {"ses_a1": {"type": "idle"}},
+            ]
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    refresh_artifact(workspace, workflow, "input")
+                    supervisor.step()
+                    client.prompt_session.assert_not_called()
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            client.create_session.assert_not_called()
+            client.prompt_session.assert_called_once()
+
+    def test_dag_disappeared_role_is_recreated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            workflow = self._dag(root, workspace)
+            refresh_artifact(workspace, workflow, "output.a1", force=True)
+            roots = iter([[{"id": "ses_a1", "title": "a1", "agent": "a1"}], []])
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+
+            def children(session_id):
+                return next(roots) if session_id == "ses_root" else []
+
+            client.children.side_effect = children
+            client.session_messages.return_value = []
+            client.create_session.return_value = {"id": "ses_a1_new"}
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step(); supervisor.step()
+            finally:
+                supervisor.close()
+
+            client.create_session.assert_called_once_with(
+                "a1", parent_id="ses_root", agent="a1",
+            )
+            client.prompt_session.assert_not_called()
+
+    def test_dag_duplicate_role_is_failed_without_prompt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            self._dag(root, workspace)
+            client = mock.Mock()
+            client.statuses.return_value = {}
+            client.children.side_effect = lambda session_id: ([
+                {"id": "ses_a1_1", "title": "a1-one", "agent": "a1"},
+                {"id": "ses_a1_2", "title": "a1-two", "agent": "a1"},
+            ] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            session = supervisor.state.executions["demo@1"].sessions["a1"]
+            self.assertEqual(session.status, "failed")
+            self.assertIn("duplicate Session", str(session.error))
+            client.create_session.assert_not_called()
+            client.prompt_session.assert_not_called()
+            status = json.loads((root / "supervisor-status.json").read_text())
+            self.assertIn("duplicate Session", status["executions"][0]["errors"][0]["error"])
 
 
 if __name__ == "__main__":

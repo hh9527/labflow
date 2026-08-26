@@ -58,8 +58,9 @@ and archives live under `control/` and `archive/`. `lab run` replaces its own pr
 OpenCode server, so a running laboratory does not retain Labflow's runtime. After stopping the
 server, `lab remove` removes the symbolic link and reclaims the Lab root.
 
-Run `labflow supervisor <lab-name>` as a separate foreground process. It can start before any
-execution exists and does not own or stop `labflow lab run`. Host start publishes an execution
+Run exactly one `labflow supervisor <lab-name>` as a separate foreground process for each Lab. It
+can start before any execution exists and does not currently own or stop `labflow lab run`. A
+non-blocking Lab-level ownership lock rejects a second Supervisor. Host start publishes an execution
 maintenance directory; the Supervisor then observes its Sessions and Timeline. An execution with an
 `artifacts/` directory additionally enables Artifact-DAG scheduling.
 
@@ -77,6 +78,27 @@ the Agent workspace `control/artifacts` path is a generated link to it. `timelin
 laboratory-wide append-only observation database. The Supervisor only writes closed `thinking`,
 `action`, and `reply` records; Host observation and statistics read it. Reducer scheduling state is
 kept in memory and never recovered from Timeline data.
+
+Scheduling is a reconciliation loop over desired and observed state:
+
+```text
+desired execution/Artifact state + observed Workflow/Session state
+    -> mutable reducer state + idempotent CreateSession/PromptSession effects
+    -> observed backend state
+```
+
+The Workflow snapshot is taken under the same lock used by Agent Artifact operations. A missing role
+Session is created, a busy Session is only observed, and an idle Session is prompted only while it
+owns runnable Artifact pressure. After a prompt, a newly completed assistant turn or an observed
+busy-to-idle transition makes the Session eligible for reconciliation again. Correctness does not
+depend on sleeping for a grace period or guessing that an asynchronous operation has completed.
+Removing `artifacts/` clears scheduling pressure while preserving Timeline observation; removing the
+execution maintenance directory forgets its scheduling state without deleting Timeline history.
+
+The latest observation is written atomically to `<lab-root>/supervisor-status.json`, including all
+observed Session identities and states, required and optional Host requests, and role-level runtime
+errors. Host event queries merge operational task/Artifact/Host-action records with the closed
+Timeline; operational events are not copied into SQLite.
 
 ## Artifact Workflow
 
