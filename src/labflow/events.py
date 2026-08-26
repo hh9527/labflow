@@ -198,6 +198,14 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
         if context.state.get("execution", {}).get("kind") == "benchmark-mode":
             execution = context.state["execution"]
             seen = set()
+            for item in context.state.get("benchmark", {}).get("sessions", []):
+                session = item.get("id")
+                role = item.get("agent")
+                if isinstance(session, str) and isinstance(role, str) and session not in seen:
+                    result.extend(_message_events(
+                        session, role, client.session_messages(session)
+                    ))
+                    seen.add(session)
             for record in context.state.get("benchmark", {}).get("problems", []):
                 for key, role in (("questioner_session_id", execution["questioner"]),
                                   ("answerer_session_id", execution["answerer"])):

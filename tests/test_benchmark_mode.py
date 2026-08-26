@@ -181,7 +181,7 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(self.client.host_prompts, 1)
         self.assertEqual([record["problem"] for record in response["result"]["problems"]],
                          ["0000", "0001"])
-        questioners = self.client.children("ses_base")
+        questioners = self.client.children(None)
         self.assertEqual(len(questioners), 1)
         self.assertEqual(len(self.client.children(questioners[0]["id"])), 1)
         for problem_id in ("0000", "0001"):

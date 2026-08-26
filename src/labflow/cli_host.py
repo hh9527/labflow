@@ -431,6 +431,13 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
         questioner = execution["questioner"]
         sessions = []
         seen = set()
+        for item in context.state.get("benchmark", {}).get("sessions", []):
+            session_id = item.get("id")
+            agent = item.get("agent")
+            if isinstance(session_id, str) and isinstance(agent, str) and session_id not in seen:
+                sessions.append({"id": session_id, "agent": agent,
+                                 "title": f"batch {item.get('batch')} {agent}"})
+                seen.add(session_id)
         for record in context.state.get("benchmark", {}).get("problems", []):
             for key, agent in (("questioner_session_id", questioner),
                                ("answerer_session_id", answerer)):
@@ -643,6 +650,10 @@ def _abort_sessions(context: Context, timeout: float = 5.0) -> dict[str, Any]:
         raise ControlError("execution has no session to abort", 75)
     client = context.client()
     pending = [root_session]
+    pending.extend(
+        item["id"] for item in context.state.get("benchmark", {}).get("sessions", [])
+        if isinstance(item.get("id"), str)
+    )
     sessions: list[str] = []
     while pending:
         session_id = pending.pop()

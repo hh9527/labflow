@@ -44,14 +44,15 @@ def _prompt(client: Any, session_id: str, prompt: str, role: str,
     while True:
         messages = client.session_messages(session_id)
         completed = _completed_after(messages, preceding)
-        if completed is not None:
+        status = client.statuses().get(session_id, {"type": "idle"}).get("type")
+        if completed is not None and status != "busy":
             return completed
         if time.monotonic() >= deadline:
             raise ControlError(f"timed out waiting for Benchmark role {role}", 75)
         time.sleep(.1)
 
 
-def _new_session(client: Any, title: str, parent: str, role: str) -> str:
+def _new_session(client: Any, title: str, parent: str | None, role: str) -> str:
     response = client.create_session(title, parent_id=parent, agent=role)
     session_id = response.get("id") if isinstance(response, dict) else None
     if not isinstance(session_id, str) or not session_id.startswith("ses_"):
@@ -273,7 +274,8 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
     with locked(context.root):
         state = load_state(context.root)
         state["phase"] = "active"
-        state["benchmark"] = {"status": "running", "started_at": started, "problems": []}
+        state["benchmark"] = {"status": "running", "started_at": started,
+                              "problems": [], "sessions": []}
         save_state(context.root, state)
         context.state = state
 
@@ -285,7 +287,14 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
             batch = offset // batch_size + 1
             problems = execution["problems"][offset:offset + batch_size]
             q_session = _new_session(client, f"{context.state['session_name']}.batch-{batch}.q",
-                                     context.state["session_id"], execution["questioner"])
+                                     None, execution["questioner"])
+            with locked(context.root):
+                state = load_state(context.root)
+                state["benchmark"]["sessions"].append({
+                    "id": q_session, "agent": execution["questioner"], "batch": batch,
+                })
+                save_state(context.root, state)
+                context.state = state
             batch_started_ns = time.time_ns()
             _prompt(client, q_session, _batch_prompt(problems), execution["questioner"])
             records.extend(_finalize_batch(context, problems, batch, q_session, batch_started_ns))
@@ -319,6 +328,7 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
         state["phase"] = "idle"
         state["benchmark"] = {"status": "completed", "started_at": started,
                               "completed_at": observed, "problems": records,
+                              "sessions": state.get("benchmark", {}).get("sessions", []),
                               "response": response}
         save_state(context.root, state)
         context.state = state
