@@ -427,16 +427,17 @@ class ConfigStateTest(unittest.TestCase):
         self.assertEqual((remove.command, remove.lab_name), ("remove", "t1"))
         self.assertEqual(attach_parser().parse_args(["t1"]).lab_name, "t1")
 
-    def test_labflow_groups_lab_host_and_agent_commands(self):
+    def test_labflow_groups_runtime_commands(self):
         self.assertEqual(
             set(labflow_parser()._subparsers._group_actions[0].choices),
-            {"lab", "attach", "host", "agent"},
+            {"lab", "attach", "host", "agent", "supervisor"},
         )
         cases = (
             ("lab", "labflow.cli.cli_lab.main", ["run", "t1"]),
             ("attach", "labflow.cli.cli_lab.attach_main", ["t1"]),
             ("host", "labflow.cli.cli_host.main", ["status", "t1", "demo@1"]),
             ("agent", "labflow.cli.task_cli.main", ["status"]),
+            ("supervisor", "labflow.cli.supervisor.main", ["t1", "--once"]),
         )
         for group, target, arguments in cases:
             with self.subTest(group=group), mock.patch(target, return_value=0) as delegated:
@@ -952,6 +953,10 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(workspace, workspace_root(lab_root, "demo@1"))
             self.assertEqual(_root, execution_root(lab_root, "demo@1"))
             self.assertEqual(Path(state["archive"]), archive_root(lab_root, "demo@1"))
+            artifact_link = workspace / "control" / "artifacts"
+            artifact_root = lab_root / "supervisor" / "demo@1" / "artifacts"
+            self.assertTrue(artifact_link.is_symlink())
+            self.assertEqual(artifact_link.resolve(), artifact_root.resolve())
 
     def test_prepare_reuses_a_named_session_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:

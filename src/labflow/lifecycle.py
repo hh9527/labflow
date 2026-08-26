@@ -159,6 +159,27 @@ def verify_prepared(manifest: Manifest, state: dict[str, Any]) -> None:
             raise ControlError(f"workspace asset changed since preparation: {name}")
 
 
+def configure_supervision(lab_root: Path, title: str, workspace: Path,
+                          workflow: dict[str, Any] | None) -> Path:
+    """Publish maintenance intent and make its Artifact directory canonical."""
+    desired = lab_root.resolve() / "supervisor" / validate_title(title)
+    desired.mkdir(parents=True, exist_ok=True)
+    if workflow is None:
+        return desired
+    artifacts = desired / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    link = workspace / "control" / "artifacts"
+    if link.is_symlink():
+        if link.resolve(strict=False) != artifacts.resolve():
+            raise ControlError(f"workspace Artifact link targets another directory: {link}")
+        return desired
+    if link.exists():
+        raise ControlError(f"workspace Artifact path is not managed by Supervisor: {link}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(artifacts, target_is_directory=True)
+    return desired
+
+
 def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] | None = None,
             from_title: str | None = None, *, lab_name: str,
             lab_root: str) -> tuple[Path, dict[str, Any], bool]:
@@ -180,7 +201,10 @@ def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] |
             if state["phase"] in ("finished", "retired", "failed"): raise ControlError(f"session {title} is {state['phase']}")
             if port is not None and int(state["server_url"].rsplit(":", 1)[1]) != port: raise ControlError("execution already uses another port", 64)
             if not Path(state["workspace"]).is_dir(): raise ControlError("recorded workspace is missing", 66)
-            verify_prepared(manifest, state); return root, state, False
+            verify_prepared(manifest, state)
+            configure_supervision(selected_lab_root, title, Path(state["workspace"]),
+                                  manifest.workflow)
+            return root, state, False
         port = port or 4096
         revision, dirty = git_metadata(repo); plan_revision, plan_source = plan_git_metadata(repo, manifest)
         workspace = workspace_root(selected_lab_root, title)
@@ -205,6 +229,7 @@ def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] |
         try:
             _copy_plan_workspace(manifest, workspace)
             state["adapter_hashes"] = generate_opencode_adapter(manifest, workspace)
+            configure_supervision(selected_lab_root, title, workspace, manifest.workflow)
             for item in manifest.assets:
                 name = str(item["path"]); source = Path((assets or {}).get(name, str(item["source"])))
                 if not source.is_absolute(): source = repo / source

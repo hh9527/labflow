@@ -9,6 +9,7 @@ from .config import ControlError
 from .context import Context
 from .observe import text_parts
 from .task_cli import task_records
+from .timeline_store import read as read_timeline
 
 
 def _ms_from_ns(value: Any) -> int | None:
@@ -169,6 +170,12 @@ def _json_events(directory: Path, kind: str) -> list[tuple[Path, dict[str, Any]]
 
 
 def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
+    lab_root = context.state.get("lab_root")
+    title = context.state.get("title")
+    if isinstance(lab_root, str) and isinstance(title, str):
+        database = Path(lab_root) / "timeline.sqlite3"
+        if database.is_file():
+            return read_timeline(database, title, since_ms)
     workspace = Path(context.state["workspace"])
     result = _task_events(workspace)
     for path, value in _json_events(context.root / "artifact-events", "artifact"):
@@ -268,8 +275,14 @@ def _find_message(context: Context, session: str, message_id: str) -> dict[str, 
 
 
 def event_detail(context: Context, event_id: str) -> dict[str, Any]:
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", event_id):
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]+", event_id):
         raise ControlError(f"invalid event id: {event_id}", 64)
+    lab_root = context.state.get("lab_root")
+    title = context.state.get("title")
+    if isinstance(lab_root, str) and isinstance(title, str):
+        values = read_timeline(Path(lab_root) / "timeline.sqlite3", title, 0, event_id)
+        if values:
+            return {"id": event_id, "type": values[0]["type"], "detail": values[0]}
     parts = event_id.split(":")
     kind = parts[0]
     workspace = Path(context.state["workspace"])

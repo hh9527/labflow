@@ -16,10 +16,10 @@ START_PROMPT = "请启动实验角色循环。"
 
 def resume_prompt(role: str) -> str:
     return (
-        f"Host 正在恢复 {role} 的长期任务循环。立即执行 labflow agent pull {role}；"
-        "领取任务后完成唯一 artifact、submit，然后继续 pull。没有工作时保持阻塞等待，"
-        "每次 pull 最多等待 60 秒；返回 null 时立即再次 pull。领取任务后先查看 inputs 中的 "
-        "fresh 和 assets 中的 updated，重新读取发生变化的资产。不得结束循环或返回最终答复。"
+        f"Supervisor 检测到 {role} 有可执行工作。立即执行 labflow agent pull {role}；"
+        "领取任务后完成唯一 artifact、submit，然后继续 pull。领取任务时先查看 inputs 中的 "
+        "fresh 和 assets 中的 updated，重新读取发生变化的资产。pull 返回 null 时自然结束当前 "
+        "turn；未来有新工作时 Supervisor 会再次恢复你。"
     )
 
 
@@ -109,6 +109,15 @@ def _benchmark_questioner_protocol(manifest: Manifest) -> str:
     )
 
 
+def _dag_role_protocol(role: str) -> str:
+    return (
+        "\n\n# Labflow Supervisor 协议\n\n"
+        f"每次被唤醒后执行 `labflow agent pull {role}`。领取任务后只完成该任务并 submit，"
+        "然后继续 pull；pull 返回 `null` 时自然结束当前 turn。不要自行阻塞等待，也不要因为"
+        "暂时无工作而退出 Session；Supervisor 会在新任务可执行时再次唤醒。\n"
+    )
+
+
 def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str:
     return "\n".join([
         "---",
@@ -180,6 +189,8 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
         if (manifest.execution["kind"] == "benchmark-mode"
                 and name == manifest.execution["questioner"]):
             instructions += _benchmark_questioner_protocol(manifest)
+        if manifest.execution["kind"] == "dag-mode":
+            instructions += _dag_role_protocol(name)
         mode = ("primary" if manifest.execution["kind"] == "benchmark-mode"
                 and name == manifest.execution["questioner"] else "subagent")
         assets = (role_asset_permissions(manifest.workflow, name)
