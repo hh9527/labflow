@@ -433,6 +433,30 @@ def _add_timeline_statistics(context: Context, metrics: dict[str, Any]) -> None:
             metrics["timeline"] = value
 
 
+def _supervision_status(context: Context) -> dict[str, Any] | None:
+    lab_root = context.state.get("lab_root")
+    title = context.state.get("title")
+    if not isinstance(lab_root, str) or not isinstance(title, str):
+        return None
+    path = Path(lab_root) / "supervisor-status.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"invalid Supervisor status: {exc}") from None
+    if not isinstance(value, dict) or value.get("schema") != "labflow.supervisor-status/v1":
+        raise ControlError("invalid Supervisor status schema")
+    executions = value.get("executions")
+    if not isinstance(executions, list):
+        raise ControlError("invalid Supervisor execution status")
+    current = next((item for item in executions
+                    if isinstance(item, dict) and item.get("title") == title), None)
+    if current is None:
+        return None
+    return {"updated_at": value.get("updated_at"), **current}
+
+
 def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
     workspace = _workspace(context)
     execution = context.state.get("execution", {"kind": "dag-mode"})
@@ -549,6 +573,9 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
         if not verbose:
             for agent in result["agents"]:
                 agent.pop("runtime_state", None)
+        supervision = _supervision_status(context)
+        if supervision is not None:
+            result["supervision"] = supervision
         return result
     workflow = context.state.get("workflow")
     artifacts = workflow_status(_workspace(context), workflow)
@@ -585,6 +612,9 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
         for agent in result["agents"]:
             agent.pop("runtime_state", None)
             agent.pop("recent_responses", None)
+    supervision = _supervision_status(context)
+    if supervision is not None:
+        result["supervision"] = supervision
     return result
 
 

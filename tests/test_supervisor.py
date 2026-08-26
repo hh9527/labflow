@@ -692,6 +692,67 @@ class SupervisorRuntimeTest(unittest.TestCase):
             status = json.loads((root / "supervisor-status.json").read_text())
             self.assertIn("duplicate Session", status["executions"][0]["errors"][0]["error"])
 
+    def test_removing_artifact_mode_stops_scheduling_and_clears_pressure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            self._dag(root, workspace)
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    artifacts = root / "supervisor" / "demo@1" / "artifacts"
+                    for path in artifacts.iterdir():
+                        path.unlink()
+                    artifacts.rmdir()
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            execution = supervisor.state.executions["demo@1"]
+            self.assertFalse(execution.dag)
+            self.assertEqual(execution.runnable, {})
+            self.assertEqual(execution.requests, ())
+            client.prompt_session.assert_called_once()
+
+    def test_removing_execution_goal_keeps_timeline_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            workspace.mkdir(parents=True)
+            desired = root / "supervisor" / "bench@1"
+            desired.mkdir(parents=True)
+            self._state(root, "bench@1", workspace, None, {
+                "kind": "benchmark-mode", "questioner": "q",
+            })
+            message = {
+                "info": {"id": "msg", "role": "assistant",
+                         "time": {"created": 10, "completed": 20},
+                         "tokens": {"output": 1}},
+                "parts": [{"type": "text", "text": "done"}],
+            }
+            client = mock.Mock()
+            client.statuses.return_value = {}
+            client.children.return_value = []
+            client.sessions.return_value = []
+            client.session_messages.return_value = [message]
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    desired.rmdir()
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertNotIn("bench@1", supervisor.state.executions)
+            self.assertEqual(len(read(root / "timeline.sqlite3", "bench@1")), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

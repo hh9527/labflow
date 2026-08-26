@@ -1432,6 +1432,43 @@ class StatusSummaryTest(unittest.TestCase):
             }])
             self.assertIn("artifacts", verbose)
 
+    def test_status_includes_the_supervisor_execution_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws"
+            workspace.mkdir()
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {"output.a1": {
+                    "desc": "output", "instruction": "build",
+                }},
+            })
+            atomic_json(root / "supervisor-status.json", {
+                "schema": "labflow.supervisor-status/v1", "updated_at": 123,
+                "executions": [{
+                    "title": "demo@1", "dag": True,
+                    "requests": ["approval"], "optional_requests": [],
+                    "errors": [{"role": "a1", "error": "duplicate Session"}],
+                    "sessions": [{
+                        "backend_id": "ses_a1", "title": "a1",
+                        "role": "a1", "status": "idle",
+                    }],
+                }],
+            })
+            context = mock.Mock(state={
+                "title": "demo@1", "lab_name": "t1", "lab_root": str(root),
+                "phase": "active", "workspace": str(workspace),
+                "workflow": workflow,
+            })
+            context.root = root / "control"
+            metrics = {"aggregate": {"tokens": {"fresh": 0}}}
+            detail = {"agents": [], "records": {"active": [], "history": []}}
+
+            with mock.patch("labflow.cli_host._metrics", return_value=(metrics, detail)):
+                status = _status(context)
+
+            self.assertEqual(status["supervision"]["updated_at"], 123)
+            self.assertEqual(status["supervision"]["errors"][0]["role"], "a1")
+
     def test_host_pull_returns_immediately_for_submitable_gate_and_summarizes_window(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
