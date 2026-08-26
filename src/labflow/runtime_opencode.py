@@ -11,15 +11,29 @@ from .task_cli import role_asset_permissions
 
 MODEL = "deepseek/deepseek-v4-flash"
 ENVIRONMENT = {"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "128000"}
-START_PROMPT = "请启动实验角色循环。"
+START_PROMPT = "请启动实验。"
 
 
-def resume_prompt(role: str) -> str:
+def task_prompt(role: str, task: dict[str, Any]) -> str:
+    target = task["target"]
+    freshness = {True: "本轮已更新", False: "沿用前一轮版本", None: "可选输入尚未提供"}
+    inputs = "\n".join(
+        f"- `{item['name']}`：{freshness[item['fresh']]}"
+        for item in task["inputs"]
+    ) or "- 无直接输入"
+    assets = "\n".join(
+        f"- `{item['path']}`：{'需要重新读取' if item['updated'] else '未发生变化'}"
+        for item in task["assets"]
+    ) or "- 无输入资产"
     return (
-        f"Supervisor 检测到 {role} 有可执行工作。立即执行 labflow agent pull {role}；"
-        "领取任务后完成唯一 artifact、submit，然后继续 pull。领取任务时先查看 inputs 中的 "
-        "fresh 和 assets 中的 updated，重新读取发生变化的资产。pull 返回 null 时自然结束当前 "
-        "turn；未来有新工作时 Supervisor 会再次恢复你。"
+        "# Labflow 任务\n\n"
+        f"目标：完成 artifact `{target['name']}`。\n\n"
+        f"任务要求：{target['instruction']}\n\n"
+        f"输入状态：\n{inputs}\n\n"
+        f"资产状态：\n{assets}\n\n"
+        "只完成这一项任务。完成后必须执行：\n\n"
+        f"`labflow agent submit {role} {target['name']}`\n\n"
+        "提交成功后结束当前 turn，不要领取或等待下一项任务。后续任务会由 Supervisor 主动投递。"
     )
 
 
@@ -112,9 +126,10 @@ def _benchmark_questioner_protocol(manifest: Manifest) -> str:
 def _dag_role_protocol(role: str) -> str:
     return (
         "\n\n# Labflow Supervisor 协议\n\n"
-        f"每次被唤醒后执行 `labflow agent pull {role}`。领取任务后只完成该任务并 submit，"
-        "然后继续 pull；pull 返回 `null` 时自然结束当前 turn。不要自行阻塞等待，也不要因为"
-        "暂时无工作而退出 Session；Supervisor 会在新任务可执行时再次唤醒。\n"
+        f"Supervisor 会主动投递一项完整任务，其中包含目标、要求、输入变化和提交命令。"
+        f"每次只完成被投递的唯一任务，并使用 `labflow agent submit {role} <artifact>` 提交。"
+        "提交成功后自然结束当前 turn，不要自行领取、轮询或等待其他任务。Supervisor 会在"
+        "下一项任务可执行时再次唤醒当前 Session。\n"
     )
 
 
@@ -131,23 +146,17 @@ def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str
 
 
 def _coordinator(manifest: Manifest) -> str:
-    roles = list(manifest.roles)
-    task = {"*": "deny", **{role: "allow" for role in roles}}
     permission = {
         "read": "deny", "glob": "deny", "grep": "deny", "list": "deny",
-        "edit": "deny", "bash": "deny", "task": task, "webfetch": "deny",
+        "edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny",
         "websearch": "deny", "external_directory": "deny",
     }
-    labels = "、".join(role.upper() for role in roles)
-    launches = "、".join(roles)
     body = (
-        f"收到 `{START_PROMPT}` 时，同时启动 {labels} 各一次。向每个角色只发送：\n\n"
-        "`按照你的角色协议启动 labflow agent 任务循环。`\n\n"
-        "全部启动调用完成后立即结束，不观察文件、不判断流程、不创建 artifact。\n\n"
-        f"收到 `恢复角色 <role>` 时，确认 role 属于 {launches}，只重新启动该角色一次，"
-        "并发送同一条启动消息；不要启动其他角色。"
+        f"收到 `{START_PROMPT}` 时立即结束当前 turn。角色 Session 的创建、恢复和任务投递"
+        "全部由 Labflow Supervisor 负责；不要启动 sub-agent，不观察文件，不判断流程，不创建 "
+        "artifact。"
     )
-    return _frontmatter("启动和恢复由 artifact DAG 驱动的长期角色。", "primary", permission) + body + "\n"
+    return _frontmatter("作为 Supervisor 管理的 DAG 根会话。", "primary", permission) + body + "\n"
 
 
 def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:

@@ -164,8 +164,8 @@ def collect_task_metrics(
         end = ended_ns // 1_000_000 if isinstance(ended_ns, int) else now_ms
         normalized.append({"record": task, "window": (start, max(start, end)), "messages": []})
 
-    # A message belongs to at most one task. This avoids double-counting when a
-    # single assistant turn submits one task and immediately pulls the next.
+    # A message belongs to at most one task. This also preserves correct accounting
+    # for historical runs where one turn submitted a task and pulled the next.
     for role, messages in messages_by_role.items():
         role_tasks = [item for item in normalized if item["record"].get("role") == role]
         for message in messages:
@@ -227,6 +227,7 @@ def _time(messages: list[dict[str, Any]]) -> dict[str, int | None]:
 
 
 def _task_wait_ms(message: dict[str, Any]) -> int:
+    """Exclude blocking pull time from historical pre-Supervisor-delivery runs."""
     info = message.get("info", {}).get("time", {})
     created = info.get("created")
     completed = info.get("completed")

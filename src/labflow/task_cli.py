@@ -18,7 +18,6 @@ from .config import ControlError
 
 SCHEMA = "labflow.workflow/v1"
 TASK_SCHEMA = "labflow.task-attempt/v1"
-DEFAULT_PULL_TIMEOUT = 60.0
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
 
 
@@ -307,7 +306,7 @@ def _task_response(workflow: dict[str, Any], status: dict[str, Any], task: dict[
                 assets[asset["path"]] = assets.get(asset["path"], False) or bool(fresh)
 
     return {
-        "target": {"name": name},
+        "target": {"name": name, "instruction": workflow["artifacts"][name]["instruction"]},
         "inputs": inputs,
         "assets": [{"path": path, "updated": updated} for path, updated in assets.items()],
     }
@@ -480,45 +479,39 @@ def restore_artifacts(root: Path, workflow: dict[str, Any], names: list[str]) ->
     return restored
 
 
-def pull(root: Path, workflow: dict[str, Any], role: str,
-         wait: bool, timeout: float | None) -> dict[str, Any] | None:
+def assign_task(root: Path, workflow: dict[str, Any], role: str,
+                preferred: str) -> dict[str, Any] | None:
+    """Atomically create or reuse one active Task for Supervisor delivery."""
     if role not in workflow["roles"]:
         raise TaskError(f"unknown workflow role: {role}", 64)
-    timeout = DEFAULT_PULL_TIMEOUT if timeout is None else timeout
-    if timeout < 0 or timeout > DEFAULT_PULL_TIMEOUT:
-        raise TaskError(f"pull timeout must be between 0 and {DEFAULT_PULL_TIMEOUT:g} seconds", 64)
-    deadline = time.monotonic() + timeout
-    while True:
-        with _locked(root):
-            status = evaluate(root, workflow)
-            active_path = _active_task_path(root, role)
-            active = _read_json(active_path)
-            if active is not None:
-                if _task_inputs_current(status, active):
-                    return _task_response(workflow, status, active)
-                _archive_active(root, active_path, active, "stale",
-                                "artifact inputs changed after pull")
-            runnable = [artifact for artifact in workflow["artifacts"].values()
-                        if artifact["owner"] == role and status["artifacts"][artifact["id"]]["runnable"]]
-            if runnable:
-                artifact = runnable[0]
-                started = time.time_ns()
-                task = {
-                    "schema": TASK_SCHEMA,
-                    "task_id": f"{role}-{started}",
-                    "role": role,
-                    "artifacts": [artifact["id"]],
-                    "inputs": {
-                        artifact["id"]: status["artifacts"][artifact["id"]]["input_mtime_ns"]
-                    },
-                    "started_at_ns": started,
-                    "status": "active",
-                }
-                _write_json(active_path, task)
-                return _task_response(workflow, status, task)
-        if not wait or time.monotonic() >= deadline:
+    artifact = workflow["artifacts"].get(preferred)
+    if artifact is None:
+        raise TaskError(f"unknown artifact: {preferred}", 64)
+    if artifact["owner"] != role:
+        raise TaskError(f"artifact is not owned by {role}: {preferred}", 64)
+    with _locked(root):
+        status = evaluate(root, workflow)
+        active_path = _active_task_path(root, role)
+        active = _read_json(active_path)
+        if active is not None:
+            if _task_inputs_current(status, active):
+                return _task_response(workflow, status, active)
+            _archive_active(root, active_path, active, "stale",
+                            "artifact inputs changed before task delivery")
+        if not status["artifacts"][preferred]["runnable"]:
             return None
-        time.sleep(.2)
+        started = time.time_ns()
+        task = {
+            "schema": TASK_SCHEMA,
+            "task_id": f"{role}-{started}",
+            "role": role,
+            "artifacts": [preferred],
+            "inputs": {preferred: status["artifacts"][preferred]["input_mtime_ns"]},
+            "started_at_ns": started,
+            "status": "active",
+        }
+        _write_json(active_path, task)
+        return _task_response(workflow, status, task)
 
 
 def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) -> dict[str, Any]:
@@ -530,15 +523,15 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
         active_path = _active_task_path(root, role)
         task = _read_json(active_path)
         if task is None:
-            raise TaskError(f"role has no active pulled task: {role}", 75)
+            raise TaskError(f"role has no active assigned task: {role}", 75)
         expected = task.get("artifacts")
         if not isinstance(expected, list) or set(names) != set(expected) or len(names) != len(expected):
-            raise TaskError(f"submit must contain the complete pulled task: {', '.join(expected or [])}", 64)
+            raise TaskError(f"submit must contain the complete assigned task: {', '.join(expected or [])}", 64)
         status = evaluate(root, workflow)
         if not _task_inputs_current(status, task):
             _archive_active(root, active_path, task, "stale",
-                            "artifact inputs changed after pull")
-            raise TaskError("artifact inputs changed after pull", 75)
+                            "artifact inputs changed after task assignment")
+            raise TaskError("artifact inputs changed after task assignment", 75)
         values = []
         for name in names:
             artifact = workflow["artifacts"].get(name)
@@ -568,13 +561,6 @@ def parser(prog: str = "labflow agent") -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog=prog, description="Work inside a Labflow execution.")
     value.add_argument("--root", type=Path)
     commands = value.add_subparsers(dest="command", required=True)
-    pull_command = commands.add_parser("pull")
-    pull_command.add_argument("role")
-    pull_command.add_argument("--no-wait", action="store_true")
-    pull_command.add_argument(
-        "--timeout", type=float, default=DEFAULT_PULL_TIMEOUT,
-        help="return a wait record after this many seconds; range 0..60 (default: 60)",
-    )
     submit_command = commands.add_parser("submit")
     submit_command.add_argument("role")
     submit_command.add_argument("artifacts", nargs="+")
@@ -594,10 +580,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
     args = parser(prog).parse_args(argv)
     try:
         root = args.root.resolve() if args.root else find_root(Path.cwd())
-        if args.command == "pull":
-            workflow = load_workflow(root)
-            result = pull(root, workflow, _id(args.role, "role"), not args.no_wait, args.timeout)
-        elif args.command == "submit":
+        if args.command == "submit":
             workflow = load_workflow(root)
             result = submit(root, workflow, _id(args.role, "role"),
                             [_id(name, "artifact") for name in args.artifacts])
