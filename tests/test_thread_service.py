@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -156,6 +157,15 @@ class ThreadServiceTest(unittest.TestCase):
         self.assertTrue((workspace / ".opencode/agents/a5.md").is_file())
         self.assertIn('"default_agent": "a5"',
                       (workspace / "opencode.json").read_text(encoding="utf-8"))
+        agent = (workspace / ".opencode/agents/a5.md").read_text(encoding="utf-8")
+        permission_line = next(
+            line for line in agent.splitlines() if line.startswith("permission: ")
+        )
+        permission = json.loads(permission_line.removeprefix("permission: "))
+        self.assertEqual(permission["read"]["engine.txt"], "allow")
+        self.assertEqual(permission["read"]["engine.txt/**"], "allow")
+        self.assertEqual(permission["read"]["thread-inputs/a5/**"], "allow")
+        self.assertEqual(permission["edit"]["answers/**"], "allow")
 
     def test_thread_metrics_are_split_by_host_round(self):
         messages = [
