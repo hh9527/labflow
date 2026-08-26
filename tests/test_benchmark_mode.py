@@ -159,6 +159,8 @@ class BenchmarkModeTest(unittest.TestCase):
                                        if line.startswith("permission: "))[12:])
         self.assertEqual(q_permission["task"], {"*": "deny", "a": "allow"})
         self.assertEqual(a_permission["task"], "deny")
+        self.assertNotIn("knowledge.txt", q_permission["read"])
+        self.assertEqual(a_permission["read"]["knowledge.txt"], "allow")
         self.assertEqual(q_permission["edit"]["ch/out/report.md"], "allow")
         self.assertNotIn("ch/q.md", q_permission["edit"])
         self.assertEqual(a_permission["edit"]["ch/out/**"], "allow")

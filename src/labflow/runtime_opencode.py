@@ -77,9 +77,8 @@ def _benchmark_role_assets(manifest: Manifest, role: str) -> dict[str, list[str]
         inputs = [asset["path"] for asset in execution["input"]]
         outputs = [asset["path"] for asset in execution["output"]]
         return {"read": [*inputs, *outputs], "write": outputs}
-    inputs = [asset["path"] for asset in execution["input"]]
     return {
-        "read": [*inputs, "problem/", "ch/"],
+        "read": ["problem/", "ch/out/"],
         "write": ["ch/out/report.md"],
     }
 
