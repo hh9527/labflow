@@ -212,6 +212,9 @@ class SupervisorRuntimeTest(unittest.TestCase):
             client = mock.Mock()
             client.statuses.return_value = {"ses_root": {"type": "idle"}}
             client.children.return_value = []
+            client.sessions.return_value = [{
+                "id": "ses_root", "title": "bench@1", "agent": "q",
+            }]
             client.session_messages.return_value = [message]
             supervisor = Supervisor(root, 4199)
             try:
@@ -224,6 +227,113 @@ class SupervisorRuntimeTest(unittest.TestCase):
             client.create_session.assert_not_called()
             status = json.loads((root / "supervisor-status.json").read_text())
             self.assertEqual(status["executions"][0]["title"], "bench@1")
+
+    def test_benchmark_detached_sessions_are_observed_and_collected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            workspace.mkdir(parents=True)
+            (root / "supervisor" / "bench@1").mkdir(parents=True)
+            control = bind_plan(root, "demo", "bench@1")
+            save_state(control, {
+                "schema": SCHEMA, "plan_id": "demo", "title": "bench@1",
+                "phase": "idle", "workspace": str(workspace),
+                "session_id": "ses_root", "workflow": None,
+                "execution": {
+                    "kind": "benchmark-mode", "questioner": "q", "answerer": "a",
+                },
+                "benchmark": {
+                    "sessions": [{"id": "ses_q", "agent": "q"}],
+                    "problems": [{
+                        "questioner_session_id": "ses_q",
+                        "answerer_session_id": "ses_a",
+                    }],
+                },
+            })
+            message = {
+                "info": {"id": "msg", "role": "assistant",
+                         "time": {"created": 10, "completed": 20},
+                         "tokens": {"output": 1}},
+                "parts": [{"type": "text", "text": "done"}],
+            }
+            client = mock.Mock()
+            client.statuses.return_value = {}
+            client.children.return_value = []
+            client.sessions.return_value = [
+                {"id": "ses_root", "title": "bench@1", "agent": "q"},
+                {"id": "ses_q", "title": "bench@1.batch-1.q", "agent": "q"},
+                {"id": "ses_a", "title": "bench@1.batch-1.a", "agent": "a"},
+            ]
+            client.session_messages.return_value = [message]
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            events = read(root / "timeline.sqlite3", "bench@1")
+            self.assertEqual({event["session"] for event in events}, {
+                "bench@1", "bench@1.batch-1.q", "bench@1.batch-1.a",
+            })
+            status = json.loads((root / "supervisor-status.json").read_text())
+            self.assertEqual(len(status["executions"][0]["sessions"]), 3)
+
+    def test_timeline_only_duplicate_roles_do_not_fail_or_create_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            (root / "supervisor" / "demo@1").mkdir(parents=True)
+            self._state(root, "demo@1", workspace, {
+                "schema": "labflow.workflow/v1", "roles": ["a1"], "artifacts": {},
+            }, {"kind": "dag-mode"})
+            client = mock.Mock()
+            client.statuses.return_value = {}
+            client.children.side_effect = lambda session_id: ([
+                {"id": "ses_a1_1", "title": "a1-one", "agent": "a1"},
+                {"id": "ses_a1_2", "title": "a1-two", "agent": "a1"},
+            ] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertEqual(supervisor.state.effects, {})
+            self.assertEqual(supervisor.state.executions["demo@1"].sessions, {})
+            status = json.loads((root / "supervisor-status.json").read_text())
+            self.assertEqual({item["status"] for item in
+                              status["executions"][0]["sessions"]}, {"idle"})
+
+    def test_restarting_once_does_not_duplicate_timeline_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            workspace.mkdir(parents=True)
+            (root / "supervisor" / "bench@1").mkdir(parents=True)
+            self._state(root, "bench@1", workspace, None, {
+                "kind": "benchmark-mode", "questioner": "q",
+            })
+            message = {
+                "info": {"id": "msg", "role": "assistant",
+                         "time": {"created": 10, "completed": 20},
+                         "tokens": {"output": 1}},
+                "parts": [{"type": "text", "text": "done"}],
+            }
+            client = mock.Mock()
+            client.statuses.return_value = {}
+            client.children.return_value = []
+            client.sessions.return_value = []
+            client.session_messages.return_value = [message]
+            with mock.patch("labflow.supervisor.Client", return_value=client):
+                for _ in range(2):
+                    supervisor = Supervisor(root, 4199)
+                    try:
+                        supervisor.step()
+                    finally:
+                        supervisor.close()
+
+            self.assertEqual(len(read(root / "timeline.sqlite3", "bench@1")), 2)
 
     def test_dag_goal_creates_and_prompts_one_missing_runnable_role(self):
         with tempfile.TemporaryDirectory() as temporary:

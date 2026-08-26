@@ -65,6 +65,7 @@ class ExecutionState:
     requests: tuple[str, ...] = ()
     optional_requests: tuple[str, ...] = ()
     sessions: dict[str, SessionState] = field(default_factory=dict)
+    observed_sessions: dict[str, SessionState] = field(default_factory=dict)
 
 
 @dataclass
@@ -136,6 +137,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             runnable=previous.runnable if previous else {},
             requests=previous.requests if previous else (),
             optional_requests=previous.optional_requests if previous else (),
+            observed_sessions=previous.observed_sessions if previous else {},
         )
         state.executions[event.execution] = execution
         return _reconcile_execution(state, execution)
@@ -155,6 +157,16 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         return []
     if event.kind == "artifact_deleted":
         execution.artifacts.pop(str(event.data["artifact"]), None)
+        return []
+    if event.kind == "observed_sessions_updated":
+        execution.observed_sessions = {
+            str(item["backend_id"]): SessionState(
+                str(item["role"]), str(item["title"]),
+                backend_id=str(item["backend_id"]),
+                status=str(item["status"]),
+            )
+            for item in event.data.get("sessions", ())
+        }
         return []
     if event.kind == "session_observed":
         role = str(event.data["role"])
@@ -223,6 +235,50 @@ def _session_tree(client: Client, root_id: str, root_title: str,
                 "role": str(child.get("agent") or child.get("title") or "unknown"),
             })
     return output
+
+
+def _observed_sessions(client: Client, root_id: str, root_title: str,
+                       root_role: str, value: dict[str, Any]) -> list[dict[str, str]]:
+    sessions = _session_tree(client, root_id, root_title, root_role)
+    by_id = {session["id"]: session for session in sessions}
+    execution = value.get("execution", {})
+    if execution.get("kind") != "benchmark-mode":
+        return sessions
+
+    referenced: dict[str, str] = {}
+    benchmark = value.get("benchmark", {})
+    for item in benchmark.get("sessions", ()) if isinstance(benchmark, dict) else ():
+        session_id = item.get("id") if isinstance(item, dict) else None
+        role = item.get("agent") if isinstance(item, dict) else None
+        if isinstance(session_id, str) and isinstance(role, str):
+            referenced[session_id] = role
+    for record in benchmark.get("problems", ()) if isinstance(benchmark, dict) else ():
+        if not isinstance(record, dict):
+            continue
+        for key, role in (
+            ("questioner_session_id", execution.get("questioner")),
+            ("answerer_session_id", execution.get("answerer")),
+        ):
+            session_id = record.get(key)
+            if isinstance(session_id, str) and isinstance(role, str):
+                referenced[session_id] = role
+
+    catalog = {
+        item["id"]: item for item in client.sessions()
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for session_id, role in referenced.items():
+        if session_id in by_id:
+            continue
+        item = catalog.get(session_id, {})
+        session = {
+            "id": session_id,
+            "title": str(item.get("title") or session_id),
+            "role": str(item.get("agent") or role),
+        }
+        sessions.append(session)
+        by_id[session_id] = session
+    return sessions
 
 
 class Supervisor:
@@ -307,13 +363,21 @@ class Supervisor:
                      if execution.get("kind") == "benchmark-mode" else "coordinator")
         client = Client(self.server_url, value["workspace"], root_id)
         statuses = client.statuses()
-        sessions = _session_tree(client, root_id, title, root_role)
+        sessions = _observed_sessions(client, root_id, title, root_role, value)
+        observed = [{
+            **session,
+            "backend_id": session["id"],
+            "status": statuses.get(session["id"], {"type": "idle"}).get("type", "idle"),
+        } for session in sessions]
+        reduce(self.state, LifecycleEvent(
+            "observed_sessions_updated", title, {"sessions": observed},
+        ))
         effects: list[Effect] = []
         observed_roles = set()
         for session in sessions:
             session_id = session["id"]
             role = session["role"]
-            if role in self.state.executions[title].roles:
+            if self.state.executions[title].dag and role in self.state.executions[title].roles:
                 if role in observed_roles:
                     effects.extend(reduce(self.state, LifecycleEvent(
                         "session_observed", title, {
@@ -346,11 +410,12 @@ class Supervisor:
                 if records:
                     self.writer.submit(records)
                 self.state.seen_messages.add(identity)
-        for role in self.state.executions[title].roles:
-            if role not in observed_roles:
-                effects.extend(reduce(self.state, LifecycleEvent(
-                    "session_missing", title, {"role": role},
-                )))
+        if self.state.executions[title].dag:
+            for role in self.state.executions[title].roles:
+                if role not in observed_roles:
+                    effects.extend(reduce(self.state, LifecycleEvent(
+                        "session_missing", title, {"role": role},
+                    )))
         return effects
 
     def _execute(self, effects: list[Effect]) -> None:
@@ -404,10 +469,11 @@ class Supervisor:
                 "requests": list(execution.requests),
                 "optional_requests": list(execution.optional_requests),
                 "sessions": [{
+                    "backend_id": session.backend_id,
                     "title": session.title,
                     "role": session.role,
                     "status": session.status,
-                } for session in execution.sessions.values()],
+                } for session in execution.observed_sessions.values()],
             } for execution in self.state.executions.values()],
         }
 
