@@ -160,7 +160,9 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 
 The initial question is sent verbatim. After each Answerer reply, the Questioner either supplies a
 narrow clarification grounded only in `q` and `k`, or ends the conversation. Labflow archives the
-transcript and declared outputs; correctness remains a Host judgment.
+transcript, declared outputs, and per-role time, token, thinking, and command metrics for every
+problem. Forked baseline history is excluded from measured problem metrics. Correctness remains a
+Host judgment.
 
 ## Run With uv
 
