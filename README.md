@@ -75,9 +75,17 @@ maintenance directory; the Supervisor then observes its Sessions and Timeline. A
 
 The Supervisor directory is desired state. For DAG executions its Artifact directory is canonical;
 the Agent workspace `control/artifacts` path is a generated link to it. `timeline.sqlite3` is one
-laboratory-wide append-only observation database. The Supervisor only writes closed `thinking`,
-`action`, and `reply` records; Host observation and statistics read it. Reducer scheduling state is
-kept in memory and never recovered from Timeline data.
+laboratory-wide append-only observation database. It stores closed Session and Turn activity plus
+Task, Artifact, Host-request, and DAG-revision facts. Host observation and statistics read it.
+Reducer scheduling state is kept in memory and never recovered from Timeline data.
+
+Every Timeline item can carry `session`, `turn`, `task_kind`, `task_id`, `artifact`, and
+`dag_revision` dimensions. A Task is either an Artifact task (`task_kind = artifact`, with the
+Artifact name as `task_id`) or a Benchmark problem (`task_kind = problem`, with the problem ID as
+`task_id`). One Task may span multiple Turns. A Turn belongs to at most one Task, while management
+Turns and workflow facts may omit either dimension. The DAG revision is the SHA-256 digest of the
+normalized Workflow, so it remains stable across Supervisor restarts and changes whenever the DAG
+definition changes.
 
 Scheduling is a reconciliation loop over desired and observed state:
 
@@ -97,8 +105,7 @@ execution maintenance directory forgets its scheduling state without deleting Ti
 
 The latest observation is written atomically to `<lab-root>/supervisor-status.json`, including all
 observed Session identities and states, required and optional Host requests, and role-level runtime
-errors. Host event queries merge operational task/Artifact/Host-action records with the closed
-Timeline; operational events are not copied into SQLite.
+errors. Host event queries merge the persisted Timeline with operational Host-action records.
 
 ## Artifact Workflow
 

@@ -44,7 +44,9 @@ def _event_id(kind: str, execution: str, session: str,
 
 
 def closed_message_events(execution: str, session: str, role: str | None,
-                          message: dict[str, Any]) -> list[dict[str, Any]]:
+                          message: dict[str, Any], *,
+                          task: tuple[str, str] | None = None,
+                          dag_revision: str | None = None) -> list[dict[str, Any]]:
     """Project one completed assistant message without exposing reasoning text."""
     info = message.get("info", {})
     if info.get("role") != "assistant":
@@ -55,8 +57,20 @@ def closed_message_events(execution: str, session: str, role: str | None,
     if not isinstance(message_id, str) or created is None or completed is None or completed < created:
         return []
 
-    base = {"execution": execution, "session": session, "role": role}
+    base = {
+        "execution": execution, "session": session, "turn": message_id,
+        "role": role,
+    }
+    if task is not None:
+        base.update({"task_kind": task[0], "task_id": task[1]})
+    if dag_revision is not None:
+        base["dag_revision"] = dag_revision
     result: list[dict[str, Any]] = []
+    result.append({
+        **base,
+        "id": _event_id("turn-started", execution, session, message_id, "start"),
+        "type": "turn_started", "at": created, "duration": 0,
+    })
     intervals: list[tuple[int, int]] = []
     for index, part in enumerate(message.get("parts", [])):
         if part.get("type") != "tool":
@@ -148,5 +162,9 @@ def closed_message_events(execution: str, session: str, role: str | None,
             if isinstance(source, int):
                 reply[target] = source
         result.append(reply)
+    result.append({
+        **base,
+        "id": _event_id("turn-ended", execution, session, message_id, "complete"),
+        "type": "turn_ended", "at": completed, "duration": completed - created,
+    })
     return result
-

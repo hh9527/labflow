@@ -16,7 +16,7 @@ from .config import ControlError, repository_root
 from .events import pending_optional_requests, pending_requests
 from .runtime_opencode import resume_prompt
 from .state import atomic_json, load_lab_config, load_state, validate_title
-from .task_cli import workflow_status
+from .task_cli import task_records, workflow_status
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
 
@@ -65,10 +65,12 @@ class ExecutionState:
     active: bool
     dag: bool
     roles: tuple[str, ...]
+    dag_revision: str | None = None
     artifacts: dict[str, int] = field(default_factory=dict)
     runnable: dict[str, tuple[tuple[str, int], ...]] = field(default_factory=dict)
     requests: tuple[str, ...] = ()
     optional_requests: tuple[str, ...] = ()
+    request_versions: dict[str, int] = field(default_factory=dict)
     sessions: dict[str, SessionState] = field(default_factory=dict)
     observed_sessions: dict[str, SessionState] = field(default_factory=dict)
     sessions_initialized: bool = False
@@ -84,6 +86,69 @@ class SupervisorState:
 def _effect_key(*values: Any) -> str:
     data = json.dumps(values, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _workflow_revision(workflow: Any) -> str | None:
+    if not isinstance(workflow, dict):
+        return None
+    encoded = json.dumps(
+        workflow, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _milliseconds(value: Any) -> int | None:
+    return value // 1_000_000 if isinstance(value, int) else None
+
+
+def _message_task(value: dict[str, Any], session_id: str, role: str,
+                  message: dict[str, Any]) -> tuple[str, str] | None:
+    info = message.get("info", {})
+    timing = info.get("time", {})
+    created = int(timing.get("created", 0))
+    completed = int(timing.get("completed", created))
+    execution = value.get("execution", {})
+    if execution.get("kind") == "benchmark-mode":
+        benchmark = value.get("benchmark", {})
+        for problem in benchmark.get("problems", ()) if isinstance(benchmark, dict) else ():
+            if not isinstance(problem, dict):
+                continue
+            problem_id = problem.get("problem") or problem.get("id")
+            started = _milliseconds(problem.get("started_at_ns"))
+            ended = _milliseconds(problem.get("end_at_ns"))
+            sessions = {
+                problem.get("questioner_session_id"), problem.get("answerer_session_id"),
+            }
+            if (isinstance(problem_id, str) and session_id in sessions
+                    and started is not None and started <= completed
+                    and (ended is None or ended >= created)):
+                return "problem", problem_id
+        metadata = Path(value["workspace"]) / "ch" / "metadata.json"
+        try:
+            active = json.loads(metadata.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        problem_id = active.get("id") if isinstance(active, dict) else None
+        started = _milliseconds(active.get("started_at_ns")) if isinstance(active, dict) else None
+        if isinstance(problem_id, str) and (started is None or started <= completed):
+            return "problem", problem_id
+        return None
+
+    if execution.get("kind") != "dag-mode":
+        return None
+    records = task_records(Path(value["workspace"]))
+    candidates = []
+    for task in (*records["history"], *records["active"]):
+        targets = task.get("artifacts")
+        started = _milliseconds(task.get("started_at_ns"))
+        ended = _milliseconds(task.get("submitted_at_ns") or task.get("ended_at_ns"))
+        if (task.get("role") == role and isinstance(targets, list) and len(targets) == 1
+                and isinstance(targets[0], str) and started is not None
+                and started <= completed and (ended is None or ended >= created)):
+            candidates.append((started, targets[0]))
+    if not candidates:
+        return None
+    return "artifact", max(candidates)[1]
 
 
 @contextmanager
@@ -158,12 +223,15 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             bool(data.get("active")),
             bool(data.get("dag")),
             tuple(data.get("roles", ())),
+            dag_revision=data.get("dag_revision"),
             artifacts=previous.artifacts if previous else {},
             sessions=previous.sessions if previous else {},
             runnable=(previous.runnable if previous and data.get("dag") else {}),
             requests=(previous.requests if previous and data.get("dag") else ()),
             optional_requests=(previous.optional_requests
                                if previous and data.get("dag") else ()),
+            request_versions=(previous.request_versions
+                              if previous and data.get("dag") else {}),
             observed_sessions=previous.observed_sessions if previous else {},
             sessions_initialized=previous.sessions_initialized if previous else False,
         )
@@ -173,12 +241,17 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
     if execution is None:
         return []
     if event.kind == "workflow_observed":
+        execution.dag_revision = event.data.get("dag_revision")
         execution.runnable = {
             role: tuple((str(item[0]), int(item[1])) for item in items)
             for role, items in event.data.get("runnable", {}).items()
         }
         execution.requests = tuple(event.data.get("requests", ()))
         execution.optional_requests = tuple(event.data.get("optional_requests", ()))
+        execution.request_versions = {
+            str(name): int(version)
+            for name, version in event.data.get("request_versions", {}).items()
+        }
         return _reconcile_execution(state, execution)
     if event.kind == "artifact_updated":
         execution.artifacts[str(event.data["artifact"])] = int(event.data["mtime_ns"])
@@ -355,6 +428,7 @@ class Supervisor:
             "active": active,
             "dag": (desired / "artifacts").is_dir() and isinstance(workflow, dict),
             "roles": roles,
+            "dag_revision": _workflow_revision(workflow),
         })
         return event, value
 
@@ -369,11 +443,94 @@ class Supervisor:
                 runnable.setdefault(status["owner"], []).append(
                     (name, int(status["input_mtime_ns"])),
                 )
+        required = pending_requests(workflow, artifacts)
+        optional = pending_optional_requests(workflow, artifacts)
         return LifecycleEvent("workflow_observed", title, {
             "runnable": runnable,
-            "requests": pending_requests(workflow, artifacts),
-            "optional_requests": pending_optional_requests(workflow, artifacts),
+            "requests": required,
+            "optional_requests": optional,
+            "request_versions": {
+                name: int(artifacts["artifacts"][name]["input_mtime_ns"])
+                for name in (*required, *optional)
+            },
+            "dag_revision": _workflow_revision(workflow),
         })
+
+    def _dag_revision_record(self, title: str, workflow: LifecycleEvent) -> dict[str, Any]:
+        revision = str(workflow.data["dag_revision"])
+        return {
+            "id": f"dag-revised:{title}:{revision}",
+            "execution": title,
+            "type": "dag_revised",
+            "at": int(time.time() * 1000),
+            "duration": 0,
+            "dag_revision": revision,
+        }
+
+    def _task_records(self, title: str, value: dict[str, Any]) -> list[dict[str, Any]]:
+        revision = _workflow_revision(value.get("workflow"))
+        workspace = Path(value["workspace"])
+        records = task_records(workspace)
+        result: list[dict[str, Any]] = []
+        for task in (*records["history"], *records["active"]):
+            attempt = task.get("task_id")
+            targets = task.get("artifacts")
+            started = _milliseconds(task.get("started_at_ns"))
+            if (not isinstance(attempt, str) or not isinstance(targets, list)
+                    or len(targets) != 1 or not isinstance(targets[0], str)
+                    or started is None):
+                continue
+            role = task.get("role")
+            session = None
+            execution = self.state.executions.get(title)
+            if execution is not None and isinstance(role, str):
+                known = execution.sessions.get(role)
+                session = known.title if known is not None else role
+            base = {
+                "execution": title, "session": session, "role": role,
+                "task_kind": "artifact", "task_id": targets[0],
+                "dag_revision": revision, "duration": 0,
+                "payload": {"attempt_id": attempt},
+            }
+            result.append({
+                **base, "id": f"task-started:{title}:{attempt}",
+                "type": "task_started", "at": started,
+            })
+            ended = _milliseconds(task.get("submitted_at_ns") or task.get("ended_at_ns"))
+            if ended is not None:
+                result.append({
+                    **base, "id": f"task-completed:{title}:{attempt}",
+                    "type": "task_completed", "at": ended,
+                    "payload": {"attempt_id": attempt, "status": task.get("status")},
+                })
+        return result
+
+    def _request_records(self, title: str, workflow: LifecycleEvent,
+                         previous: tuple[set[str], set[str], dict[str, int]]) -> list[dict[str, Any]]:
+        old_required, old_optional, old_versions = previous
+        required = set(workflow.data.get("requests", ()))
+        optional = set(workflow.data.get("optional_requests", ()))
+        revision = str(workflow.data["dag_revision"])
+        versions = workflow.data.get("request_versions", {})
+        now = int(time.time() * 1000)
+        result = []
+        for optional_flag, before, after in (
+            (False, old_required, required), (True, old_optional, optional),
+        ):
+            for kind, names in (
+                ("host_request_opened", after - before),
+                ("host_request_resolved", before - after),
+            ):
+                for name in sorted(names):
+                    marker = versions.get(name, old_versions.get(name, 0))
+                    result.append({
+                        "id": f"{kind}:{title}:{revision}:{name}:{marker}",
+                        "execution": title, "type": kind, "at": now, "duration": 0,
+                        "task_kind": "artifact", "task_id": name,
+                        "artifact": name, "dag_revision": revision,
+                        "payload": {"optional": optional_flag},
+                    })
+        return result
 
     def _artifact_events(self, title: str, desired: Path) -> list[LifecycleEvent]:
         directory = desired / "artifacts"
@@ -391,6 +548,26 @@ class Supervisor:
             if previous.get(name) != mtime
         )
         return events
+
+    def _artifact_records(self, title: str,
+                          events: list[LifecycleEvent]) -> list[dict[str, Any]]:
+        revision = self.state.executions[title].dag_revision
+        now = int(time.time() * 1000)
+        result = []
+        for event in events:
+            name = str(event.data["artifact"])
+            refreshed = event.kind == "artifact_updated"
+            at = (_milliseconds(event.data.get("mtime_ns")) if refreshed else now) or now
+            marker = event.data.get("mtime_ns", at)
+            result.append({
+                "id": f"{event.kind}:{title}:{name}:{marker}",
+                "execution": title,
+                "type": "artifact_refreshed" if refreshed else "artifact_deleted",
+                "at": at, "duration": 0, "artifact": name,
+                "task_kind": "artifact", "task_id": name,
+                "dag_revision": revision,
+            })
+        return result
 
     def _observe_sessions(self, title: str, value: dict[str, Any]) -> list[Effect]:
         root_id = value.get("session_id")
@@ -416,6 +593,19 @@ class Supervisor:
             session_id = session["id"]
             role = session["role"]
             messages = client.session_messages(session_id)
+            created = [
+                int(message.get("info", {}).get("time", {}).get("created"))
+                for message in messages
+                if isinstance(message.get("info", {}).get("time", {}).get("created"),
+                              (int, float))
+            ]
+            self.writer.submit([{
+                "id": f"session-started:{title}:{session_id}",
+                "execution": title, "session": session["title"],
+                "role": role, "type": "session_started",
+                "at": min(created, default=int(time.time() * 1000)), "duration": 0,
+                "payload": {"backend_id": session_id},
+            }])
             for message in messages:
                 info = message.get("info", {})
                 message_id = info.get("id")
@@ -428,6 +618,8 @@ class Supervisor:
                     completed_turns.add(session_id)
                 records = closed_message_events(
                     title, session["title"], role, message,
+                    task=_message_task(value, session_id, role, message),
+                    dag_revision=self.state.executions[title].dag_revision,
                 )
                 if records:
                     self.writer.submit(records)
@@ -533,13 +725,23 @@ class Supervisor:
         for title, path in desired.items():
             event, value = self._execution_event(title, path)
             effects = reduce(self.state, event)
-            for artifact_event in self._artifact_events(title, path):
+            artifact_events = self._artifact_events(title, path)
+            self.writer.submit(self._artifact_records(title, artifact_events))
+            for artifact_event in artifact_events:
                 effects.extend(reduce(self.state, artifact_event))
             effects.extend(self._observe_sessions(title, value))
             workflow = (self._workflow_event(title, value)
                         if self.state.executions[title].dag else None)
             if workflow is not None:
+                execution = self.state.executions[title]
+                previous = (
+                    set(execution.requests), set(execution.optional_requests),
+                    dict(execution.request_versions),
+                )
+                self.writer.submit([self._dag_revision_record(title, workflow)])
+                self.writer.submit(self._request_records(title, workflow, previous))
                 effects.extend(reduce(self.state, workflow))
+                self.writer.submit(self._task_records(title, value))
             self._execute(effects)
         atomic_json(self.root / "supervisor-status.json", self._status())
 
