@@ -161,6 +161,9 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual((measured["status"], measured["turns"]), ("completed", 2))
         self.assertEqual([item["text"].strip() for item in measured["transcript"]],
                          ["measured question", "Which region?", "EMEA", "final EMEA"])
+        self.assertEqual(measured["metrics"]["answerer"]["assistant_messages"], 2)
+        self.assertEqual(measured["metrics"]["questioner"]["assistant_messages"], 2)
+        self.assertEqual(measured["metrics"]["answerer"]["rounds"][0]["round"], 1)
         baseline_reply = self.client.values["ses_base"][-1]["info"]["id"]
         self.assertEqual(self.client.forks, [("ses_base", baseline_reply)])
         archived = self.root / "benchmark/problems/0001/outputs/answers/result.txt"

@@ -9,6 +9,7 @@ from typing import Any
 from .config import ControlError, sha256
 from .context import Context
 from .events import project_events
+from .metrics import summarize_thread_metrics
 from .observe import latest_assistant, text_parts
 from .state import load_state, locked, now, save_state
 
@@ -146,6 +147,7 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
         client, f"{context.state['session_name']}.{problem['id']}.q",
         context.state["session_id"], execution["questioner"],
     )
+    answerer_start = len(client.session_messages(answerer_session))
     transcript = [{"role": "q", "text": question}]
     started = int(time.time() * 1000)
     status = "turn_limit"
@@ -170,6 +172,9 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
         transcript.append({"role": "q", "text": action["text"],
                            "message_id": q_message.get("info", {}).get("id")})
     ended = int(time.time() * 1000)
+    metric_roles = context.state.get("metrics", context.manifest.metrics).get("roles", {})
+    answerer_messages = client.session_messages(answerer_session)[answerer_start:]
+    questioner_messages = client.session_messages(questioner_session)
     return {
         "id": problem["id"], "preflight": preflight, "status": status,
         "turns": sum(1 for item in transcript if item["role"] == "a"),
@@ -177,6 +182,18 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
         "answerer_session_id": answerer_session,
         "questioner_session_id": questioner_session,
         "transcript": transcript,
+        "metrics": {
+            "answerer": summarize_thread_metrics(
+                answerer_messages,
+                metric_roles.get(execution["answerer"], {}).get("commands", {}),
+                now_ms=ended,
+            ),
+            "questioner": summarize_thread_metrics(
+                questioner_messages,
+                metric_roles.get(execution["questioner"], {}).get("commands", {}),
+                now_ms=ended,
+            ),
+        },
         "outputs": _archive_outputs(context, problem["id"], execution["output"]),
     }
 
