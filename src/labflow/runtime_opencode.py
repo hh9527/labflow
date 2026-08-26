@@ -70,22 +70,13 @@ def _role_permission(role: dict[str, Any], assets: dict[str, list[str]]) -> dict
     }
 
 
-def _thread_service_assets(manifest: Manifest, role: str) -> dict[str, list[str]]:
+def _benchmark_role_assets(manifest: Manifest, role: str) -> dict[str, list[str]]:
     execution = manifest.execution
-    read: list[str] = []
-    for path in execution["bundle"]["paths"]:
-        read.extend((path, f"{path.rstrip('/')}/"))
-    read.append(f"thread-inputs/{role}/")
-
-    write: list[str] = []
-    for check in execution["baseline"]["checks"]:
-        parent = str(Path(check).parent)
-        target = f"{parent}/" if parent != "." else check
-        if target not in write:
-            write.append(target)
-        if target not in read:
-            read.append(target)
-    return {"read": list(dict.fromkeys(read)), "write": write}
+    if role == execution["answerer"]:
+        inputs = [asset["path"] for asset in execution["input"]]
+        outputs = [asset["path"] for asset in execution["output"]]
+        return {"read": [*inputs, *outputs], "write": outputs}
+    return {"read": [], "write": []}
 
 
 def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str:
@@ -126,8 +117,8 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
     agents.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
     config = workspace / "opencode.json"
-    primary = (manifest.execution["role"]
-               if manifest.execution["kind"] == "thread-service" else "coordinator")
+    primary = (manifest.execution["answerer"]
+               if manifest.execution["kind"] == "benchmark-mode" else "coordinator")
     atomic_json(config, {
         "$schema": "https://opencode.ai/config.json",
         "default_agent": primary,
@@ -143,16 +134,16 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
         "execution": manifest.execution,
     })
     generated.append(runtime_manifest)
-    if manifest.execution["kind"] == "artifact-dag":
+    if manifest.execution["kind"] == "dag-mode":
         coordinator = agents / "coordinator.md"
         atomic_write(coordinator, _coordinator(manifest).encode(), 0o444)
         generated.append(coordinator)
     for name, role in manifest.roles.items():
         instructions = (manifest.root / role["instructions"]).read_text(encoding="utf-8")
-        mode = "primary" if manifest.execution["kind"] == "thread-service" else "subagent"
+        mode = "primary" if manifest.execution["kind"] == "benchmark-mode" else "subagent"
         assets = (role_asset_permissions(manifest.workflow, name)
                   if manifest.workflow is not None
-                  else _thread_service_assets(manifest, name))
+                  else _benchmark_role_assets(manifest, name))
         text = (_frontmatter(role["description"], mode, _role_permission(role, assets))
                 + instructions.rstrip() + "\n")
         path = agents / f"{name}.md"

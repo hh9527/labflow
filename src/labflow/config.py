@@ -31,6 +31,33 @@ def safe_relative(value: str, kind: str = "path") -> PurePosixPath:
     return path
 
 
+def _benchmark_assets(value: Any, where: str, *, output: bool) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ControlError(f"{where} must be an array")
+    result = []
+    seen = set()
+    for index, item in enumerate(value):
+        item_where = f"{where}[{index}]"
+        if not isinstance(item, dict):
+            raise ControlError(f"{item_where} must be an object")
+        _keys(item, {"path", "level"} if output else {"path"}, item_where)
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ControlError(f"{item_where}.path must be nonempty")
+        directory = raw_path.endswith("/")
+        normalized = raw_path[:-1] if directory else raw_path
+        safe_relative(normalized, f"{item_where}.path")
+        path = f"{normalized}/" if directory else normalized
+        level = item.get("level", 2) if output else 0
+        if isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 2):
+            raise ControlError(f"{item_where}.level must be 0, 1, or 2")
+        if path in seen:
+            raise ControlError(f"duplicate Benchmark Asset path: {path}")
+        seen.add(path)
+        result.append({"path": path, "level": level})
+    return result
+
+
 def repository_root(cwd: Path | None = None) -> Path:
     from .external import resolve_cli
     result = subprocess.run(
@@ -69,7 +96,7 @@ class Manifest:
     manifest_name: str = "experiment.json"
     metrics: dict[str, Any] = field(default_factory=lambda: {"roles": {}})
     workflow: dict[str, Any] | None = None
-    execution: dict[str, Any] = field(default_factory=lambda: {"kind": "artifact-dag"})
+    execution: dict[str, Any] = field(default_factory=lambda: {"kind": "dag-mode"})
 
     @property
     def permission_preflight(self) -> dict[str, tuple[str, ...]]:
@@ -271,57 +298,88 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
             raise ControlError(str(exc), exc.code) from None
         if list(normalized_roles) != workflow["roles"]:
             raise ControlError("manifest roles must match workflow roles in declaration order")
-    execution_value = data.get("execution", {"kind": "artifact-dag"})
+    execution_value = data.get("execution", {"kind": "dag-mode"})
     if not isinstance(execution_value, dict):
         raise ControlError("execution must be an object")
     kind = execution_value.get("kind")
-    if kind == "artifact-dag":
+    if kind == "dag-mode":
         _keys(execution_value, {"kind"}, "execution")
         if workflow is None:
-            raise ControlError("artifact-dag execution requires a workflow")
+            raise ControlError("dag-mode execution requires a workflow")
         execution = {"kind": kind}
-    elif kind == "thread-service":
-        _keys(execution_value, {"kind", "role", "start", "baseline", "bundle"}, "execution")
-        role = execution_value.get("role")
-        if not isinstance(role, str) or role not in normalized_roles:
-            raise ControlError("thread-service execution.role must name a manifest role")
-        if list(normalized_roles) != [role]:
-            raise ControlError("thread-service execution requires exactly its primary role")
+    elif kind == "benchmark-mode":
+        _keys(execution_value, {"kind", "questioner", "answerer", "preflight",
+                                "input", "output", "problems", "bundle"}, "execution")
+        questioner = execution_value.get("questioner")
+        answerer = execution_value.get("answerer")
+        if (not isinstance(questioner, str) or questioner not in normalized_roles
+                or not isinstance(answerer, str) or answerer not in normalized_roles
+                or questioner == answerer):
+            raise ControlError("benchmark-mode requires distinct questioner and answerer roles")
+        if set(normalized_roles) != {questioner, answerer}:
+            raise ControlError("benchmark-mode requires exactly its questioner and answerer roles")
         if workflow is not None:
-            raise ControlError("thread-service execution cannot define artifact workflow")
-        start = execution_value.get("start")
-        if not isinstance(start, str):
-            raise ControlError("thread-service execution.start must be a path")
-        safe_relative(start, "thread-service start prompt")
-        if not (root / start).is_file():
-            raise ControlError(f"missing thread-service start prompt: {start}", 66)
-        baseline = execution_value.get("baseline")
-        if not isinstance(baseline, dict):
-            raise ControlError("thread-service execution.baseline must be an object")
-        _keys(baseline, {"checks", "command"}, "execution.baseline")
-        checks = _string_array(baseline.get("checks", []), "execution.baseline.checks")
-        if not checks:
-            raise ControlError("execution.baseline.checks must not be empty")
-        for value in checks:
-            safe_relative(value, "thread-service baseline check")
-        command = _string_array(baseline.get("command"), "execution.baseline.command")
-        if not command:
-            raise ControlError("execution.baseline.command must not be empty")
+            raise ControlError("benchmark-mode execution cannot define artifact workflow")
+        inputs = _benchmark_assets(execution_value.get("input", []), "execution.input",
+                                   output=False)
+        outputs = _benchmark_assets(execution_value.get("output", []), "execution.output",
+                                    output=True)
+        preflight = execution_value.get("preflight", 0)
+        if isinstance(preflight, bool) or not isinstance(preflight, int) or preflight < 0:
+            raise ControlError("execution.preflight must be a non-negative integer")
+        raw_problems = execution_value.get("problems")
+        if not isinstance(raw_problems, list) or not raw_problems:
+            raise ControlError("execution.problems must be a nonempty array")
+        problems = []
+        for index, problem in enumerate(raw_problems):
+            where = f"execution.problems[{index}]"
+            if not isinstance(problem, dict):
+                raise ControlError(f"{where} must be an object")
+            _keys(problem, {"q", "k", "maxTurns"}, where)
+            q = problem.get("q")
+            k = problem.get("k")
+            max_turns = problem.get("maxTurns", 3)
+            if not isinstance(q, str):
+                raise ControlError(f"{where}.q must be a path")
+            safe_relative(q, f"{where}.q")
+            if not (root / q).is_file():
+                raise ControlError(f"missing Benchmark question: {q}", 66)
+            if k is not None:
+                if not isinstance(k, str):
+                    raise ControlError(f"{where}.k must be a path")
+                safe_relative(k, f"{where}.k")
+                if not (root / k).is_file():
+                    raise ControlError(f"missing Benchmark hidden knowledge: {k}", 66)
+            if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+                raise ControlError(f"{where}.maxTurns must be a positive integer")
+            problem_id = Path(q).stem
+            validate_identifier(problem_id, f"{where} id")
+            if any(item["id"] == problem_id for item in problems):
+                raise ControlError(f"duplicate Benchmark problem id: {problem_id}")
+            problems.append({"id": problem_id, "q": q, "k": k,
+                             "maxTurns": max_turns})
+        if preflight > len(problems):
+            raise ControlError("execution.preflight exceeds the number of problems")
         bundle = execution_value.get("bundle")
-        if not isinstance(bundle, dict):
-            raise ControlError("thread-service execution.bundle must be an object")
-        _keys(bundle, {"paths"}, "execution.bundle")
-        bundle_paths = _string_array(bundle.get("paths", []), "execution.bundle.paths")
-        if not bundle_paths:
-            raise ControlError("execution.bundle.paths must not be empty")
-        for value in bundle_paths:
-            safe_relative(value, "thread-service bundle path")
+        bundle_paths: list[str] = []
+        if bundle is not None:
+            if not isinstance(bundle, dict):
+                raise ControlError("benchmark-mode execution.bundle must be an object")
+            _keys(bundle, {"paths"}, "execution.bundle")
+            bundle_paths = _string_array(bundle.get("paths", []), "execution.bundle.paths")
+            if not bundle_paths:
+                raise ControlError("execution.bundle.paths must not be empty")
+            for value in bundle_paths:
+                safe_relative(value, "benchmark-mode bundle path")
         execution = {
             "kind": kind,
-            "role": role,
-            "start": start,
-            "baseline": {"checks": checks, "command": command},
-            "bundle": {"paths": bundle_paths},
+            "questioner": questioner,
+            "answerer": answerer,
+            "preflight": preflight,
+            "input": inputs,
+            "output": outputs,
+            "problems": problems,
+            "bundle": {"paths": bundle_paths} if bundle is not None else None,
         }
     else:
         raise ControlError(f"unsupported execution kind: {kind!r}")

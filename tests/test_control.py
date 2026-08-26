@@ -229,9 +229,7 @@ class ConfigStateTest(unittest.TestCase):
     def test_control_surface_includes_connection_preflight(self):
         self.assertEqual(set(control_parser()._subparsers._group_actions[0].choices),
                          {"test-connect", "start", "stat", "status", "pull", "event",
-                          "update", "submit", "resume", "abort-sessions",
-                          "approve-baseline", "open-thread", "comment-thread",
-                          "close-thread"})
+                          "update", "submit", "resume", "abort-sessions"})
         args = control_parser().parse_args(["pull", "t1", "demo/1", "123", "--timeout", "5"])
         self.assertEqual((args.session_name, args.since, args.timeout), ("demo/1", 123, 5.0))
         event = control_parser().parse_args(["event", "t1", "demo/1", "task:a1-1"])
@@ -369,13 +367,13 @@ class ConfigStateTest(unittest.TestCase):
         self.assertEqual(client.prompt_session.call_args_list[1].args[0], "ses_a5_new")
 
     def test_start_requires_lab_and_plan_identity(self):
-        args = control_parser().parse_args(["start", "t1", "sample-plan"])
+        args = control_parser().parse_args(["start", "t1", "sample-plan/1", "sample-plan"])
         self.assertEqual(
-            (args.command, args.lab_name, args.plan_id, args.from_session),
-            ("start", "t1", "sample-plan", None),
+            (args.command, args.lab_name, args.session_name, args.plan_id, args.from_session),
+            ("start", "t1", "sample-plan/1", "sample-plan", None),
         )
         inherited = control_parser().parse_args(
-            ["start", "t1", "sample-plan", "--from", "sample-plan/1"]
+            ["start", "t1", "sample-plan/2", "sample-plan", "--from", "sample-plan/1"]
         )
         self.assertEqual(inherited.from_session, "sample-plan/1")
 
@@ -576,7 +574,7 @@ class ConfigStateTest(unittest.TestCase):
         ), mock.patch(
             "labflow.cli_host._start", return_value={"kind": "initial"}
         ), redirect_stdout(output):
-            result = control_main(["start", "t1", "sample-plan"])
+            result = control_main(["start", "t1", "sample-plan/2", "sample-plan"])
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["session_name"], "sample-plan/2")
         prepare_call.assert_called_once_with(
@@ -1455,17 +1453,16 @@ class StatusSummaryTest(unittest.TestCase):
             context.root = workspace / "execution"
             context.client.return_value.children.return_value = []
             result = _host_pull(context, started_at_ns // 1_000_000 - 1, timeout=60)
-            self.assertEqual(result["reason"], "requests_changed")
-            self.assertLess(result["waited_ms"], 1000)
-            self.assertEqual(result["requests"], ["output-2"])
+            self.assertLess(result["timeline"]["waited_ms"], 1000)
+            self.assertEqual(result["result"], {"requests": ["output-2"]})
             self.assertFalse(workflow_status(workspace, workflow)["artifacts"]["output-2"]["submittable"])
-            self.assertEqual([event["status"] for event in result["events"]
+            self.assertEqual([event["status"] for event in result["timeline"]["events"]
                               if event["type"] == "task"], ["submitted"])
-            repeated = _host_pull(context, result["next_since"], timeout=0)
-            self.assertEqual([event["id"] for event in repeated["events"]],
-                             [event["id"] for event in result["events"]
-                              if event["at"] == result["next_since"]])
-            self.assertEqual(repeated["requests"], ["output-2"])
+            repeated = _host_pull(context, result["timeline"]["next_since"], timeout=0)
+            self.assertEqual([event["id"] for event in repeated["timeline"]["events"]],
+                             [event["id"] for event in result["timeline"]["events"]
+                              if event["at"] == result["timeline"]["next_since"]])
+            self.assertEqual(repeated["result"], {"requests": ["output-2"]})
 
     def test_host_pull_reports_every_ready_host_artifact(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1492,9 +1489,8 @@ class StatusSummaryTest(unittest.TestCase):
 
             result = _host_pull(context, None, timeout=.02)
 
-            self.assertEqual(result["reason"], "requests_changed")
-            self.assertLess(result["waited_ms"], 1000)
-            self.assertEqual(result["requests"], ["input-optional"])
+            self.assertLess(result["timeline"]["waited_ms"], 1000)
+            self.assertEqual(result["result"], {"requests": ["input-optional"]})
 
     def test_host_pull_rejects_waits_longer_than_one_minute(self):
         context = mock.Mock(state={"workflow": {"roles": []}})

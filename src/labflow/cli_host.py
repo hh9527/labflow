@@ -24,7 +24,7 @@ from .lifecycle import (
     send_round,
     verify_prepared,
 )
-from .metrics import collect_metrics, summarize_thread_metrics
+from .metrics import collect_metrics
 from .observe import assistant_messages, text_parts
 from .runtime_opencode import START_PROMPT, resume_prompt
 from .state import (
@@ -35,17 +35,11 @@ from .state import (
     load_state,
     record_connect_test,
 )
+from .benchmark_mode import run as run_benchmark
 from .task_cli import (
     TaskError, remove_artifact, supersede_role_task, task_records, workflow_status,
 )
-from .thread_service import (
-    approve_baseline,
-    close_thread,
-    comment_thread,
-    install_bundle,
-    open_thread,
-    thread_records,
-)
+from .bundle import install_bundle
 
 
 def emit(value: object) -> None:
@@ -81,12 +75,13 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
     event.add_argument("event_id")
     start = commands.add_parser("start")
     start.add_argument("lab_name")
+    start.add_argument("session_name")
     start.add_argument("plan_id")
     start.add_argument(
         "--from", dest="from_session",
         help="inherit current artifacts and checked files from an earlier execution",
     )
-    start.add_argument("--bundle", help="install a declared thread-service input bundle")
+    start.add_argument("--bundle", help="install a declared benchmark-mode input bundle")
     update = commands.add_parser("update")
     target(update)
     update.add_argument("assets", nargs="+")
@@ -109,22 +104,6 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
         help="abort active sessions belonging to a completed or retired execution",
     )
     target(abort_sessions)
-    approve = commands.add_parser("approve-baseline", help="freeze a qualified role session")
-    target(approve)
-    approve.add_argument("role")
-    open_item = commands.add_parser("open-thread", help="fork the baseline for one production problem")
-    target(open_item)
-    open_item.add_argument("role")
-    open_item.add_argument("thread_name")
-    open_item.add_argument("problem_file")
-    comment = commands.add_parser("comment-thread", help="continue the active problem session")
-    target(comment)
-    comment.add_argument("role")
-    comment.add_argument("thread_name")
-    comment.add_argument("comment_file")
-    close = commands.add_parser("close-thread", help="archive the active problem session")
-    target(close)
-    close.add_argument("role")
     return root
 
 
@@ -154,15 +133,18 @@ def _configure_start(repo: Path, lab_name: str, plan_id: str,
     lab = load_lab_config(repo, lab_name)
     load_connect_test(lab_name, Path(lab["root"]))
     manifest = load_manifest(repo, plan_id)
-    if manifest.execution["kind"] == "thread-service":
-        if bundle is None:
-            raise ControlError("thread-service start requires --bundle", 64)
+    if manifest.execution["kind"] == "benchmark-mode":
         if from_session is not None:
-            raise ControlError("thread-service start does not support --from", 64)
-        if not Path(bundle).expanduser().is_dir():
+            raise ControlError("benchmark-mode start does not support --from", 64)
+        requires_bundle = manifest.execution.get("bundle") is not None
+        if requires_bundle and bundle is None:
+            raise ControlError("benchmark-mode plan requires --bundle", 64)
+        if not requires_bundle and bundle is not None:
+            raise ControlError("benchmark-mode plan does not accept --bundle", 64)
+        if bundle is not None and not Path(bundle).expanduser().is_dir():
             raise ControlError(f"bundle is not a directory: {bundle}", 66)
     elif bundle is not None:
-        raise ControlError("--bundle is only valid for a thread-service plan", 64)
+        raise ControlError("--bundle is only valid for a benchmark-mode plan", 64)
     return {**lab, "lab_name": lab_name,
             "bundle": str(Path(bundle).expanduser().resolve()) if bundle else None}
 
@@ -441,65 +423,38 @@ def _intervention_summary(context: Context) -> dict[str, Any]:
 
 def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
     workspace = _workspace(context)
-    execution = context.state.get("execution", {"kind": "artifact-dag"})
-    if execution["kind"] == "thread-service":
+    execution = context.state.get("execution", {"kind": "dag-mode"})
+    if execution["kind"] == "benchmark-mode":
         client = context.client()
         statuses = client.statuses()
-        service = context.state.get("thread_service", {})
-        baseline = service.get("baseline")
-        records = thread_records(context)
-        sessions = []
-        message_map: dict[str, list[dict[str, Any]]] = {}
-        root_session = context.state.get("session_id")
-        role = execution["role"]
-        if isinstance(root_session, str):
-            sessions.append({"id": root_session, "agent": role, "title": "qualification baseline"})
-            message_map[root_session] = client.session_messages(root_session)
-        for record in records:
-            session_id = record.get("session_id")
-            if not isinstance(session_id, str):
-                continue
-            sessions.append({"id": session_id, "agent": role,
-                             "title": f"thread {record.get('name')}"})
-            opened = record.get("opened_at_ms", 0)
-            message_map[session_id] = [
-                message for message in client.session_messages(session_id)
-                if message.get("info", {}).get("time", {}).get("created", 0) >= opened
-            ]
-        command_definitions = context.state.get(
-            "metrics", context.manifest.metrics
-        ).get("roles", {}).get(role, {}).get("commands", {})
+        session_id = context.state.get("session_id")
+        answerer = execution["answerer"]
+        questioner = execution["questioner"]
+        sessions = ([{"id": session_id, "agent": answerer,
+                      "title": context.state["session_name"]}]
+                    if isinstance(session_id, str) else [])
+        if isinstance(session_id, str):
+            for child in client.children(session_id):
+                child_id = child.get("id")
+                if not isinstance(child_id, str):
+                    continue
+                title = str(child.get("title", ""))
+                agent = child.get("agent") or (questioner if title.endswith(".q") else answerer)
+                sessions.append({"id": child_id, "agent": agent, "title": title})
+        message_map = {item["id"]: client.session_messages(item["id"])
+                       for item in sessions}
         metrics = collect_metrics(
             context.state["session_name"], context.state["phase"], workspace, sessions,
-            message_map.__getitem__, context.state.get("metrics", context.manifest.metrics),
+            message_map.__getitem__,
+            context.state.get("metrics", context.manifest.metrics),
             {"active": [], "history": []},
         )
         metrics["host_interventions"] = _intervention_summary(context)
-        metrics["thread_service"] = {
-            "baseline": baseline,
-            "baseline_metrics": (
-                summarize_thread_metrics(
-                    message_map.get(root_session, []), command_definitions
-                ) if isinstance(root_session, str) else None
-            ),
-            "active": service.get("active"),
-            "threads": [
-                {**record, "metrics": summarize_thread_metrics(
-                    message_map.get(record.get("session_id"), []), command_definitions
-                )}
-                for record in records
-            ],
-        }
-        active_session = (service.get("active") or {}).get("session_id") or root_session
         agents = [{
-            "role": role,
-            "session_id": active_session,
-            "state": "thread_active" if service.get("active") else (
-                "ready" if baseline else "qualification"
-            ),
-            "runtime_state": statuses.get(active_session, {"type": "idle"}),
-            "active_thread": service.get("active"),
-        }]
+            "role": item["agent"], "session_id": item["id"],
+            "state": statuses.get(item["id"], {"type": "idle"}).get("type", "idle"),
+            "runtime_state": statuses.get(item["id"], {"type": "idle"}),
+        } for item in sessions]
         return metrics, {"agents": agents, "records": {"active": [], "history": []}}
     children, messages, statuses = _live_children(context)
     records = task_records(workspace)
@@ -551,19 +506,18 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
                 "workspace": context.state.get("workspace"),
                 "next_host_actions": [], "agents": []}
     metrics, detail = _metrics(context)
-    if context.state.get("execution", {}).get("kind") == "thread-service":
-        service = context.state.get("thread_service", {})
-        baseline = service.get("baseline")
+    if context.state.get("execution", {}).get("kind") == "benchmark-mode":
+        benchmark = context.state.get("benchmark", {})
         result = {
             "session_name": context.state["session_name"],
             "phase": context.state["phase"],
             "workspace": context.state.get("workspace"),
-            "baseline": {
-                "approved": baseline is not None,
-                "approved_at": baseline.get("approved_at") if baseline else None,
+            "benchmark": {
+                "status": benchmark.get("status", "not_started"),
+                "completed_problems": len(benchmark.get("problems", [])),
+                "total_problems": len(context.manifest.execution["problems"]),
+                "preflight": context.manifest.execution["preflight"],
             },
-            "active_thread": service.get("active"),
-            "threads": metrics["thread_service"]["threads"],
             "agents": detail["agents"],
             "tokens": metrics["aggregate"]["tokens"],
         }
@@ -642,15 +596,12 @@ def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) ->
     started_ms = int(time.time() * 1000)
     since = started_ms if since_ms is None else since_ms
     deadline = time.monotonic() + timeout
-    reason = "timeout"
     requests = []
     previous_requests = _request_snapshot(context)
     while True:
         artifacts = workflow_status(_workspace(context), workflow)
-        at_ms = int(time.time() * 1000)
         requests = pending_requests(workflow, artifacts)
         if requests != previous_requests:
-            reason = "requests_changed"
             break
         if time.monotonic() >= deadline:
             break
@@ -660,40 +611,28 @@ def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) ->
     events = project_events(context, since)
     artifacts = workflow_status(_workspace(context), workflow)
     requests = pending_requests(workflow, artifacts)
-    if requests != previous_requests:
-        reason = "requests_changed"
-    elif reason == "requests_changed":
-        reason = "state_changed"
     _save_request_snapshot(context, requests)
     next_since = max([since, *(event["at"] for event in events)])
     return {
-        "schema": "labflow.host-pull/v3",
+        "schema": "labflow.host-observation/v1",
         "session_name": context.state["session_name"],
-        "clock": "unix_ms",
-        "since": since,
-        "next_since": next_since,
-        "observed_at": int(time.time() * 1000),
-        "waited_ms": ended_ms - started_ms,
-        "reason": reason,
-        "events": events,
-        "requests": requests,
+        "timeline": {
+            "clock": "unix_ms",
+            "since": since,
+            "next_since": next_since,
+            "observed_at": int(time.time() * 1000),
+            "waited_ms": ended_ms - started_ms,
+            "events": events,
+        },
+        "result": {"requests": requests} if requests else None,
     }
 
 
 def _start(context: Context) -> dict[str, Any]:
     context.client().health()
     verify_prepared(context.manifest, context.state)
-    if context.manifest.execution["kind"] == "thread-service":
-        initial = [record for record in context.rounds() if record.get("kind") == "qualification"]
-        if initial and initial[0].get("user_message_id"):
-            return initial[0]
-        prompt = (context.manifest.root / context.manifest.execution["start"]).read_text(
-            encoding="utf-8"
-        )
-        return send_round(
-            context, "qualification", prompt, require_empty=True,
-            agent=context.manifest.execution["role"],
-        )
+    if context.manifest.execution["kind"] == "benchmark-mode":
+        return run_benchmark(context)
     initial = [record for record in context.rounds() if record.get("kind") == "initial"]
     if initial and initial[0].get("user_message_id"):
         return initial[0]
@@ -716,12 +655,6 @@ def _abort_sessions(context: Context, timeout: float = 5.0) -> dict[str, Any]:
             child["id"] for child in client.children(session_id)
             if isinstance(child.get("id"), str)
         )
-    if context.state.get("execution", {}).get("kind") == "thread-service":
-        for record in thread_records(context):
-            session_id = record.get("session_id")
-            if isinstance(session_id, str) and session_id not in sessions:
-                sessions.append(session_id)
-
     statuses = client.statuses()
     active = [session_id for session_id in sessions
               if statuses.get(session_id, {}).get("type") == "busy"]
@@ -761,7 +694,9 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
             client = Client(
                 f"http://127.0.0.1:{configured['port']}", configured["root"]
             )
-            session_name = next_session_title(client, args.plan_id, configured["root"])
+            session_name = args.session_name
+            if any(item.get("title") == session_name for item in client.sessions()):
+                raise ControlError(f"OpenCode Session title already exists: {session_name}", 64)
             root, state, _ = prepare(
                 args.plan_id,
                 session_name,
@@ -770,8 +705,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
                 lab_name=args.lab_name,
                 lab_root=configured["root"],
             )
-            execution = state.get("execution", {"kind": "artifact-dag"})
-            if execution["kind"] == "thread-service":
+            execution = state.get("execution", {"kind": "dag-mode"})
+            if execution["kind"] == "benchmark-mode":
                 manifest = load_manifest(repo, args.plan_id)
                 state = install_bundle(root, state, manifest, configured.get("bundle"))
             create_execution_session(root, state, session_name)
@@ -795,16 +730,6 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
             emit(_resume(context, args.role, args.timeout, force=args.force))
         elif args.command == "abort-sessions":
             emit(_abort_sessions(context))
-        elif args.command == "approve-baseline":
-            emit(approve_baseline(context, args.role))
-        elif args.command == "open-thread":
-            emit(open_thread(context, args.role, args.thread_name, args.problem_file))
-        elif args.command == "comment-thread":
-            emit(comment_thread(
-                context, args.role, args.thread_name, args.comment_file
-            ))
-        elif args.command == "close-thread":
-            emit(close_thread(context, args.role))
         return 0
     except (ControlError, TaskError) as exc:
         print(f"{prog}: {exc}", file=sys.stderr)

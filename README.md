@@ -12,6 +12,20 @@ Session   carries agent context
 Labflow currently provides an OpenCode runtime adapter. Workflow plans and the Artifact/Asset
 protocol are independent of the application, language, and domain under test.
 
+## Execution Modes
+
+Labflow has two distinct execution modes:
+
+```text
+dag-mode      A coordinator starts persistent role Agents; Artifact pressure drives pull/submit work.
+benchmark-mode  A Questioner and Answerer run a fixed, answer-free problem suite.
+```
+
+`dag-mode` requires a Workflow and derives role permissions from Artifact Assets. `benchmark-mode`
+has no Workflow or coordinator. It gives the Answerer read-only inputs and writable outputs while
+keeping each problem's optional hidden knowledge private to the Questioner. Leading `preflight`
+problems warm one Answerer Session; every measured problem forks the same warmed boundary.
+
 ## Commands
 
 Labflow has one executable and three command groups:
@@ -27,7 +41,7 @@ Typical use from a project Git worktree:
 ```bash
 labflow lab run local --port 4199
 labflow host test-connect local
-labflow host start local sample-plan
+labflow host start local sample-plan/1 sample-plan
 labflow host status local sample-plan/1
 labflow lab ls local
 labflow lab attach local sample-plan/1
@@ -124,6 +138,29 @@ for Assets. Labflow does not hash Asset contents to infer workflow changes.
 
 When no work becomes available before the 60-second timeout, pull returns JSON `null`. A persistent
 Agent immediately pulls again.
+
+## Benchmark Mode
+
+Benchmark plans declare inputs, outputs, and questions without expected answers:
+
+```json
+{
+  "kind": "benchmark-mode",
+  "questioner": "q",
+  "answerer": "a",
+  "preflight": 1,
+  "input": [{"path": "knowledge/"}],
+  "output": [{"path": "answers/", "level": 2}],
+  "problems": [
+    {"q": "problems/0000.md", "maxTurns": 2},
+    {"q": "problems/0001.md", "k": "problems/0001-info.md", "maxTurns": 3}
+  ]
+}
+```
+
+The initial question is sent verbatim. After each Answerer reply, the Questioner either supplies a
+narrow clarification grounded only in `q` and `k`, or ends the conversation. Labflow archives the
+transcript and declared outputs; correctness remains a Host judgment.
 
 ## Run With uv
 
