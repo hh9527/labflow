@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "labflow"
+version = "0.1.0"
+description = "Runtime-neutral laboratories for agent workflow experiments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "hh9527" }]
+dependencies = []
+
+[project.scripts]
+labflow = "labflow.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/labflow"]
