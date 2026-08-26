@@ -45,13 +45,16 @@ labflow host test-connect local
 labflow host start local sample-plan
 labflow host status local sample-plan@1
 labflow attach local
+# Stop the server, then reclaim the laboratory:
+labflow lab remove local
 ```
 
 `labflow lab run` creates `.labs/<lab-name>` as a symbolic link to the temporary Lab root. The Lab
 root's `config.json` is the configuration source of truth; it records the Lab name, port, and Host
 workspace. Agent workspaces live at `ws/<plan-id>[.<variant>]@<generation>/`, while Host-only state
-and archives live under `control/` and `archive/`. Stopping the foreground process terminates the
-server, removes the symbolic link, and reclaims the Lab root.
+and archives live under `control/` and `archive/`. `lab run` replaces its own process with the
+OpenCode server, so a running laboratory does not retain Labflow's runtime. After stopping the
+server, `lab remove` removes the symbolic link and reclaims the Lab root.
 
 ## Artifact Workflow
 

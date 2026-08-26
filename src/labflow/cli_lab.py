@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
-from typing import Any
 
-from .client import Client
 from .config import ControlError, repository_root, validate_identifier
 from .external import resolve_cli
 from .lifecycle import opencode_environment
@@ -23,6 +21,8 @@ def parser(prog: str = "labflow lab") -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run a foreground headless laboratory")
     run.add_argument("lab_name")
     run.add_argument("--port", type=int)
+    remove = commands.add_parser("remove", help="remove a stopped laboratory")
+    remove.add_argument("lab_name")
     return root
 
 
@@ -55,47 +55,37 @@ def _run(repo: Path, lab_name: str, requested_port: int | None) -> int:
     lab_root = Path(tempfile.mkdtemp(prefix=f"labflow-{lab_name}-", dir="/tmp")).resolve()
     log_path = lab_root / "logs" / "opencode.log"
     log_path.parent.mkdir()
-    log = log_path.open("ab")
-    server = subprocess.Popen(
-        [*opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port), "--pure"],
-        cwd=lab_root,
-        env=opencode_environment({}),
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    config: dict[str, Any] | None = None
+    config = create_lab_config(repo, lab_name, port, lab_root)
+    print(f"Lab {lab_name} is starting on port {port}; root={lab_root}", flush=True)
+    command = [*opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port), "--pure"]
     try:
-        client = Client(f"http://127.0.0.1:{port}", str(lab_root), timeout=.1)
-        deadline = time.monotonic() + 10
-        while True:
-            if server.poll() is not None:
-                raise ControlError(f"opencode daemon exited; see {log_path}", 70)
-            try:
-                client.health()
-                break
-            except ControlError:
-                if time.monotonic() >= deadline:
-                    raise ControlError(f"timed out connecting to lab; see {log_path}", 69) from None
-                time.sleep(.1)
-        config = create_lab_config(repo, lab_name, port, lab_root)
-        print(f"Lab {lab_name} is ready on port {port}; root={lab_root}", flush=True)
-        returncode = server.wait()
-        if returncode:
-            raise ControlError(f"opencode daemon exited with status {returncode}; see {log_path}", 70)
+        os.chdir(lab_root)
+        with log_path.open("ab", buffering=0) as log:
+            os.dup2(log.fileno(), 1)
+            os.dup2(log.fileno(), 2)
+        os.execvpe(command[0], command, opencode_environment({}))
         return 0
-    finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=5)
-        log.close()
-        if config is not None:
-            remove_lab_config(repo, lab_name, config)
+    except OSError:
+        remove_lab_config(repo, lab_name, config)
         shutil.rmtree(lab_root, ignore_errors=True)
+        raise
+
+
+def _remove(repo: Path, lab_name: str) -> dict[str, str]:
+    lab_name = validate_identifier(lab_name, "lab-name")
+    config = load_lab_config(repo, lab_name)
+    lab_root = Path(config["root"])
+    expected_parent = Path(tempfile.gettempdir()).resolve()
+    if lab_root.parent != expected_parent or not lab_root.name.startswith(f"labflow-{lab_name}-"):
+        raise ControlError(f"refusing to remove unexpected lab root: {lab_root}", 64)
+    try:
+        with socket.create_connection(("127.0.0.1", config["port"]), timeout=.2):
+            raise ControlError(f"lab {lab_name} is still running", 75)
+    except OSError:
+        pass
+    remove_lab_config(repo, lab_name, config)
+    shutil.rmtree(lab_root)
+    return {"name": lab_name, "root": str(lab_root), "removed": "true"}
 
 
 def _attach(repo: Path, lab_name: str) -> int:
@@ -108,7 +98,11 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow lab") -> int:
     args = parser(prog).parse_args(argv)
     try:
         repo = repository_root(Path.cwd())
-        return _run(repo, args.lab_name, args.port)
+        if args.command == "run":
+            return _run(repo, args.lab_name, args.port)
+        result = _remove(repo, args.lab_name)
+        print(f"Removed lab {result['name']}; root={result['root']}")
+        return 0
     except ControlError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)
         return exc.code

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -421,6 +422,8 @@ class ConfigStateTest(unittest.TestCase):
     def test_lab_run_accepts_name_and_optional_port(self):
         args = lab_parser().parse_args(["run", "t1", "--port", "4199"])
         self.assertEqual((args.command, args.lab_name, args.port), ("run", "t1", 4199))
+        remove = lab_parser().parse_args(["remove", "t1"])
+        self.assertEqual((remove.command, remove.lab_name), ("remove", "t1"))
         self.assertEqual(attach_parser().parse_args(["t1"]).lab_name, "t1")
 
     def test_labflow_groups_lab_host_and_agent_commands(self):
@@ -454,12 +457,6 @@ class ConfigStateTest(unittest.TestCase):
 
     def test_run_only_hosts_the_headless_daemon(self):
         with tempfile.TemporaryDirectory() as temporary:
-            server = mock.Mock()
-            server.poll.side_effect = [None, 0]
-            server.wait.return_value = 0
-            client = mock.Mock()
-            client.health.return_value = {"healthy": True}
-            reservation = mock.MagicMock()
             stdout = StringIO()
             with mock.patch(
                 "labflow.cli_lab.repository_root",
@@ -467,19 +464,51 @@ class ConfigStateTest(unittest.TestCase):
             ), mock.patch(
                 "labflow.cli_lab.resolve_cli", return_value=("opencode",)
             ), mock.patch(
-                "labflow.cli_lab.subprocess.Popen", return_value=server
-            ) as popen, mock.patch(
-                "labflow.cli_lab.subprocess.run"
-            ) as run, mock.patch(
-                "labflow.cli_lab.Client", return_value=client
-            ), redirect_stdout(stdout):
+                "labflow.cli_lab.os.chdir"
+            ) as chdir, mock.patch(
+                "labflow.cli_lab.os.dup2"
+            ), mock.patch(
+                "labflow.cli_lab.os.execvpe"
+            ) as execvpe, redirect_stdout(stdout):
                 result = lab_main(["run", "t1", "--port", "4199"])
-        self.assertEqual(result, 0)
-        self.assertFalse((Path(temporary) / ".labs/t1").is_symlink())
-        self.assertEqual(popen.call_count, 1)
-        self.assertIn("serve", popen.call_args.args[0])
-        run.assert_not_called()
-        self.assertIn("Lab t1 is ready", stdout.getvalue())
+            self.assertEqual(result, 0)
+            self.assertTrue((Path(temporary) / ".labs/t1").is_symlink())
+            chdir.assert_called_once()
+            self.assertIn("serve", execvpe.call_args.args[1])
+            self.assertIn("Lab t1 is starting", stdout.getvalue())
+            shutil.rmtree(chdir.call_args.args[0])
+
+    def test_remove_reclaims_a_stopped_lab(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            lab_root = Path(tempfile.mkdtemp(prefix="labflow-t1-", dir="/tmp"))
+            create_lab_config(repo, "t1", 4199, lab_root)
+            with mock.patch(
+                "labflow.cli_lab.repository_root", return_value=repo
+            ), mock.patch(
+                "labflow.cli_lab.socket.create_connection", side_effect=ConnectionRefusedError
+            ):
+                self.assertEqual(lab_main(["remove", "t1"]), 0)
+            self.assertFalse((repo / ".labs/t1").is_symlink())
+            self.assertFalse(lab_root.exists())
+
+    def test_remove_rejects_a_running_lab(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            lab_root = Path(tempfile.mkdtemp(prefix="labflow-t1-", dir="/tmp"))
+            create_lab_config(repo, "t1", 4199, lab_root)
+            connection = mock.MagicMock()
+            stderr = StringIO()
+            with mock.patch(
+                "labflow.cli_lab.repository_root", return_value=repo
+            ), mock.patch(
+                "labflow.cli_lab.socket.create_connection", return_value=connection
+            ), redirect_stderr(stderr):
+                self.assertEqual(lab_main(["remove", "t1"]), 75)
+            self.assertTrue((repo / ".labs/t1").is_symlink())
+            self.assertTrue(lab_root.exists())
+            shutil.rmtree(lab_root)
+            (repo / ".labs/t1").unlink()
 
     def test_attach_leaves_session_selection_to_the_tui(self):
         with tempfile.TemporaryDirectory() as temporary:
