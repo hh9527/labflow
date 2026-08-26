@@ -250,10 +250,12 @@ class ArtifactWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "unknown artifact start key.*owner"):
             validate_workflow(base)
 
-    def test_cli_is_only_pull_submit_and_status(self):
+    def test_cli_exposes_dag_and_benchmark_agent_commands(self):
         self.assertEqual(parser().parse_args(["pull", "a1"]).timeout, 60.0)
         self.assertEqual(parser().parse_args(["submit", "a1", "output-1.a1"]).artifacts, ["output-1.a1"])
         self.assertEqual(parser().parse_args(["status"]).command, "status")
+        self.assertEqual(parser().parse_args(["start-problem", "0001"]).problem, "0001")
+        self.assertEqual(parser().parse_args(["end-problem", "error"]).outcome, "error")
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parser().parse_args(["mark-done", "a1", "output-1"])
 

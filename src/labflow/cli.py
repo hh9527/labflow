@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import cli_host, cli_lab, problem_cli, task_cli
+from . import cli_host, cli_lab, task_cli
 
 
 def parser() -> argparse.ArgumentParser:
@@ -12,10 +12,10 @@ def parser() -> argparse.ArgumentParser:
         description="Run reproducible agent laboratories and artifact workflows.",
     )
     commands = root.add_subparsers(dest="group", required=True)
-    commands.add_parser("lab", add_help=False, help="run and inspect laboratory servers")
+    commands.add_parser("lab", add_help=False, help="run laboratory servers")
+    commands.add_parser("attach", add_help=False, help="attach a TUI to a laboratory")
     commands.add_parser("host", add_help=False, help="control and observe experiment sessions")
-    commands.add_parser("agent", add_help=False, help="pull and submit artifact DAG work")
-    commands.add_parser("problem", add_help=False, help="operate Benchmark problem channels")
+    commands.add_parser("agent", add_help=False, help="operate inside an agent workspace")
     return root
 
 
@@ -27,12 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     group = values.pop(0)
     if group == "lab":
         return cli_lab.main(values, prog="labflow lab")
+    if group == "attach":
+        return cli_lab.attach_main(values, prog="labflow attach")
     if group == "host":
         return cli_host.main(values, prog="labflow host")
     if group == "agent":
         return task_cli.main(values, prog="labflow agent")
-    if group == "problem":
-        return problem_cli.main(values, prog="labflow problem")
     parser().parse_args([group])
     return 2
 

@@ -99,12 +99,12 @@ def _benchmark_questioner_protocol(manifest: Manifest) -> str:
     return (
         "\n\n# Labflow Benchmark 提问协议\n\n"
         "Host 会一次性准备并触发整批题目。按 Host 给出的编号顺序执行 "
-        "`labflow problem start <id>`，再读取通道中的 `ch/q.md`、可选 `ch/k.md` 和只读 "
+        "`labflow agent start-problem <id>`，再读取通道中的 `ch/q.md`、可选 `ch/k.md` 和只读 "
         "`ch/metadata.json`。本批开始时通过 task 工具创建唯一的 "
         f"`{answerer}` 子会话，所有题目持续复用它。必须把 q.md 原文逐字发送给 Answerer，"
         "不得概括、转述、改写或补充。Answerer 追问时，只依据当前 K 作最窄澄清，不得主动泄漏 "
         "K、提示解法或判断正确性。Answerer 完成后读取其可选证据，综合题面与对话写出必需、"
-        "非空的 `ch/out/report.md`，然后执行 `labflow problem end ok|error|cancel`。只有归档成功后"
+        "非空的 `ch/out/report.md`，然后执行 `labflow agent end-problem ok|error|cancel`。只有归档成功后"
         "才能继续下一题；全部题目完成后才结束。\n"
     )
 

@@ -184,10 +184,10 @@ def _batch_prompt(problems: list[dict[str, Any]]) -> str:
     limits = {problem["id"]: problem["maxTurns"] for problem in problems}
     return (
         "完成这一批 Benchmark：" + ", ".join(limits) + "。题面和可选隐藏知识已经一次性放入 "
-        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题执行 `labflow problem start <id>`，然后"
+        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题执行 `labflow agent start-problem <id>`，然后"
         "读取 `ch/q.md` 并把原文逐字发送给 Answerer，不得转述或改写；可选 K 位于 `ch/k.md`，"
         "约束位于 `ch/metadata.json`。本批只创建一个 Answerer 子会话并持续复用。每题完成后"
-        "由你写 `ch/out/report.md`，然后根据结果执行 `labflow problem end ok|error|cancel`；归档"
+        "由你写 `ch/out/report.md`，然后根据结果执行 `labflow agent end-problem ok|error|cancel`；归档"
         "成功后再开始下一题。每题最多进行的 Answerer 轮数为："
         + json.dumps(limits, ensure_ascii=False, separators=(",", ":"))
         + "。全部归档后再结束回复。"

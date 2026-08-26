@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +13,7 @@ from labflow.bundle import install_bundle
 from labflow.config import ControlError, Manifest, sha256
 from labflow.runtime_opencode import generate
 from labflow.state import SCHEMA, atomic_write, load_state, save_state
+from labflow.task_cli import main as agent_main
 
 
 class FakeClient:
@@ -121,9 +123,10 @@ class BenchmarkModeTest(unittest.TestCase):
         self.manifest = Manifest(
             "bench", self.base, (), {
                 "q": {"description": "questioner", "instructions": "q.md",
-                      "commands": ["labflow problem start *", "labflow problem end *"],
-                      "preflight": ["labflow problem start sample",
-                                    "labflow problem end cancel"]},
+                      "commands": ["labflow agent start-problem *",
+                                   "labflow agent end-problem *"],
+                      "preflight": ["labflow agent start-problem sample",
+                                    "labflow agent end-problem cancel"]},
                 "a": {"description": "answerer", "instructions": "a.md",
                       "commands": [], "preflight": []},
             }, (), (), (), execution=execution,
@@ -225,6 +228,23 @@ class BenchmarkModeTest(unittest.TestCase):
                          (source / "q.md").read_bytes())
         self.assertEqual(json.loads((self.workspace / "ch/metadata.json").read_text()),
                          {"id": "0000", "maxTurns": 1})
+
+    def test_agent_problem_commands_resolve_the_workspace_without_a_workflow(self):
+        source = self.workspace / "problem/0000"
+        source.mkdir(parents=True)
+        (source / "q.md").write_text("exact question\n", encoding="utf-8")
+        with mock.patch("sys.stdout", new_callable=StringIO):
+            self.assertEqual(agent_main([
+                "--root", str(self.workspace), "start-problem", "0000"
+            ]), 0)
+        channel = self.workspace / "ch/out"
+        (channel / "report.md").write_text("report\n", encoding="utf-8")
+        with mock.patch("sys.stdout", new_callable=StringIO):
+            self.assertEqual(agent_main([
+                "--root", str(self.workspace), "end-problem", "cancel"
+            ]), 0)
+        self.assertEqual((self.workspace / "result/0000/report.md").read_text(),
+                         "report\n")
 
 
 if __name__ == "__main__":

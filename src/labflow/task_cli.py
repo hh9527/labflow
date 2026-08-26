@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
+from .config import ControlError
+
 
 SCHEMA = "labflow.workflow/v1"
 TASK_SCHEMA = "labflow.task-attempt/v1"
@@ -577,6 +579,14 @@ def parser(prog: str = "labflow agent") -> argparse.ArgumentParser:
     submit_command.add_argument("role")
     submit_command.add_argument("artifacts", nargs="+")
     commands.add_parser("status")
+    start_command = commands.add_parser(
+        "start-problem", help="copy one prepared Benchmark problem into the active channel"
+    )
+    start_command.add_argument("problem")
+    end_command = commands.add_parser(
+        "end-problem", help="archive and clear the active Benchmark problem channel"
+    )
+    end_command.add_argument("outcome", choices=("ok", "error", "cancel"))
     return value
 
 
@@ -584,17 +594,25 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
     args = parser(prog).parse_args(argv)
     try:
         root = args.root.resolve() if args.root else find_root(Path.cwd())
-        workflow = load_workflow(root)
         if args.command == "pull":
+            workflow = load_workflow(root)
             result = pull(root, workflow, _id(args.role, "role"), not args.no_wait, args.timeout)
         elif args.command == "submit":
+            workflow = load_workflow(root)
             result = submit(root, workflow, _id(args.role, "role"),
                             [_id(name, "artifact") for name in args.artifacts])
         elif args.command == "status":
+            workflow = load_workflow(root)
             result = workflow_status(root, workflow)
+        elif args.command == "start-problem":
+            from .benchmark_mode import start_problem
+            result = start_problem(root, args.problem)
+        else:
+            from .benchmark_mode import end_problem
+            result = end_problem(root, args.outcome)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
-    except TaskError as exc:
+    except (TaskError, ControlError) as exc:
         print(f"{prog}: {exc}", file=sys.stderr)
         return exc.code
     except KeyboardInterrupt:

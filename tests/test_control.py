@@ -66,7 +66,9 @@ from labflow.cli_host import (
     main as control_main,
     parser as control_parser,
 )
-from labflow.cli_lab import main as lab_main, parser as lab_parser
+from labflow.cli_lab import (
+    attach_main, attach_parser, main as lab_main, parser as lab_parser,
+)
 from labflow.cli import main as labflow_main, parser as labflow_parser
 
 
@@ -415,19 +417,16 @@ class ConfigStateTest(unittest.TestCase):
     def test_lab_run_accepts_name_and_optional_port(self):
         args = lab_parser().parse_args(["run", "t1", "--port", "4199"])
         self.assertEqual((args.command, args.lab_name, args.port), ("run", "t1", 4199))
-        listed = lab_parser().parse_args(["ls", "t1"])
-        self.assertEqual((listed.command, listed.lab_name), ("ls", "t1"))
-        attached = lab_parser().parse_args(["attach", "t1", "sample-plan/1"])
-        self.assertEqual((attached.lab_name, attached.session_name),
-                         ("t1", "sample-plan/1"))
+        self.assertEqual(attach_parser().parse_args(["t1"]).lab_name, "t1")
 
     def test_labflow_groups_lab_host_and_agent_commands(self):
         self.assertEqual(
             set(labflow_parser()._subparsers._group_actions[0].choices),
-            {"lab", "host", "agent"},
+            {"lab", "attach", "host", "agent"},
         )
         cases = (
-            ("lab", "labflow.cli.cli_lab.main", ["ls", "t1"]),
+            ("lab", "labflow.cli.cli_lab.main", ["run", "t1"]),
+            ("attach", "labflow.cli.cli_lab.attach_main", ["t1"]),
             ("host", "labflow.cli.cli_host.main", ["status", "t1", "demo/1"]),
             ("agent", "labflow.cli.task_cli.main", ["status"]),
         )
@@ -477,48 +476,14 @@ class ConfigStateTest(unittest.TestCase):
         run.assert_not_called()
         self.assertIn("Lab t1 is ready", stdout.getvalue())
 
-    def test_lab_ls_lists_named_sessions_across_workspaces(self):
+    def test_attach_leaves_session_selection_to_the_tui(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
             lab_root = repo / "lab"; lab_root.mkdir()
-            workspace = lab_root / "executions" / "demo" / "1" / "runtime" / "ws"
-            workspace.mkdir(parents=True)
             create_lab_config(repo, "t1", 4199, lab_root)
-            sessions = [{
-                "id": "ses_demo", "title": "demo/1", "directory": str(workspace),
-            }]
-            client = mock.Mock()
-            client.statuses.return_value = {"ses_demo": {"type": "busy"}}
-            output = StringIO()
-            with mock.patch(
-                "labflow.cli_lab.repository_root", return_value=repo
-            ), mock.patch(
-                "labflow.cli_lab._lab_sessions", return_value=sessions
-            ), mock.patch(
-                "labflow.cli_lab.Client", return_value=client
-            ), redirect_stdout(output):
-                result = lab_main(["ls", "t1"])
-        self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue()), [{
-            "id": "ses_demo", "state": "busy", "title": "demo/1",
-            "workspace": str(workspace),
-        }])
-
-    def test_lab_attach_resolves_an_exact_session_title(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary)
-            lab_root = repo / "lab"; lab_root.mkdir()
-            workspace = lab_root / "executions" / "demo" / "1" / "runtime" / "ws"
-            workspace.mkdir(parents=True)
-            create_lab_config(repo, "t1", 4199, lab_root)
-            session = {
-                "id": "ses_demo", "title": "demo/1", "directory": str(workspace),
-            }
             completed = mock.Mock(returncode=0)
             with mock.patch(
                 "labflow.cli_lab.repository_root", return_value=repo
-            ), mock.patch(
-                "labflow.cli_lab._lab_sessions", return_value=[session]
             ), mock.patch(
                 "labflow.cli_lab.resolve_cli", return_value=("opencode",)
             ), mock.patch(
@@ -526,28 +491,12 @@ class ConfigStateTest(unittest.TestCase):
             ), mock.patch(
                 "labflow.cli_lab.subprocess.run", return_value=completed
             ) as run:
-                result = lab_main(["attach", "t1", "demo/1"])
+                result = attach_main(["t1"])
         self.assertEqual(result, 0)
         run.assert_called_once_with(
-            ["opencode", "attach", "http://127.0.0.1:4199", "--dir", str(workspace),
-             "--session", "ses_demo"],
-            cwd=str(workspace), env=ENVIRONMENT,
+            ["opencode", "attach", "http://127.0.0.1:4199"],
+            cwd=str(lab_root), env=ENVIRONMENT,
         )
-
-    def test_lab_attach_rejects_an_unknown_session_title(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary)
-            lab_root = repo / "lab"; lab_root.mkdir()
-            create_lab_config(repo, "t1", 4199, lab_root)
-            error = StringIO()
-            with mock.patch(
-                "labflow.cli_lab.repository_root", return_value=repo
-            ), mock.patch(
-                "labflow.cli_lab._lab_sessions", return_value=[]
-            ), redirect_stderr(error):
-                result = lab_main(["attach", "t1", "demo/1"])
-        self.assertEqual(result, 66)
-        self.assertIn("session title not found", error.getvalue())
 
     def test_control_start_prepares_and_creates_the_session(self):
         repo = Path("/repo")

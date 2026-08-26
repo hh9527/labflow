@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import socket
 import subprocess
@@ -14,47 +13,29 @@ from typing import Any
 from .client import Client
 from .config import ControlError, repository_root, validate_identifier
 from .external import resolve_cli
-from .lifecycle import lab_sessions, opencode_environment
+from .lifecycle import opencode_environment
 from .state import create_lab_config, lab_config_path, load_lab_config, remove_lab_config
 
 
 def parser(prog: str = "labflow lab") -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog=prog, description="Run and inspect an agent laboratory.")
+    root = argparse.ArgumentParser(prog=prog, description="Run an agent laboratory.")
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run a foreground headless laboratory")
     run.add_argument("lab_name")
     run.add_argument("--port", type=int)
-    ls = commands.add_parser("ls", help="list sessions whose workspace belongs to the laboratory")
-    ls.add_argument("lab_name")
-    attach = commands.add_parser("attach", help="attach a TUI to a session title")
-    attach.add_argument("lab_name")
-    attach.add_argument("session_name")
     return root
+
+
+def attach_parser(prog: str = "labflow attach") -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(prog=prog, description="Attach a TUI to a laboratory.")
+    value.add_argument("lab_name")
+    return value
 
 
 def _free_port() -> int:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         return int(reservation.getsockname()[1])
-
-
-def _client(config: dict[str, Any], timeout: float = 5) -> Client:
-    return Client(f"http://127.0.0.1:{config['port']}", config["root"], timeout=timeout)
-
-
-def _lab_sessions(config: dict[str, Any]) -> list[dict[str, Any]]:
-    lab_root = Path(config["root"]).resolve()
-    records = []
-    for session in lab_sessions(_client(config), lab_root):
-        directory = session.get("directory")
-        if not isinstance(directory, str):
-            continue
-        try:
-            Path(directory).resolve().relative_to(lab_root)
-        except ValueError:
-            continue
-        records.append(session)
-    return sorted(records, key=lambda item: (str(item.get("title", "")), str(item.get("id", ""))))
 
 
 def _run(repo: Path, lab_name: str, requested_port: int | None) -> int:
@@ -115,51 +96,31 @@ def _run(repo: Path, lab_name: str, requested_port: int | None) -> int:
         shutil.rmtree(lab_root, ignore_errors=True)
 
 
-def _list(repo: Path, lab_name: str) -> int:
+def _attach(repo: Path, lab_name: str) -> int:
     config = load_lab_config(repo, validate_identifier(lab_name, "lab-name"))
-    statuses: dict[str, Any] = {}
-    status_directories: set[str] = set()
-    result = []
-    for session in _lab_sessions(config):
-        session_id = session.get("id")
-        directory = session.get("directory")
-        if isinstance(directory, str) and directory not in status_directories:
-            statuses.update(Client(
-                f"http://127.0.0.1:{config['port']}", directory
-            ).statuses())
-            status_directories.add(directory)
-        result.append({
-            "title": session.get("title"),
-            "id": session_id,
-            "workspace": session.get("directory"),
-            "state": statuses.get(session_id, {"type": "idle"}).get("type", "idle"),
-        })
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
-
-
-def _attach(repo: Path, lab_name: str, session_name: str) -> int:
-    config = load_lab_config(repo, validate_identifier(lab_name, "lab-name"))
-    matches = [item for item in _lab_sessions(config) if item.get("title") == session_name]
-    if not matches:
-        raise ControlError(f"session title not found in lab {lab_name}: {session_name}", 66)
-    if len(matches) != 1:
-        raise ControlError(f"session title is not unique in lab {lab_name}: {session_name}", 65)
-    session = matches[0]
-    command = [*resolve_cli("opencode"), "attach", f"http://127.0.0.1:{config['port']}",
-               "--dir", session["directory"], "--session", session["id"]]
-    return subprocess.run(command, cwd=session["directory"], env=opencode_environment({})).returncode
+    command = [*resolve_cli("opencode"), "attach", f"http://127.0.0.1:{config['port']}"]
+    return subprocess.run(command, cwd=config["root"], env=opencode_environment({})).returncode
 
 
 def main(argv: list[str] | None = None, *, prog: str = "labflow lab") -> int:
     args = parser(prog).parse_args(argv)
     try:
         repo = repository_root(Path.cwd())
-        if args.command == "run":
-            return _run(repo, args.lab_name, args.port)
-        if args.command == "ls":
-            return _list(repo, args.lab_name)
-        return _attach(repo, args.lab_name, args.session_name)
+        return _run(repo, args.lab_name, args.port)
+    except ControlError as exc:
+        print(f"{prog}: {exc}", file=sys.stderr)
+        return exc.code
+    except OSError as exc:
+        print(f"{prog}: {exc}", file=sys.stderr)
+        return 69
+    except KeyboardInterrupt:
+        return 130
+
+
+def attach_main(argv: list[str] | None = None, *, prog: str = "labflow attach") -> int:
+    args = attach_parser(prog).parse_args(argv)
+    try:
+        return _attach(repository_root(Path.cwd()), args.lab_name)
     except ControlError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)
         return exc.code

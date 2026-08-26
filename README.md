@@ -28,12 +28,13 @@ handles a bounded batch of problems without Session forks.
 
 ## Commands
 
-Labflow has one executable and three command groups:
+Labflow has one executable, three command groups, and a direct TUI entry:
 
 ```text
-labflow lab    run and inspect laboratory servers
+labflow lab    run laboratory servers
+labflow attach connect a TUI and select a session
 labflow host   start, observe, and control sessions
-labflow agent  pull and submit Artifact work
+labflow agent  operate inside an Agent workspace
 ```
 
 Typical use from a project Git worktree:
@@ -43,8 +44,7 @@ labflow lab run local --port 4199
 labflow host test-connect local
 labflow host start local sample-plan/1 sample-plan
 labflow host status local sample-plan/1
-labflow lab ls local
-labflow lab attach local sample-plan/1
+labflow attach local
 ```
 
 `labflow lab run` writes `{port, root}` to `target/labs/<lab-name>/config.json`. Session state and
@@ -160,9 +160,9 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 
 At start, Labflow copies the complete suite into the plan workspace as
 `problem/<id>/q.md` and optional `problem/<id>/k.md`, then triggers each batch once. The Questioner
-opens each problem with `labflow problem start <id>`, which copies exact Q/K and generated metadata
+opens each problem with `labflow agent start-problem <id>`, which copies exact Q/K and generated metadata
 into `ch/`. It passes `ch/q.md` verbatim through dialogue, maintains the required nonempty
-`ch/out/report.md`, and closes with `labflow problem end ok|error|cancel`. The Answerer may leave `ch/out/ok-*` success
+`ch/out/report.md`, and closes with `labflow agent end-problem ok|error|cancel`. The Answerer may leave `ch/out/ok-*` success
 evidence or `ch/out/err-*` failure evidence; both sets may be absent and they cannot coexist. Labflow
 does not interpret evidence file formats. The Answerer cannot write `report.md`.
 
