@@ -76,11 +76,11 @@ def _benchmark_role_assets(manifest: Manifest, role: str) -> dict[str, list[str]
     if role == execution["answerer"]:
         inputs = [asset["path"] for asset in execution["input"]]
         outputs = [asset["path"] for asset in execution["output"]]
-        return {"read": [*inputs, "ch/q.md", *outputs], "write": outputs}
+        return {"read": [*inputs, *outputs], "write": outputs}
     inputs = [asset["path"] for asset in execution["input"]]
     return {
         "read": [*inputs, "problem/", "ch/"],
-        "write": ["ch/q.md", "ch/out/report.md"],
+        "write": ["ch/out/report.md"],
     }
 
 
@@ -88,8 +88,8 @@ def _benchmark_answerer_protocol(manifest: Manifest) -> str:
     output = manifest.execution["output"][0]["path"]
     return (
         "\n\n# Labflow Benchmark 交付协议\n\n"
-        f"证据文件只写入 `{output}`。成功且有机器结果时写 `ok-*`，其中至少包含一份合法 "
-        "JSON；命令诊断等失败证据写 `err-*`。两类证据不得同时存在，也都可以不存在。"
+        f"证据文件只写入 `{output}`。成功证据写 `ok-*`，失败证据写 `err-*`。两类证据不得"
+        "同时存在，也都可以不存在。"
         "`report.md` 由 Questioner 编写，你不得创建或修改。每题开始清理上一题的 `ok-*` 与 "
         "`err-*`。原始提问、必要追问和澄清走对话管道；完成后最后一条消息只说明本题完成。\n"
     )
@@ -101,8 +101,8 @@ def _benchmark_questioner_protocol(manifest: Manifest) -> str:
         "\n\n# Labflow Benchmark 提问协议\n\n"
         "Host 会一次性准备并触发整批题目。按 Host 给出的编号顺序读取 "
         "`problem/<id>/q.md` 及可选的 `k.md`。本批开始时通过 task 工具创建唯一的 "
-        f"`{answerer}` 子会话，所有题目持续复用它。每题先把原题写入 `ch/q.md`，再用自然"
-        "业务语言向 Answerer 提问。Answerer 追问时，只依据当前 K 作最窄澄清，不得主动泄漏 "
+        f"`{answerer}` 子会话，所有题目持续复用它。必须把 q.md 原文逐字发送给 Answerer，"
+        "不得概括、转述、改写或补充。Answerer 追问时，只依据当前 K 作最窄澄清，不得主动泄漏 "
         "K、提示解法或判断正确性。Answerer 完成后读取其可选证据，综合题面与对话写出必需、"
         "非空的 `ch/out/report.md`，然后执行 `labflow agent record <id>`。只有归档成功后"
         "才能继续下一题；全部题目完成后才结束。\n"

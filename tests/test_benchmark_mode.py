@@ -160,9 +160,11 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(q_permission["task"], {"*": "deny", "a": "allow"})
         self.assertEqual(a_permission["task"], "deny")
         self.assertEqual(q_permission["edit"]["ch/out/report.md"], "allow")
+        self.assertNotIn("ch/q.md", q_permission["edit"])
         self.assertEqual(a_permission["edit"]["ch/out/**"], "allow")
         self.assertEqual(a_permission["edit"]["ch/out/report.md"], "deny")
         self.assertIn("Host 会一次性准备并触发整批题目", q_text)
+        self.assertIn("原文逐字发送", q_text)
         self.assertIn("`report.md` 由 Questioner 编写", a_text)
 
     def test_one_host_trigger_runs_and_archives_the_whole_batch(self):
@@ -199,6 +201,11 @@ class BenchmarkModeTest(unittest.TestCase):
         (channel / "err-diagnostic.txt").write_text("error\n")
         with self.assertRaisesRegex(ControlError, "cannot coexist"):
             record_problem(self.workspace, "0000")
+        (channel / "ok-answer.json").unlink()
+        (channel / "err-diagnostic.txt").unlink()
+        (channel / "ok-note.txt").write_text("opaque evidence\n")
+        record_problem(self.workspace, "0000")
+        self.assertTrue((self.workspace / "result/0000/ok-note.txt").is_file())
 
 
 if __name__ == "__main__":

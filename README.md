@@ -160,10 +160,11 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 
 At start, Labflow copies the complete suite into the plan workspace as
 `problem/<id>/q.md` and optional `problem/<id>/k.md`, then triggers each batch once. The Questioner
-copies the active question to `ch/q.md`, maintains the required nonempty `ch/out/report.md`, and uses
+passes the active `q.md` verbatim through dialogue, maintains the required nonempty
+`ch/out/report.md`, and uses
 `labflow agent record <id>` to checkpoint each problem. The Answerer may leave `ch/out/ok-*` success
-evidence or `ch/out/err-*` failure evidence; both sets may be absent and they cannot coexist. Present
-`ok-*` evidence must include valid JSON. The Answerer cannot write `report.md`.
+evidence or `ch/out/err-*` failure evidence; both sets may be absent and they cannot coexist. Labflow
+does not interpret evidence file formats. The Answerer cannot write `report.md`.
 
 Labflow partitions the suite into groups of `batchSize`. Each group gets a fresh Questioner Session;
 the Questioner creates one fresh Answerer child and reuses that pair for every problem in the group.

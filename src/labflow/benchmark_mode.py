@@ -109,15 +109,6 @@ def record_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
     err_files = [path for path in evidence if path.name.startswith("err-")]
     if ok_files and err_files:
         raise ControlError("ok-* and err-* evidence cannot coexist", 75)
-    if ok_files:
-        json_files = [path for path in ok_files if path.suffix == ".json"]
-        if not json_files:
-            raise ControlError("ok-* evidence must include a JSON file", 75)
-        for path in json_files:
-            try:
-                json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ControlError(f"invalid JSON evidence {path.name}: {exc}", 75) from None
 
     destination = workspace / RESULT_ROOT / problem_id
     if destination.exists():
@@ -136,7 +127,6 @@ def record_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
             path.unlink()
         elif path.is_dir():
             shutil.rmtree(path)
-    (workspace / CHANNEL_ROOT / "q.md").unlink(missing_ok=True)
     return checkpoint
 
 
@@ -160,8 +150,9 @@ def _batch_prompt(problems: list[dict[str, Any]]) -> str:
     limits = {problem["id"]: problem["maxTurns"] for problem in problems}
     return (
         "完成这一批 Benchmark：" + ", ".join(limits) + "。题面和可选隐藏知识已经一次性放入 "
-        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题处理；本批只创建一个 Answerer "
-        "子会话并持续复用。每题完成后由你写 `ch/out/report.md`，然后执行 "
+        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题处理，并把 q.md 原文逐字发送给 "
+        "Answerer，不得转述或改写。本批只创建一个 Answerer 子会话并持续复用。每题完成后"
+        "由你写 `ch/out/report.md`，然后执行 "
         "`labflow agent record <id>`；归档成功后再开始下一题。每题最多进行的 Answerer 轮数为："
         + json.dumps(limits, ensure_ascii=False, separators=(",", ":"))
         + "。全部归档后再结束回复。"
