@@ -427,16 +427,17 @@ class ConfigStateTest(unittest.TestCase):
         self.assertEqual((remove.command, remove.lab_name), ("remove", "t1"))
         self.assertEqual(attach_parser().parse_args(["t1"]).lab_name, "t1")
 
-    def test_labflow_groups_lab_host_and_agent_commands(self):
+    def test_labflow_groups_runtime_commands(self):
         self.assertEqual(
             set(labflow_parser()._subparsers._group_actions[0].choices),
-            {"lab", "attach", "host", "agent"},
+            {"lab", "attach", "host", "agent", "supervisor"},
         )
         cases = (
             ("lab", "labflow.cli.cli_lab.main", ["run", "t1"]),
             ("attach", "labflow.cli.cli_lab.attach_main", ["t1"]),
             ("host", "labflow.cli.cli_host.main", ["status", "t1", "demo@1"]),
             ("agent", "labflow.cli.task_cli.main", ["status"]),
+            ("supervisor", "labflow.cli.supervisor.main", ["t1", "--once"]),
         )
         for group, target, arguments in cases:
             with self.subTest(group=group), mock.patch(target, return_value=0) as delegated:
@@ -952,6 +953,10 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(workspace, workspace_root(lab_root, "demo@1"))
             self.assertEqual(_root, execution_root(lab_root, "demo@1"))
             self.assertEqual(Path(state["archive"]), archive_root(lab_root, "demo@1"))
+            artifact_link = workspace / "control" / "artifacts"
+            artifact_root = lab_root / "supervisor" / "demo@1" / "artifacts"
+            self.assertTrue(artifact_link.is_symlink())
+            self.assertEqual(artifact_link.resolve(), artifact_root.resolve())
 
     def test_prepare_reuses_a_named_session_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1426,6 +1431,43 @@ class StatusSummaryTest(unittest.TestCase):
                 "command": "labflow host submit t1 demo@1 output-2",
             }])
             self.assertIn("artifacts", verbose)
+
+    def test_status_includes_the_supervisor_execution_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws"
+            workspace.mkdir()
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {"output.a1": {
+                    "desc": "output", "instruction": "build",
+                }},
+            })
+            atomic_json(root / "supervisor-status.json", {
+                "schema": "labflow.supervisor-status/v1", "updated_at": 123,
+                "executions": [{
+                    "title": "demo@1", "dag": True,
+                    "requests": ["approval"], "optional_requests": [],
+                    "errors": [{"role": "a1", "error": "duplicate Session"}],
+                    "sessions": [{
+                        "backend_id": "ses_a1", "title": "a1",
+                        "role": "a1", "status": "idle",
+                    }],
+                }],
+            })
+            context = mock.Mock(state={
+                "title": "demo@1", "lab_name": "t1", "lab_root": str(root),
+                "phase": "active", "workspace": str(workspace),
+                "workflow": workflow,
+            })
+            context.root = root / "control"
+            metrics = {"aggregate": {"tokens": {"fresh": 0}}}
+            detail = {"agents": [], "records": {"active": [], "history": []}}
+
+            with mock.patch("labflow.cli_host._metrics", return_value=(metrics, detail)):
+                status = _status(context)
+
+            self.assertEqual(status["supervision"]["updated_at"], 123)
+            self.assertEqual(status["supervision"]["errors"][0]["role"], "a1")
 
     def test_host_pull_returns_immediately_for_submitable_gate_and_summarizes_window(self):
         with tempfile.TemporaryDirectory() as temporary:

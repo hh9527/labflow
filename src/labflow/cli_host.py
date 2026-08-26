@@ -21,24 +21,27 @@ from .lifecycle import (
     prepare,
     probe_opencode_connection,
     refresh_workflow_artifact,
-    send_round,
     verify_prepared,
 )
 from .metrics import collect_metrics
 from .observe import assistant_messages, text_parts
-from .runtime_opencode import START_PROMPT, resume_prompt
+from .runtime_opencode import resume_prompt
 from .state import (
     atomic_write,
     atomic_json,
     load_lab_config,
     load_connect_test,
     load_state,
+    locked,
+    now,
     record_connect_test,
+    save_state,
 )
 from .benchmark_mode import run as run_benchmark
 from .task_cli import (
     TaskError, remove_artifact, supersede_role_task, task_records, workflow_status,
 )
+from .timeline_store import statistics as timeline_statistics
 from .bundle import install_bundle
 
 
@@ -421,6 +424,39 @@ def _intervention_summary(context: Context) -> dict[str, Any]:
             "host_forced": bool(events)}
 
 
+def _add_timeline_statistics(context: Context, metrics: dict[str, Any]) -> None:
+    lab_root = context.state.get("lab_root")
+    title = context.state.get("title")
+    if isinstance(lab_root, str) and isinstance(title, str):
+        value = timeline_statistics(Path(lab_root) / "timeline.sqlite3", title)
+        if value is not None:
+            metrics["timeline"] = value
+
+
+def _supervision_status(context: Context) -> dict[str, Any] | None:
+    lab_root = context.state.get("lab_root")
+    title = context.state.get("title")
+    if not isinstance(lab_root, str) or not isinstance(title, str):
+        return None
+    path = Path(lab_root) / "supervisor-status.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"invalid Supervisor status: {exc}") from None
+    if not isinstance(value, dict) or value.get("schema") != "labflow.supervisor-status/v1":
+        raise ControlError("invalid Supervisor status schema")
+    executions = value.get("executions")
+    if not isinstance(executions, list):
+        raise ControlError("invalid Supervisor execution status")
+    current = next((item for item in executions
+                    if isinstance(item, dict) and item.get("title") == title), None)
+    if current is None:
+        return None
+    return {"updated_at": value.get("updated_at"), **current}
+
+
 def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
     workspace = _workspace(context)
     execution = context.state.get("execution", {"kind": "dag-mode"})
@@ -461,6 +497,7 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
             {"active": [], "history": []},
         )
         metrics["host_interventions"] = _intervention_summary(context)
+        _add_timeline_statistics(context, metrics)
         agents = [{
             "role": item["agent"], "session_id": item["id"],
             "state": statuses.get(item["id"], {"type": "idle"}).get("type", "idle"),
@@ -474,6 +511,7 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
         messages.__getitem__, context.state.get("metrics", context.manifest.metrics), records,
     )
     metrics["host_interventions"] = _intervention_summary(context)
+    _add_timeline_statistics(context, metrics)
     agents = []
     by_role = {role["agent"]: role for role in metrics["roles"]}
     active_by_role = {record.get("role"): record for record in records["active"]}
@@ -535,6 +573,9 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
         if not verbose:
             for agent in result["agents"]:
                 agent.pop("runtime_state", None)
+        supervision = _supervision_status(context)
+        if supervision is not None:
+            result["supervision"] = supervision
         return result
     workflow = context.state.get("workflow")
     artifacts = workflow_status(_workspace(context), workflow)
@@ -571,6 +612,9 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
         for agent in result["agents"]:
             agent.pop("runtime_state", None)
             agent.pop("recent_responses", None)
+    supervision = _supervision_status(context)
+    if supervision is not None:
+        result["supervision"] = supervision
     return result
 
 
@@ -646,10 +690,17 @@ def _start(context: Context) -> dict[str, Any]:
     verify_prepared(context.manifest, context.state)
     if context.manifest.execution["kind"] == "benchmark-mode":
         return run_benchmark(context)
-    initial = [record for record in context.rounds() if record.get("kind") == "initial"]
-    if initial and initial[0].get("user_message_id"):
-        return initial[0]
-    return send_round(context, "initial", START_PROMPT, require_empty=True)
+    with locked(context.root):
+        state = load_state(context.root)
+        state["phase"] = "active"
+        state["started_at"] = state.get("started_at") or now()
+        save_state(context.root, state)
+        context.state = state
+    return {
+        "schema": "labflow.supervision/v1",
+        "status": "maintained",
+        "title": state["title"],
+    }
 
 
 def _abort_sessions(context: Context, timeout: float = 5.0) -> dict[str, Any]:

@@ -17,7 +17,7 @@ protocol are independent of the application, language, and domain under test.
 Labflow has two distinct execution modes:
 
 ```text
-dag-mode      A coordinator starts persistent role Agents; Artifact pressure drives pull/submit work.
+dag-mode      A Supervisor maintains role Sessions; Artifact pressure drives pull/submit work.
 benchmark-mode  A Questioner and Answerer run a fixed, answer-free problem suite.
 ```
 
@@ -28,13 +28,14 @@ handles a bounded batch of problems without Session forks.
 
 ## Commands
 
-Labflow has one executable, three command groups, and a direct TUI entry:
+Labflow has one executable, four command groups, and a direct TUI entry:
 
 ```text
 labflow lab    run laboratory servers
 labflow attach connect a TUI and select a session
 labflow host   start, observe, and control sessions
 labflow agent  operate inside an Agent workspace
+labflow supervisor  maintain Sessions and the laboratory Timeline
 ```
 
 Typical use from a project Git worktree:
@@ -42,6 +43,7 @@ Typical use from a project Git worktree:
 ```bash
 labflow lab run local --port 4199
 labflow host test-connect local
+labflow supervisor local
 labflow host start local sample-plan
 labflow host status local sample-plan@1
 labflow attach local
@@ -55,6 +57,48 @@ workspace. Agent workspaces live at `ws/<plan-id>[.<variant>]@<generation>/`, wh
 and archives live under `control/` and `archive/`. `lab run` replaces its own process with the
 OpenCode server, so a running laboratory does not retain Labflow's runtime. After stopping the
 server, `lab remove` removes the symbolic link and reclaims the Lab root.
+
+Run exactly one `labflow supervisor <lab-name>` as a separate foreground process for each Lab. It
+can start before any execution exists and does not currently own or stop `labflow lab run`. A
+non-blocking Lab-level ownership lock rejects a second Supervisor. Host start publishes an execution
+maintenance directory; the Supervisor then observes its Sessions and Timeline. An execution with an
+`artifacts/` directory additionally enables Artifact-DAG scheduling.
+
+```text
+<lab-root>/
+  supervisor/
+    <plan-id>[.<variant>]@<generation>/
+      artifacts/
+        <artifact>
+  timeline.sqlite3
+```
+
+The Supervisor directory is desired state. For DAG executions its Artifact directory is canonical;
+the Agent workspace `control/artifacts` path is a generated link to it. `timeline.sqlite3` is one
+laboratory-wide append-only observation database. The Supervisor only writes closed `thinking`,
+`action`, and `reply` records; Host observation and statistics read it. Reducer scheduling state is
+kept in memory and never recovered from Timeline data.
+
+Scheduling is a reconciliation loop over desired and observed state:
+
+```text
+desired execution/Artifact state + observed Workflow/Session state
+    -> mutable reducer state + idempotent CreateSession/PromptSession effects
+    -> observed backend state
+```
+
+The Workflow snapshot is taken under the same lock used by Agent Artifact operations. A missing role
+Session is created, a busy Session is only observed, and an idle Session is prompted only while it
+owns runnable Artifact pressure. After a prompt, a newly completed assistant turn or an observed
+busy-to-idle transition makes the Session eligible for reconciliation again. Correctness does not
+depend on sleeping for a grace period or guessing that an asynchronous operation has completed.
+Removing `artifacts/` clears scheduling pressure while preserving Timeline observation; removing the
+execution maintenance directory forgets its scheduling state without deleting Timeline history.
+
+The latest observation is written atomically to `<lab-root>/supervisor-status.json`, including all
+observed Session identities and states, required and optional Host requests, and role-level runtime
+errors. Host event queries merge operational task/Artifact/Host-action records with the closed
+Timeline; operational events are not copied into SQLite.
 
 ## Artifact Workflow
 
@@ -141,8 +185,9 @@ A successful pull returns the complete direct input and input Asset sets:
 when an optional input does not yet exist. `updated` follows the same Artifact publication boundary
 for Assets. Labflow does not hash Asset contents to infer workflow changes.
 
-When no work becomes available before the 60-second timeout, pull returns JSON `null`. A persistent
-Agent immediately pulls again.
+When no work becomes available before the bounded timeout, pull returns JSON `null`. The Agent then
+ends its current turn. When new Artifact work becomes runnable, the Supervisor resumes the same
+Session with a fixed instruction to pull again. A busy Session is never interrupted or prompted.
 
 Host pull distinguishes blocking `requests` from `opt_requests`. A Host Artifact used only through
 optional inputs appears in `opt_requests`; it remains visible but does not wake a waiting Host pull.
