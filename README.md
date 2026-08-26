@@ -144,6 +144,9 @@ for Assets. Labflow does not hash Asset contents to infer workflow changes.
 When no work becomes available before the 60-second timeout, pull returns JSON `null`. A persistent
 Agent immediately pulls again.
 
+Host pull distinguishes blocking `requests` from `opt_requests`. A Host Artifact used only through
+optional inputs appears in `opt_requests`; it remains visible but does not wake a waiting Host pull.
+
 ## Benchmark Mode
 
 Benchmark plans declare inputs, outputs, and questions without expected answers:

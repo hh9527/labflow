@@ -235,11 +235,29 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
     return result
 
 
-def pending_requests(workflow: dict[str, Any], artifacts: dict[str, Any]) -> list[str]:
+def _optional_host_inputs(workflow: dict[str, Any]) -> set[str]:
+    uses: dict[str, list[bool]] = {}
+    for artifact in workflow["artifacts"].values():
+        for reference in artifact.get("input", []):
+            uses.setdefault(reference["id"], []).append(reference["optional"])
+    return {name for name, flags in uses.items() if flags and all(flags)}
+
+
+def _ready_host_artifacts(workflow: dict[str, Any], artifacts: dict[str, Any]) -> list[str]:
     return [name for name in workflow["artifacts"]
             if artifacts["artifacts"][name]["owner"] == "host"
             and not artifacts["artifacts"][name]["current"]
             and not artifacts["artifacts"][name]["blocked_by"]]
+
+
+def pending_requests(workflow: dict[str, Any], artifacts: dict[str, Any]) -> list[str]:
+    optional = _optional_host_inputs(workflow)
+    return [name for name in _ready_host_artifacts(workflow, artifacts) if name not in optional]
+
+
+def pending_optional_requests(workflow: dict[str, Any], artifacts: dict[str, Any]) -> list[str]:
+    optional = _optional_host_inputs(workflow)
+    return [name for name in _ready_host_artifacts(workflow, artifacts) if name in optional]
 
 
 def _find_message(context: Context, session: str, message_id: str) -> dict[str, Any]:

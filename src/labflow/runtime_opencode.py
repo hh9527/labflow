@@ -157,10 +157,14 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
     })
     generated.append(config)
     runtime_manifest = workspace / "experiment.json"
+    runtime_workflow = json.loads(json.dumps(manifest.workflow))
+    if runtime_workflow is not None:
+        for artifact in runtime_workflow["artifacts"].values():
+            artifact.pop("owner", None)
     atomic_json(runtime_manifest, {
         "schema": "labflow.experiment-runtime/v1",
         "plan_id": manifest.plan_id,
-        "workflow": manifest.workflow,
+        "workflow": runtime_workflow,
         "execution": manifest.execution,
     })
     generated.append(runtime_manifest)

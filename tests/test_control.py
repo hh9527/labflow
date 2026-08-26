@@ -53,7 +53,8 @@ from labflow.events import event_detail, project_events
 from labflow.permissions import preflight_permissions
 from labflow.reporting import submit_report
 from labflow.task_cli import (
-    evaluate, refresh_artifact, pull, submit, task_records, validate_workflow, workflow_status,
+    evaluate, load_workflow, refresh_artifact, pull, submit, task_records, validate_workflow,
+    workflow_status,
 )
 from labflow.watch import WatchWindow, acp_events, message_events, watch_progress
 from labflow.cli_host import (
@@ -934,6 +935,12 @@ class ConfigStateTest(unittest.TestCase):
             self.assertTrue(created)
             workspace = Path(state["workspace"])
             self.assertTrue((workspace / "experiment.json").is_file())
+            self.assertNotIn(
+                "owner",
+                json.loads((workspace / "experiment.json").read_text())["workflow"]
+                ["artifacts"]["input"],
+            )
+            self.assertEqual(load_workflow(workspace), state["workflow"])
             self.assertTrue((workspace / ".opencode/agents/a1.md").is_file())
             self.assertEqual((workspace / "bin/tool").read_text(), "tool")
             self.assertEqual((workspace / "seed.txt").read_text(), "seed\n")
@@ -1446,7 +1453,9 @@ class StatusSummaryTest(unittest.TestCase):
             context.client.return_value.children.return_value = []
             result = _host_pull(context, started_at_ns // 1_000_000 - 1, timeout=60)
             self.assertLess(result["timeline"]["waited_ms"], 1000)
-            self.assertEqual(result["result"], {"requests": ["output-2"]})
+            self.assertEqual(result["result"], {
+                "requests": ["output-2"], "opt_requests": [],
+            })
             self.assertFalse(workflow_status(workspace, workflow)["artifacts"]["output-2"]["submittable"])
             self.assertEqual([event["status"] for event in result["timeline"]["events"]
                               if event["type"] == "task"], ["submitted"])
@@ -1454,9 +1463,11 @@ class StatusSummaryTest(unittest.TestCase):
             self.assertEqual([event["id"] for event in repeated["timeline"]["events"]],
                              [event["id"] for event in result["timeline"]["events"]
                               if event["at"] == result["timeline"]["next_since"]])
-            self.assertEqual(repeated["result"], {"requests": ["output-2"]})
+            self.assertEqual(repeated["result"], {
+                "requests": ["output-2"], "opt_requests": [],
+            })
 
-    def test_host_pull_reports_every_ready_host_artifact(self):
+    def test_host_pull_reports_optional_host_artifacts_without_waking(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             workflow = validate_workflow({
@@ -1481,8 +1492,10 @@ class StatusSummaryTest(unittest.TestCase):
 
             result = _host_pull(context, None, timeout=.02)
 
-            self.assertLess(result["timeline"]["waited_ms"], 1000)
-            self.assertEqual(result["result"], {"requests": ["input-optional"]})
+            self.assertGreaterEqual(result["timeline"]["waited_ms"], 10)
+            self.assertEqual(result["result"], {
+                "requests": [], "opt_requests": ["input-optional"],
+            })
 
     def test_host_pull_rejects_waits_longer_than_one_minute(self):
         context = mock.Mock(state={"workflow": {"roles": []}})

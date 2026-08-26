@@ -14,7 +14,7 @@ from typing import Any
 from .client import Client
 from .config import ControlError, load_manifest, repository_root, sha256, validate_identifier
 from .context import Context, resolve
-from .events import event_detail, pending_requests, project_events
+from .events import event_detail, pending_optional_requests, pending_requests, project_events
 from .lifecycle import (
     create_execution_session,
     next_session_title,
@@ -622,6 +622,7 @@ def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) ->
     events = project_events(context, since)
     artifacts = workflow_status(_workspace(context), workflow)
     requests = pending_requests(workflow, artifacts)
+    opt_requests = pending_optional_requests(workflow, artifacts)
     _save_request_snapshot(context, requests)
     next_since = max([since, *(event["at"] for event in events)])
     return {
@@ -635,7 +636,8 @@ def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) ->
             "waited_ms": ended_ms - started_ms,
             "events": events,
         },
-        "result": {"requests": requests} if requests else None,
+        "result": ({"requests": requests, "opt_requests": opt_requests}
+                   if requests or opt_requests else None),
     }
 
 
