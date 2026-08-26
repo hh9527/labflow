@@ -34,7 +34,7 @@ def submit_report(context: Context, body_file: Path) -> dict[str, Any]:
         atomic_write(stored, content.encode())
         record: dict[str, Any] = {
             "schema": "labflow.report/v1",
-            "session_name": context.state["session_name"],
+            "title": context.state["title"],
             "number": number,
             "created_at": now(),
             "body": stored.name,

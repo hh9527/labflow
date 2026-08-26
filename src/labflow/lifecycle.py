@@ -20,8 +20,8 @@ from .observe import latest_assistant, normalized, text_parts
 from .permissions import preflight_permissions
 from .runtime_opencode import ENVIRONMENT, generate as generate_opencode_adapter
 from .state import (
-    SCHEMA, atomic_json, atomic_write, bind_plan, execution_root, load_state, locked, now,
-    save_state, validate_session_name,
+    SCHEMA, archive_root, atomic_json, atomic_write, bind_plan, execution_root, load_state,
+    locked, now, save_state, validate_title, workspace_root,
 )
 from .task_cli import TaskError, evaluate, refresh_artifact, restore_artifacts
 
@@ -40,9 +40,9 @@ def lab_sessions(client: Client, lab_root: str | Path) -> list[dict[str, Any]]:
     connection = root / "connection"
     if connection.is_dir():
         workspaces.add(connection)
-    executions = root / "executions"
-    if executions.is_dir():
-        workspaces.update(path for path in executions.glob("*/*/runtime/ws") if path.is_dir())
+    workspace_directory = root / "ws"
+    if workspace_directory.is_dir():
+        workspaces.update(path for path in workspace_directory.iterdir() if path.is_dir())
     records: dict[str, dict[str, Any]] = {}
     for workspace in sorted(workspaces):
         source = client if workspace == Path(client.workspace).resolve() else Client(
@@ -56,22 +56,24 @@ def lab_sessions(client: Client, lab_root: str | Path) -> list[dict[str, Any]]:
 
 
 def next_session_title(client: Client, base: str, lab_root: str | Path) -> str:
-    if not base or any(character.isspace() for character in base):
-        raise ControlError(f"session title base must not contain whitespace: {base!r}", 64)
-    pattern = re.compile(rf"^{re.escape(base)}/([1-9][0-9]*)$")
+    validate_identifier(base, "session title base")
+    pattern = re.compile(rf"^{re.escape(base)}@([1-9][0-9]*)$")
     generations = []
     for session in lab_sessions(client, lab_root):
         title = session.get("title") if isinstance(session, dict) else None
         match = pattern.fullmatch(title) if isinstance(title, str) else None
         if match:
             generations.append(int(match.group(1)))
-    execution_generations = Path(lab_root).resolve() / "executions" / base
-    if execution_generations.is_dir():
-        generations.extend(
-            int(path.name) for path in execution_generations.iterdir()
-            if path.is_dir() and path.name.isdigit() and int(path.name) > 0
-        )
-    return f"{base}/{max(generations, default=0) + 1}"
+    root = Path(lab_root).resolve()
+    for prefix in ("ws", "control", "archive"):
+        directory = root / prefix
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            match = pattern.fullmatch(path.name) if path.is_dir() else None
+            if match:
+                generations.append(int(match.group(1)))
+    return f"{base}@{max(generations, default=0) + 1}"
 
 
 def probe_opencode_connection(lab_name: str, port: int, workspace: Path) -> dict[str, Any]:
@@ -157,34 +159,35 @@ def verify_prepared(manifest: Manifest, state: dict[str, Any]) -> None:
             raise ControlError(f"workspace asset changed since preparation: {name}")
 
 
-def prepare(plan_id: str, session_name: str, port: int | None, assets: dict[str, str] | None = None,
-            from_session: str | None = None, *, lab_name: str,
+def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] | None = None,
+            from_title: str | None = None, *, lab_name: str,
             lab_root: str) -> tuple[Path, dict[str, Any], bool]:
     repo = repository_root(); validate_identifier(plan_id, "plan-id")
-    validate_identifier(lab_name, "lab-name"); validate_session_name(session_name)
+    validate_identifier(lab_name, "lab-name"); validate_title(title)
     if port is not None and not 1 <= port <= 65535: raise ControlError("port must be from 1 through 65535", 64)
     selected_lab_root = Path(lab_root).resolve()
     if not selected_lab_root.is_dir():
         raise ControlError(f"lab root is unavailable: {selected_lab_root}", 75)
-    manifest = load_manifest(repo, plan_id); root = bind_plan(selected_lab_root, plan_id, session_name)
-    if from_session is not None:
-        validate_session_name(from_session)
-        if from_session == session_name:
+    manifest = load_manifest(repo, plan_id); root = bind_plan(selected_lab_root, plan_id, title)
+    if from_title is not None:
+        validate_title(from_title)
+        if from_title == title:
             raise ControlError("an execution cannot inherit from itself", 64)
     with locked(root):
         if (root / "state.json").exists():
             state = load_state(root)
             if state["plan_id"] != plan_id: raise ControlError("execution plan mismatch")
-            if state["phase"] in ("finished", "retired", "failed"): raise ControlError(f"session {session_name} is {state['phase']}")
+            if state["phase"] in ("finished", "retired", "failed"): raise ControlError(f"session {title} is {state['phase']}")
             if port is not None and int(state["server_url"].rsplit(":", 1)[1]) != port: raise ControlError("execution already uses another port", 64)
             if not Path(state["workspace"]).is_dir(): raise ControlError("recorded workspace is missing", 66)
             verify_prepared(manifest, state); return root, state, False
         port = port or 4096
         revision, dirty = git_metadata(repo); plan_revision, plan_source = plan_git_metadata(repo, manifest)
-        run_root = root / "runtime"; workspace = run_root / "ws"
-        run_root.mkdir()
-        state: dict[str, Any] = {"schema": SCHEMA, "plan_id": plan_id, "session_name": session_name, "run_id": uuid.uuid4().hex,
-            "phase": "preparing", "workspace": str(workspace), "run_root": str(run_root), "session_id": None,
+        workspace = workspace_root(selected_lab_root, title)
+        archive = archive_root(selected_lab_root, title)
+        state: dict[str, Any] = {"schema": SCHEMA, "plan_id": plan_id, "title": title, "run_id": uuid.uuid4().hex,
+            "phase": "preparing", "workspace": str(workspace), "archive": str(archive),
+            "session_id": None,
             "server_url": f"http://127.0.0.1:{port}", "repository_revision": revision, "repository_dirty": dirty,
             "lab_root": str(selected_lab_root),
             "lab_name": lab_name,
@@ -194,7 +197,7 @@ def prepare(plan_id: str, session_name: str, port: int | None, assets: dict[str,
             "execution": manifest.execution,
             "input_hashes": {}, "asset_hashes": {}, "next_round": 0, "active_round": None,
             "asset_overrides": dict(assets or {}),
-            "from_session": from_session,
+            "from_title": from_title,
             "created_at": now(),
             "start_requested_at": now(),
             "started_at": None, "finished_at": None}
@@ -213,8 +216,8 @@ def prepare(plan_id: str, session_name: str, port: int | None, assets: dict[str,
             state["reporting"] = manifest.reporting
             state["metrics"] = manifest.metrics
             state["input_hashes"][manifest.manifest_name] = sha256(manifest.root / manifest.manifest_name)
-            if from_session is not None:
-                state["inheritance"] = _inherit_execution(selected_lab_root, from_session, plan_id, workspace,
+            if from_title is not None:
+                state["inheritance"] = _inherit_execution(selected_lab_root, from_title, plan_id, workspace,
                                                             manifest.workflow)
             save_state(root, state)
         except Exception:
@@ -233,9 +236,9 @@ def _inherit_execution(lab_root: Path, source_id: str, plan_id: str, workspace: 
     source_workspace_value = source_state.get("workspace")
     source_workspace = (Path(source_workspace_value)
                         if isinstance(source_workspace_value, str) and source_workspace_value
-                        else source_root / "result" / "workspace")
+                        else archive_root(lab_root, source_id) / "workspace")
     if not source_workspace.is_dir():
-        source_workspace = source_root / "result" / "workspace"
+        source_workspace = archive_root(lab_root, source_id) / "workspace"
     if not source_workspace.is_dir():
         raise ControlError(f"source execution workspace is unavailable: {source_id}", 66)
     source_workflow = source_state.get("workflow")
@@ -337,7 +340,7 @@ def create_execution_session(root: Path, state: dict[str, Any], title: str) -> d
     if not isinstance(session_id, str) or not session_id.startswith("ses_"): raise ControlError("opencode returned an invalid session identity")
     with locked(root):
         current = load_state(root); current["session_id"] = session_id
-        current["session_base"] = title.rsplit("/", 1)[0]; current["session_title"] = title
+        current["execution_base"] = title.rsplit("@", 1)[0]
         current["phase"] = "ready"; save_state(root, current); state = current
     return state
 
@@ -432,7 +435,8 @@ def reconcile(context: Context) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
 
 def run_validation(context: Context) -> list[dict[str, Any]]:
-    directory = context.root / "result" / "validation"; directory.mkdir(parents=True, exist_ok=True)
+    directory = Path(context.state["archive"]) / "validation"
+    directory.mkdir(parents=True, exist_ok=True)
     results = []
     for item in context.manifest.validation:
         workspace = Path(context.state["workspace"]); cwd = workspace / item.get("cwd", "")
@@ -510,7 +514,9 @@ def finish(context: Context) -> dict[str, Any]:
         with locked(context.root): state = load_state(context.root); state["phase"] = "failed"; save_state(context.root, state)
         raise ControlError("required validation failed", 1)
     try:
-        result = context.root / "result"; copy_archive(context, result / "workspace")
+        result = Path(state["archive"])
+        result.mkdir(parents=True, exist_ok=True)
+        copy_archive(context, result / "workspace")
         raw_session = export_session(context, state["session_id"])
         atomic_json(result / "session.json", raw_session)
         children = context.client().children()
@@ -529,7 +535,7 @@ def finish(context: Context) -> dict[str, Any]:
         atomic_json(result / "query.json", document)
         summary = document["summary"]
         atomic_write(result / "RUNLOG.md", ("# Run log\n\n```json\n" + json.dumps(summary, indent=2) + "\n```\n").encode())
-        atomic_write(result / "SUMMARY.md", f"# {state['session_name']} summary\n\nExecution data was frozen at {now()}.\n".encode())
+        atomic_write(result / "SUMMARY.md", f"# {state['title']} summary\n\nExecution data was frozen at {now()}.\n".encode())
     except Exception:
         with locked(context.root):
             current = load_state(context.root); current["phase"] = "idle"; save_state(context.root, current)
@@ -540,10 +546,10 @@ def finish(context: Context) -> dict[str, Any]:
 
 
 def safe_cleanup(state: dict[str, Any]) -> None:
-    run_root = Path(state["run_root"]); workspace = Path(state["workspace"])
+    workspace = Path(state["workspace"])
     lab_root = Path(state["lab_root"]).resolve()
-    execution = execution_root(lab_root, state["session_name"])
-    if (run_root != execution / "runtime" or workspace != run_root / "ws" or run_root.is_symlink()
-            or not run_root.resolve().is_relative_to(lab_root)):
+    expected = workspace_root(lab_root, state["title"])
+    if (workspace != expected or workspace.is_symlink()
+            or not workspace.resolve().is_relative_to(lab_root / "ws")):
         raise ControlError("refusing unsafe temporary cleanup")
-    if run_root.exists(): shutil.rmtree(run_root)
+    if workspace.exists(): shutil.rmtree(workspace)

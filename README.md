@@ -42,14 +42,16 @@ Typical use from a project Git worktree:
 ```bash
 labflow lab run local --port 4199
 labflow host test-connect local
-labflow host start local sample-plan/1 sample-plan
-labflow host status local sample-plan/1
+labflow host start local sample-plan
+labflow host status local sample-plan@1
 labflow attach local
 ```
 
-`labflow lab run` writes `{port, root}` to `target/labs/<lab-name>/config.json`. Session state and
-workspaces live under that temporary lab root. Stopping the foreground process terminates the
-server and reclaims the root.
+`labflow lab run` creates `.labs/<lab-name>` as a symbolic link to the temporary Lab root. The Lab
+root's `config.json` is the configuration source of truth; it records the Lab name, port, and Host
+workspace. Agent workspaces live at `ws/<plan-id>[.<variant>]@<generation>/`, while Host-only state
+and archives live under `control/` and `archive/`. Stopping the foreground process terminates the
+server, removes the symbolic link, and reclaims the Lab root.
 
 ## Artifact Workflow
 

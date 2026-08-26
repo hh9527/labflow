@@ -7,7 +7,7 @@ from typing import Any
 
 from .client import Client
 from .config import ControlError, Manifest, load_manifest, repository_root
-from .state import execution_root, load_lab_config, load_state, validate_session_name
+from .state import execution_root, load_lab_config, load_state, validate_title, workspace_root
 
 
 @dataclass
@@ -30,13 +30,15 @@ class Context:
         return result
 
 
-def resolve(lab_name: str, session_name: str, cwd: Path | None = None) -> Context:
-    validate_session_name(session_name)
+def resolve(lab_name: str, title: str, cwd: Path | None = None) -> Context:
+    validate_title(title)
     repo = repository_root(cwd)
     lab = load_lab_config(repo, lab_name)
-    root = execution_root(Path(lab["root"]), session_name)
+    root = execution_root(Path(lab["root"]), title)
     state = load_state(root)
-    if state.get("session_name") != session_name: raise ControlError("session name mismatch")
+    if state.get("title") != title: raise ControlError("execution title mismatch")
     if state.get("lab_name") != lab_name or state.get("lab_root") != lab["root"]:
         raise ControlError("execution lab identity mismatch")
+    if state.get("workspace") != str(workspace_root(Path(lab["root"]), title)):
+        raise ControlError("execution workspace identity mismatch")
     return Context(repo, root, state, load_manifest(repo, state["plan_id"]))

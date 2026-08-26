@@ -14,7 +14,7 @@ from .client import Client
 from .config import ControlError, repository_root, validate_identifier
 from .external import resolve_cli
 from .lifecycle import opencode_environment
-from .state import create_lab_config, lab_config_path, load_lab_config, remove_lab_config
+from .state import create_lab_config, lab_link_path, load_lab_config, remove_lab_config
 
 
 def parser(prog: str = "labflow lab") -> argparse.ArgumentParser:
@@ -44,7 +44,8 @@ def _run(repo: Path, lab_name: str, requested_port: int | None) -> int:
     port = requested_port if requested_port is not None else _free_port()
     if not 1 <= port <= 65535:
         raise ControlError("port must be from 1 through 65535", 64)
-    if lab_config_path(repo, lab_name).exists():
+    link = lab_link_path(repo, lab_name)
+    if link.exists() or link.is_symlink():
         raise ControlError(f"lab {lab_name} is already configured", 75)
     with socket.socket() as reservation:
         try:
@@ -52,7 +53,8 @@ def _run(repo: Path, lab_name: str, requested_port: int | None) -> int:
         except OSError as exc:
             raise ControlError(f"cannot reserve lab port {port}: {exc}", 69) from None
     lab_root = Path(tempfile.mkdtemp(prefix=f"labflow-{lab_name}-", dir="/tmp")).resolve()
-    log_path = lab_root / "opencode.log"
+    log_path = lab_root / "logs" / "opencode.log"
+    log_path.parent.mkdir()
     log = log_path.open("ab")
     server = subprocess.Popen(
         [*opencode, "serve", "--hostname", "127.0.0.1", "--port", str(port), "--pure"],

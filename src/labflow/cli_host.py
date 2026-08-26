@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .client import Client
-from .config import ControlError, load_manifest, repository_root, sha256
+from .config import ControlError, load_manifest, repository_root, sha256, validate_identifier
 from .context import Context, resolve
 from .events import event_detail, pending_requests, project_events
 from .lifecycle import (
@@ -54,7 +54,7 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
 
     def target(command: argparse.ArgumentParser) -> None:
         command.add_argument("lab_name")
-        command.add_argument("session_name")
+        command.add_argument("title")
 
     stat_command = commands.add_parser("stat")
     target(stat_command)
@@ -75,10 +75,10 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
     event.add_argument("event_id")
     start = commands.add_parser("start")
     start.add_argument("lab_name")
-    start.add_argument("session_name")
     start.add_argument("plan_id")
+    start.add_argument("--variant", help="distinguish this execution series from the base plan")
     start.add_argument(
-        "--from", dest="from_session",
+        "--from", dest="from_title",
         help="inherit current artifacts and checked files from an earlier execution",
     )
     start.add_argument("--bundle", help="install a declared benchmark-mode input bundle")
@@ -128,13 +128,13 @@ def _controller_repo() -> Path:
 
 
 def _configure_start(repo: Path, lab_name: str, plan_id: str,
-                     from_session: str | None = None,
+                     from_title: str | None = None,
                      bundle: str | None = None) -> dict[str, Any]:
     lab = load_lab_config(repo, lab_name)
     load_connect_test(lab_name, Path(lab["root"]))
     manifest = load_manifest(repo, plan_id)
     if manifest.execution["kind"] == "benchmark-mode":
-        if from_session is not None:
+        if from_title is not None:
             raise ControlError("benchmark-mode start does not support --from", 64)
         requires_bundle = manifest.execution.get("bundle") is not None
         if requires_bundle and bundle is None:
@@ -178,7 +178,7 @@ def _asset_contains(asset: str, path: str) -> bool:
 def _record_intervention(context: Context, kind: str, targets: list[dict[str, Any]]) -> dict[str, Any]:
     event = {
         "schema": "labflow.host-intervention/v1",
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "host_forced": True,
         "kind": kind,
         "recorded_at_ns": time.time_ns(),
@@ -325,7 +325,7 @@ def _resume(context: Context, role: str, timeout: float = 15.0,
         child, loop_state = running[-1]
         session_id = child["id"]
         return {
-            "schema": "labflow.role-resume/v2", "session_name": context.state["session_name"],
+            "schema": "labflow.role-resume/v2", "title": context.state["title"],
             "role": role, "action": "already_running", "session_id": session_id,
             "previous_runtime_state": statuses[session_id], "runtime_state": statuses[session_id],
             "loop_observed": True, "loop_state": loop_state,
@@ -341,7 +341,7 @@ def _resume(context: Context, role: str, timeout: float = 15.0,
     else:
         action = "recreated"
         response = client.create_session(
-            next_session_title(client, f"{context.state['session_base']}.{role}",
+            next_session_title(client, f"{context.state['execution_base']}.{role}",
                                context.state["lab_root"]),
             parent_id=context.state["session_id"],
         )
@@ -374,7 +374,7 @@ def _resume(context: Context, role: str, timeout: float = 15.0,
             if action == "resumed_existing":
                 action = "recreated"
                 response = client.create_session(
-                    next_session_title(client, f"{context.state['session_base']}.{role}",
+                    next_session_title(client, f"{context.state['execution_base']}.{role}",
                                        context.state["lab_root"]),
                     parent_id=context.state["session_id"],
                 )
@@ -389,7 +389,7 @@ def _resume(context: Context, role: str, timeout: float = 15.0,
         time.sleep(.1)
     return {
         "schema": "labflow.role-resume/v2",
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "role": role,
         "session_id": session_id,
         "action": action,
@@ -435,21 +435,27 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
             session_id = item.get("id")
             agent = item.get("agent")
             if isinstance(session_id, str) and isinstance(agent, str) and session_id not in seen:
-                sessions.append({"id": session_id, "agent": agent,
-                                 "title": f"batch {item.get('batch')} {agent}"})
+                sessions.append({
+                    "id": session_id,
+                    "agent": agent,
+                    "title": f"{context.state['title']}.batch-{item.get('batch')}.{agent}",
+                })
                 seen.add(session_id)
         for record in context.state.get("benchmark", {}).get("problems", []):
             for key, agent in (("questioner_session_id", questioner),
                                ("answerer_session_id", answerer)):
                 session_id = record.get(key)
                 if isinstance(session_id, str) and session_id not in seen:
-                    sessions.append({"id": session_id, "agent": agent,
-                                     "title": f"batch {record.get('batch')} {agent}"})
+                    sessions.append({
+                        "id": session_id,
+                        "agent": agent,
+                        "title": f"{context.state['title']}.batch-{record.get('batch')}.{agent}",
+                    })
                     seen.add(session_id)
         message_map = {item["id"]: client.session_messages(item["id"])
                        for item in sessions}
         metrics = collect_metrics(
-            context.state["session_name"], context.state["phase"], workspace, sessions,
+            context.state["title"], context.state["phase"], workspace, sessions,
             message_map.__getitem__,
             context.state.get("metrics", context.manifest.metrics),
             {"active": [], "history": []},
@@ -464,7 +470,7 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
     children, messages, statuses = _live_children(context)
     records = task_records(workspace)
     metrics = collect_metrics(
-        context.state["session_name"], context.state["phase"], workspace, children,
+        context.state["title"], context.state["phase"], workspace, children,
         messages.__getitem__, context.state.get("metrics", context.manifest.metrics), records,
     )
     metrics["host_interventions"] = _intervention_summary(context)
@@ -507,14 +513,14 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
     if context.state["phase"] in ("waiting", "preparing"):
-        return {"session_name": context.state["session_name"], "phase": context.state["phase"],
+        return {"title": context.state["title"], "phase": context.state["phase"],
                 "workspace": context.state.get("workspace"),
                 "next_host_actions": [], "agents": []}
     metrics, detail = _metrics(context)
     if context.state.get("execution", {}).get("kind") == "benchmark-mode":
         benchmark = context.state.get("benchmark", {})
         result = {
-            "session_name": context.state["session_name"],
+            "title": context.state["title"],
             "phase": context.state["phase"],
             "workspace": context.state.get("workspace"),
             "benchmark": {
@@ -540,7 +546,7 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
                for name, value in artifacts["artifacts"].items()
                if value["owner"] != "host" and not value["current"] and value["blocked_by"]]
     result = {
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "phase": context.state["phase"],
         "workspace": context.state.get("workspace"),
         "artifact_summary": {
@@ -552,7 +558,7 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
             "action": "submit_artifact",
             "artifact": name,
             "command": (f"labflow host submit {context.state['lab_name']} "
-                        f"{context.state['session_name']} {name}"),
+                        f"{context.state['title']} {name}"),
         } for name in submittable],
         "agents": detail["agents"],
         "tokens": metrics["aggregate"]["tokens"],
@@ -620,7 +626,7 @@ def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) ->
     next_since = max([since, *(event["at"] for event in events)])
     return {
         "schema": "labflow.host-observation/v1",
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "timeline": {
             "clock": "unix_ms",
             "since": since,
@@ -682,7 +688,7 @@ def _abort_sessions(context: Context, timeout: float = 5.0) -> dict[str, Any]:
         raise ControlError(f"timed out aborting session(s): {', '.join(remaining)}", 75)
     return {
         "schema": "labflow.sessions-abort/v1",
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "sessions": sessions,
         "aborted": active,
         "already_idle": [session_id for session_id in sessions if session_id not in active],
@@ -698,19 +704,20 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
         if args.command == "start":
             repo = _controller_repo()
             configured = _configure_start(
-                repo, args.lab_name, args.plan_id, args.from_session, args.bundle
+                repo, args.lab_name, args.plan_id, args.from_title, args.bundle
             )
             client = Client(
                 f"http://127.0.0.1:{configured['port']}", configured["root"]
             )
-            session_name = args.session_name
-            if any(item.get("title") == session_name for item in client.sessions()):
-                raise ControlError(f"OpenCode Session title already exists: {session_name}", 64)
+            if args.variant is not None:
+                validate_identifier(args.variant, "variant")
+            base = args.plan_id if args.variant is None else f"{args.plan_id}.{args.variant}"
+            title = next_session_title(client, base, configured["root"])
             root, state, _ = prepare(
                 args.plan_id,
-                session_name,
+                title,
                 configured["port"],
-                from_session=args.from_session,
+                from_title=args.from_title,
                 lab_name=args.lab_name,
                 lab_root=configured["root"],
             )
@@ -718,11 +725,11 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
             if execution["kind"] == "benchmark-mode":
                 manifest = load_manifest(repo, args.plan_id)
                 state = install_bundle(root, state, manifest, configured.get("bundle"))
-            create_execution_session(root, state, session_name)
-            context = resolve(args.lab_name, session_name, repo)
-            emit({"session_name": session_name, **_start(context)})
+            create_execution_session(root, state, title)
+            context = resolve(args.lab_name, title, repo)
+            emit({"title": title, **_start(context)})
             return 0
-        context = resolve(args.lab_name, args.session_name, _controller_repo())
+        context = resolve(args.lab_name, args.title, _controller_repo())
         if args.command == "status":
             emit(_status(context, args.verbose))
         elif args.command == "pull":

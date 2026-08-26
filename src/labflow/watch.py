@@ -189,7 +189,7 @@ def watch_progress(context: Context, debounce: int, timeout: int) -> dict[str, A
             "updated_at": now(),
         })
     return {
-        "session_name": context.state["session_name"],
+        "title": context.state["title"],
         "started_at": started_at,
         "ended_at": now(),
         "reason": reason,

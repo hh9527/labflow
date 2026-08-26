@@ -20,6 +20,7 @@ from labflow.query import select_engine
 from labflow.external import probe_direct, probe_mise, resolve_capabilities, resolve_cli, resolve_command
 from labflow.state import (
     SCHEMA,
+    archive_root,
     atomic_json,
     bind_plan,
     create_lab_config,
@@ -29,7 +30,8 @@ from labflow.state import (
     load_state,
     record_connect_test,
     save_state,
-    validate_session_name,
+    validate_title,
+    workspace_root,
 )
 from labflow.lifecycle import (
     _inherit_execution,
@@ -85,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/global/health"): self.response({"healthy": True})
         elif self.path.startswith("/session/status"): self.response({"ses_test": {"type": "idle"}})
         elif self.path.startswith("/session?"): self.response([
-            {"id": "ses_test", "title": "test/1", "directory": "/tmp/ws"}
+            {"id": "ses_test", "title": "test@1", "directory": "/tmp/ws"}
         ])
         elif "/message?" in self.path: self.response(self.messages)
         elif self.path.startswith("/broken"): self.send_response(200); self.end_headers(); self.wfile.write(b"not-json")
@@ -123,7 +125,7 @@ class ServerTest(unittest.TestCase):
 
     def test_contract(self):
         self.assertTrue(self.client.health()["healthy"]); self.assertEqual(self.client.status()["type"], "idle")
-        self.assertEqual(self.client.sessions()[0]["title"], "test/1")
+        self.assertEqual(self.client.sessions()[0]["title"], "test@1")
         self.assertEqual(Client(self.client.url, "/tmp/ws").create_session("test")["id"], "ses_test")
         Client(self.client.url, "/tmp/ws").create_session("child", "ses_parent")
         self.assertEqual(Handler.last_payload, {"title": "child", "parentID": "ses_parent"})
@@ -211,33 +213,33 @@ class ConfigStateTest(unittest.TestCase):
             )
 
     def test_artifact_publication_command_is_available(self):
-        args = control_parser().parse_args(["submit", "t1", "demo/1", "output-1", "result"])
-        self.assertEqual((args.command, args.lab_name, args.session_name, args.artifacts),
-                         ("submit", "t1", "demo/1", ["output-1", "result"]))
-        forced = control_parser().parse_args(["submit", "t1", "demo/1", "output-1", "--force"])
+        args = control_parser().parse_args(["submit", "t1", "demo@1", "output-1", "result"])
+        self.assertEqual((args.command, args.lab_name, args.title, args.artifacts),
+                         ("submit", "t1", "demo@1", ["output-1", "result"]))
+        forced = control_parser().parse_args(["submit", "t1", "demo@1", "output-1", "--force"])
         self.assertTrue(forced.force)
         forced_update = control_parser().parse_args(
-            ["update", "t1", "demo/1", "output.txt=input.txt", "--force"]
+            ["update", "t1", "demo@1", "output.txt=input.txt", "--force"]
         )
         self.assertTrue(forced_update.force)
-        forced_resume = control_parser().parse_args(["resume", "t1", "demo/1", "a1", "--force"])
+        forced_resume = control_parser().parse_args(["resume", "t1", "demo@1", "a1", "--force"])
         self.assertTrue(forced_resume.force)
 
     def test_stat_command_is_available(self):
-        args = control_parser().parse_args(["stat", "t1", "demo/1"])
-        self.assertEqual((args.command, args.lab_name, args.session_name),
-                         ("stat", "t1", "demo/1"))
+        args = control_parser().parse_args(["stat", "t1", "demo@1"])
+        self.assertEqual((args.command, args.lab_name, args.title),
+                         ("stat", "t1", "demo@1"))
 
     def test_control_surface_includes_connection_preflight(self):
         self.assertEqual(set(control_parser()._subparsers._group_actions[0].choices),
                          {"test-connect", "start", "stat", "status", "pull", "event",
                           "update", "submit", "resume", "abort-sessions"})
-        args = control_parser().parse_args(["pull", "t1", "demo/1", "123", "--timeout", "5"])
-        self.assertEqual((args.session_name, args.since, args.timeout), ("demo/1", 123, 5.0))
-        event = control_parser().parse_args(["event", "t1", "demo/1", "task:a1-1"])
-        self.assertEqual((event.session_name, event.event_id), ("demo/1", "task:a1-1"))
-        abort = control_parser().parse_args(["abort-sessions", "t1", "demo/1"])
-        self.assertEqual((abort.command, abort.session_name), ("abort-sessions", "demo/1"))
+        args = control_parser().parse_args(["pull", "t1", "demo@1", "123", "--timeout", "5"])
+        self.assertEqual((args.title, args.since, args.timeout), ("demo@1", 123, 5.0))
+        event = control_parser().parse_args(["event", "t1", "demo@1", "task:a1-1"])
+        self.assertEqual((event.title, event.event_id), ("demo@1", "task:a1-1"))
+        abort = control_parser().parse_args(["abort-sessions", "t1", "demo@1"])
+        self.assertEqual((abort.command, abort.title), ("abort-sessions", "demo@1"))
         connect = control_parser().parse_args(["test-connect", "t1"])
         self.assertEqual(connect.lab_name, "t1")
 
@@ -248,7 +250,7 @@ class ConfigStateTest(unittest.TestCase):
             create_lab_config(repo, "old-lab", 4205, lab_root)
             with mock.patch(
                 "labflow.cli_host.probe_opencode_connection",
-                return_value={"health": True, "session_id": "ses_probe", "title": "connect/1"},
+                return_value={"health": True, "session_id": "ses_probe", "title": "connect@1"},
             ) as probe:
                 result = _test_connect(repo, "old-lab")
             self.assertEqual(result["lab_name"], "old-lab")
@@ -266,8 +268,8 @@ class ConfigStateTest(unittest.TestCase):
         client.create_session.return_value = {"id": "ses_a5_new"}
         client.session_messages.return_value = self.PULL_MESSAGE
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "workflow": {"roles": ["a5"]},
-                         "session_id": "ses_coordinator", "session_base": "demo",
+        context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
+                         "session_id": "ses_coordinator", "execution_base": "demo",
                          "lab_root": "/tmp/lab"}
         client.sessions.return_value = []
         context.client.return_value = client
@@ -283,7 +285,7 @@ class ConfigStateTest(unittest.TestCase):
         client.statuses.return_value = {"ses_a5": {"type": "busy"}}
         client.session_messages.return_value = self.PULL_MESSAGE
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "workflow": {"roles": ["a5"]}}
+        context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]}}
         context.client.return_value = client
 
         self.assertEqual(_resume(context, "a5")["action"], "already_running")
@@ -302,8 +304,8 @@ class ConfigStateTest(unittest.TestCase):
         client.session_messages.return_value = self.PULL_MESSAGE
         client.create_session.return_value = {"id": "ses_a5_new"}
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "workflow": {"roles": ["a5"]},
-                         "session_id": "ses_coordinator", "session_base": "demo",
+        context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
+                         "session_id": "ses_coordinator", "execution_base": "demo",
                          "lab_root": "/tmp/lab"}
         client.sessions.return_value = []
         context.client.return_value = client
@@ -317,18 +319,18 @@ class ConfigStateTest(unittest.TestCase):
             "ses_a5_new", mock.ANY, agent="a5"
         )
         client.create_session.assert_called_once_with(
-            "demo.a5/1", parent_id="ses_coordinator"
+            "demo.a5@1", parent_id="ses_coordinator"
         )
 
     def test_resume_rejects_unknown_role_and_recreates_missing_session(self):
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "workflow": {"roles": ["a5"]}}
+        context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]}}
 
         with self.assertRaisesRegex(ControlError, "unknown workflow role"):
             _resume(context, "a4")
 
         context.state["session_id"] = "ses_coordinator"
-        context.state["session_base"] = "demo"
+        context.state["execution_base"] = "demo"
         context.state["lab_root"] = "/tmp/lab"
         client = mock.Mock()
         client.children.side_effect = [[], [{"id": "ses_a5_new", "agent": "a5"}]]
@@ -356,8 +358,8 @@ class ConfigStateTest(unittest.TestCase):
         client.session_messages.return_value = self.PULL_MESSAGE
         client.create_session.return_value = {"id": "ses_a5_new"}
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "workflow": {"roles": ["a5"]},
-                         "session_id": "ses_coordinator", "session_base": "demo",
+        context.state = {"title": "demo@1", "workflow": {"roles": ["a5"]},
+                         "session_id": "ses_coordinator", "execution_base": "demo",
                          "lab_root": "/tmp/lab"}
         client.sessions.return_value = []
         context.client.return_value = client
@@ -369,15 +371,17 @@ class ConfigStateTest(unittest.TestCase):
         self.assertEqual(client.prompt_session.call_args_list[1].args[0], "ses_a5_new")
 
     def test_start_requires_lab_and_plan_identity(self):
-        args = control_parser().parse_args(["start", "t1", "sample-plan/1", "sample-plan"])
+        args = control_parser().parse_args(["start", "t1", "sample-plan"])
         self.assertEqual(
-            (args.command, args.lab_name, args.session_name, args.plan_id, args.from_session),
-            ("start", "t1", "sample-plan/1", "sample-plan", None),
+            (args.command, args.lab_name, args.plan_id, args.variant, args.from_title),
+            ("start", "t1", "sample-plan", None, None),
         )
         inherited = control_parser().parse_args(
-            ["start", "t1", "sample-plan/2", "sample-plan", "--from", "sample-plan/1"]
+            ["start", "t1", "sample-plan", "--variant", "trial",
+             "--from", "sample-plan@1"]
         )
-        self.assertEqual(inherited.from_session, "sample-plan/1")
+        self.assertEqual(inherited.variant, "trial")
+        self.assertEqual(inherited.from_title, "sample-plan@1")
 
     def test_abort_sessions_stops_busy_execution_tree_without_deleting_history(self):
         client = mock.Mock()
@@ -400,7 +404,7 @@ class ConfigStateTest(unittest.TestCase):
             },
         ]
         context = mock.Mock()
-        context.state = {"session_name": "demo/1", "session_id": "ses_root"}
+        context.state = {"title": "demo@1", "session_id": "ses_root"}
         context.client.return_value = client
 
         result = _abort_sessions(context)
@@ -427,7 +431,7 @@ class ConfigStateTest(unittest.TestCase):
         cases = (
             ("lab", "labflow.cli.cli_lab.main", ["run", "t1"]),
             ("attach", "labflow.cli.cli_lab.attach_main", ["t1"]),
-            ("host", "labflow.cli.cli_host.main", ["status", "t1", "demo/1"]),
+            ("host", "labflow.cli.cli_host.main", ["status", "t1", "demo@1"]),
             ("agent", "labflow.cli.task_cli.main", ["status"]),
         )
         for group, target, arguments in cases:
@@ -471,6 +475,7 @@ class ConfigStateTest(unittest.TestCase):
             ), redirect_stdout(stdout):
                 result = lab_main(["run", "t1", "--port", "4199"])
         self.assertEqual(result, 0)
+        self.assertFalse((Path(temporary) / ".labs/t1").is_symlink())
         self.assertEqual(popen.call_count, 1)
         self.assertIn("serve", popen.call_args.args[0])
         run.assert_not_called()
@@ -500,11 +505,11 @@ class ConfigStateTest(unittest.TestCase):
 
     def test_control_start_prepares_and_creates_the_session(self):
         repo = Path("/repo")
-        root = Path("/tmp/lab/executions/sample-plan/2")
+        root = Path("/tmp/lab/control/sample-plan@2")
         prepared = {"phase": "preparing"}
         context = mock.Mock()
         client = mock.Mock()
-        client.sessions.return_value = [{"title": "sample-plan/1"}]
+        client.sessions.return_value = [{"title": "sample-plan@1"}]
         output = StringIO()
         with mock.patch(
             "labflow.cli_host._controller_repo", return_value=repo
@@ -523,14 +528,14 @@ class ConfigStateTest(unittest.TestCase):
         ), mock.patch(
             "labflow.cli_host._start", return_value={"kind": "initial"}
         ), redirect_stdout(output):
-            result = control_main(["start", "t1", "sample-plan/2", "sample-plan"])
+            result = control_main(["start", "t1", "sample-plan"])
         self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue())["session_name"], "sample-plan/2")
+        self.assertEqual(json.loads(output.getvalue())["title"], "sample-plan@2")
         prepare_call.assert_called_once_with(
-            "sample-plan", "sample-plan/2", 4199, from_session=None,
+            "sample-plan", "sample-plan@2", 4199, from_title=None,
             lab_name="t1", lab_root="/tmp/lab"
         )
-        create_session.assert_called_once_with(root, prepared, "sample-plan/2")
+        create_session.assert_called_once_with(root, prepared, "sample-plan@2")
 
     def test_host_configures_the_explicit_plan_and_runner_port(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -540,7 +545,7 @@ class ConfigStateTest(unittest.TestCase):
             lab_root = repo / "lab"; lab_root.mkdir()
             create_lab_config(repo, "t1", 43123, lab_root)
             record_connect_test("t1", lab_root, {
-                "health": True, "session_id": "ses_probe", "title": "connect/1"
+                "health": True, "session_id": "ses_probe", "title": "connect@1"
             })
             value = _configure_start(repo, "t1", "demo")
             self.assertEqual(value["lab_name"], "t1")
@@ -569,10 +574,9 @@ class ConfigStateTest(unittest.TestCase):
                     "output-4": {"desc": "final output", "input": ["output-3.a5"]},
                 },
             })
-            source_root = bind_plan(lab_root, "demo", "demo/1")
-            source_workspace = source_root / "runtime" / "ws"
-            source_workspace.parent.mkdir()
-            source_workspace.mkdir()
+            source_root = bind_plan(lab_root, "demo", "demo@1")
+            source_workspace = workspace_root(lab_root, "demo@1")
+            source_workspace.mkdir(parents=True)
             (source_workspace / "GOAL.md").write_text("old language", encoding="utf-8")
             refresh_artifact(source_workspace, workflow, "input-0")
             (source_workspace / "NOTES.md").write_text("process notes", encoding="utf-8")
@@ -582,14 +586,14 @@ class ConfigStateTest(unittest.TestCase):
             submit(source_workspace, workflow, "a1", ["output-1.a1"])
             refresh_artifact(source_workspace, workflow, "output-2")
             save_state(source_root, {
-                "schema": SCHEMA, "plan_id": "demo", "session_name": "demo/1", "phase": "idle",
+                "schema": SCHEMA, "plan_id": "demo", "title": "demo@1", "phase": "idle",
                 "workspace": str(source_workspace), "workflow": workflow,
             })
 
             target = lab_root / "target-workspace"
             target.mkdir()
             (target / "GOAL.md").write_text("old language", encoding="utf-8")
-            result = _inherit_execution(lab_root, "demo/1", "demo", target, workflow)
+            result = _inherit_execution(lab_root, "demo@1", "demo", target, workflow)
             self.assertEqual(result["artifacts"], ["input-0", "input-1", "output-1.a1", "output-2"])
             self.assertEqual((target / "output.txt").read_text(), "result")
             self.assertEqual((target / "NOTES.md").read_text(), "process notes")
@@ -621,6 +625,11 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(load_lab_config(repo, "t1"), value)
             self.assertEqual(value["port"], 4199)
             self.assertEqual(value["root"], str(lab_root))
+            self.assertEqual((repo / ".labs/t1").resolve(), lab_root)
+            self.assertEqual(json.loads((lab_root / "config.json").read_text()), {
+                "schema": "labflow.lab/v1", "name": "t1", "port": 4199,
+                "host_workspace": str(repo),
+            })
             with self.assertRaisesRegex(ControlError, "configured differently"):
                 create_lab_config(repo, "t1", 4200, lab_root)
 
@@ -629,10 +638,11 @@ class ConfigStateTest(unittest.TestCase):
             repo = Path(temporary)
             lab_root = repo / "lab"; lab_root.mkdir()
             create_lab_config(repo, "t1", 4199, lab_root)
-            root = bind_plan(lab_root, "demo", "demo/1")
+            root = bind_plan(lab_root, "demo", "demo@1")
             save_state(root, {
-                "schema": SCHEMA, "plan_id": "demo", "session_name": "demo/1",
+                "schema": SCHEMA, "plan_id": "demo", "title": "demo@1",
                 "lab_name": "t1", "lab_root": str(lab_root), "phase": "idle",
+                "workspace": str(workspace_root(lab_root, "demo@1")),
             })
             manifest = mock.Mock()
             with mock.patch(
@@ -640,7 +650,7 @@ class ConfigStateTest(unittest.TestCase):
             ), mock.patch(
                 "labflow.context.load_manifest", return_value=manifest
             ):
-                context = resolve_context("t1", "demo/1")
+                context = resolve_context("t1", "demo@1")
             self.assertEqual((context.root, context.manifest), (root, manifest))
 
             state = load_state(root); state["lab_name"] = "other"; save_state(root, state)
@@ -649,7 +659,7 @@ class ConfigStateTest(unittest.TestCase):
             ), mock.patch(
                 "labflow.context.load_manifest", return_value=manifest
             ), self.assertRaisesRegex(ControlError, "lab identity mismatch"):
-                resolve_context("t1", "demo/1")
+                resolve_context("t1", "demo@1")
 
     def test_start_requires_a_connection_test_before_freezing_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -676,7 +686,7 @@ class ConfigStateTest(unittest.TestCase):
             create_lab_config(repo, "t1", 4199, lab_root)
             with mock.patch(
                 "labflow.cli_host.probe_opencode_connection",
-                return_value={"health": True, "session_id": "ses_probe", "title": "connect/1"},
+                return_value={"health": True, "session_id": "ses_probe", "title": "connect@1"},
             ) as probe:
                 receipt = _test_connect(repo, "t1")
             self.assertEqual(load_connect_test("t1", lab_root), receipt)
@@ -686,39 +696,39 @@ class ConfigStateTest(unittest.TestCase):
         client = mock.Mock()
         client.health.return_value = {"healthy": True}
         client.create_session.return_value = {"id": "ses_probe"}
-        client.sessions.return_value = [{"title": "connect/1"}]
+        client.sessions.return_value = [{"title": "connect@1"}]
         workspace = Path("/tmp/lab/connection")
         with mock.patch("labflow.lifecycle.Client", return_value=client) as factory:
             result = probe_opencode_connection("t1", 4199, workspace)
         self.assertEqual(result, {
-            "health": True, "session_id": "ses_probe", "title": "connect/2"
+            "health": True, "session_id": "ses_probe", "title": "connect@2"
         })
         factory.assert_called_once_with("http://127.0.0.1:4199", str(workspace), timeout=0.5)
         client.health.assert_called_once()
-        client.create_session.assert_called_once_with("connect/2")
+        client.create_session.assert_called_once_with("connect@2")
 
     def test_lab_sessions_merge_workspaces_and_allocate_global_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             connection = root / "connection"; connection.mkdir()
-            workspace = root / "executions" / "demo" / "1" / "runtime" / "ws"
+            workspace = root / "ws" / "demo@1"
             workspace.mkdir(parents=True)
             primary = mock.Mock(workspace=str(connection), url="http://127.0.0.1:4199",
                                 timeout=5)
             primary.sessions.return_value = [{
-                "id": "ses_connect", "title": "connect/1",
+                "id": "ses_connect", "title": "connect@1",
                 "directory": str(connection),
             }]
             execution_client = mock.Mock()
             execution_client.sessions.return_value = [{
-                "id": "ses_demo", "title": "demo/1", "directory": str(workspace),
+                "id": "ses_demo", "title": "demo@1", "directory": str(workspace),
             }]
             with mock.patch("labflow.lifecycle.Client",
                             return_value=execution_client):
                 records = lab_sessions(primary, root)
                 title = next_session_title(primary, "demo", root)
             self.assertEqual({item["id"] for item in records}, {"ses_connect", "ses_demo"})
-            self.assertEqual(title, "demo/2")
+            self.assertEqual(title, "demo@2")
 
     def test_update_copies_and_removes_workspace_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -829,7 +839,7 @@ class ConfigStateTest(unittest.TestCase):
             })
             context = mock.Mock()
             context.root = root / "execution"
-            context.state = {"session_name": "demo/1", "phase": "idle",
+            context.state = {"title": "demo@1", "phase": "idle",
                              "workspace": str(workspace), "workflow": workflow}
             with self.assertRaisesRegex(ControlError, "requires --force"):
                 _update(context, [f"output.txt={source}"])
@@ -846,7 +856,7 @@ class ConfigStateTest(unittest.TestCase):
     def test_atomic_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "plan").write_text("plan\n")
-            state = {"schema": SCHEMA, "plan_id": "plan", "session_name": "plan/1", "phase": "ready"}; save_state(root, state)
+            state = {"schema": SCHEMA, "plan_id": "plan", "title": "plan@1", "phase": "ready"}; save_state(root, state)
             self.assertEqual(load_state(root), state)
 
     def test_opencode_environment_is_adapter_owned(self):
@@ -890,7 +900,7 @@ class ConfigStateTest(unittest.TestCase):
                  mock.patch("labflow.lifecycle.resolve_cli", return_value=git), \
                  mock.patch("labflow.lifecycle.subprocess.run", wraps=subprocess.run):
                 _root, state, created = prepare(
-                    "demo", "demo/1", 4567, lab_name="t1", lab_root=str(lab_root)
+                    "demo", "demo@1", 4567, lab_name="t1", lab_root=str(lab_root)
                 )
             self.assertTrue(created)
             workspace = Path(state["workspace"])
@@ -903,7 +913,9 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(set(state["permission_preflight"]), {"a1"})
             self.assertEqual(state["reporting"], {"sinks": []})
             self.assertEqual(state["metrics"], {"roles": {}})
-            self.assertTrue(workspace.is_relative_to(lab_root))
+            self.assertEqual(workspace, workspace_root(lab_root, "demo@1"))
+            self.assertEqual(_root, execution_root(lab_root, "demo@1"))
+            self.assertEqual(Path(state["archive"]), archive_root(lab_root, "demo@1"))
 
     def test_prepare_reuses_a_named_session_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -914,10 +926,10 @@ class ConfigStateTest(unittest.TestCase):
             with mock.patch("labflow.lifecycle.repository_root", return_value=repo), \
                  mock.patch("labflow.lifecycle.git_metadata", return_value=("repo-rev", False)):
                 root, prepared, created = prepare(
-                    "demo", "demo/1", 4567, lab_name="t1", lab_root=str(lab_root)
+                    "demo", "demo@1", 4567, lab_name="t1", lab_root=str(lab_root)
                 )
                 same_root, same_state, created_again = prepare(
-                    "demo", "demo/1", 4567, lab_name="t1", lab_root=str(lab_root)
+                    "demo", "demo@1", 4567, lab_name="t1", lab_root=str(lab_root)
                 )
             self.assertTrue(created)
             self.assertFalse(created_again)
@@ -934,7 +946,7 @@ class ConfigStateTest(unittest.TestCase):
             with mock.patch("labflow.lifecycle.repository_root", return_value=repo), \
                  mock.patch("labflow.lifecycle.git_metadata", return_value=("rev", False)):
                 with self.assertRaisesRegex(ControlError, "clean and committed"):
-                    prepare("demo", "demo/1", 4567, lab_name="t1", lab_root=str(lab_root))
+                    prepare("demo", "demo@1", 4567, lab_name="t1", lab_root=str(lab_root))
 
 
 class ObserveQueryTest(unittest.TestCase):
@@ -984,7 +996,9 @@ class ObserveQueryTest(unittest.TestCase):
                 ({"name": "crate", "cwd": "crate", "command": ["../bin/tool"], "required": True},),
                 (), (),
             )
-            context = Context(root, root / "execution", {"workspace": str(workspace)}, manifest)
+            context = Context(root, root / "execution", {
+                "workspace": str(workspace), "archive": str(root / "archive/demo@1")
+            }, manifest)
 
             results = run_validation(context)
 
@@ -1036,10 +1050,10 @@ class MetricsTest(unittest.TestCase):
             }}}
             children = [{"id": "ses_worker", "agent": "worker", "title": "Worker",
                          "model": {"providerID": "provider", "id": "model", "variant": "v"}}]
-            result = collect_metrics("demo/1", "idle", workspace, children,
+            result = collect_metrics("demo@1", "idle", workspace, children,
                                      lambda _session: messages, definition)
             role = result["roles"][0]
-            self.assertEqual(result["session_name"], "demo/1")
+            self.assertEqual(result["title"], "demo@1")
             self.assertEqual([phase["name"] for phase in role["phases"]],
                              ["language_learning", "api_learning", "implementation"])
             self.assertEqual(role["tokens"]["fresh"], 138)
@@ -1195,14 +1209,14 @@ class MetricsTest(unittest.TestCase):
             ]
             children = [{"id": session_id, "agent": "worker", "title": "Worker"}]
             context = Context(Path(temporary), root, {
-                "session_name": "demo/1", "phase": "idle", "workspace": str(workspace),
+                "title": "demo@1", "phase": "idle", "workspace": str(workspace),
                 "metrics": {"roles": {}},
             }, mock.Mock(metrics={"roles": {}}))
             output = StringIO()
             with mock.patch("labflow.cli_host.resolve", return_value=context), \
                  mock.patch("labflow.cli_host._live_children",
                             return_value=(children, {session_id: messages}, {})), redirect_stdout(output):
-                self.assertEqual(control_main(["stat", "t1", "demo/1"]), 0)
+                self.assertEqual(control_main(["stat", "t1", "demo@1"]), 0)
             document = json.loads(output.getvalue())
             self.assertEqual(document["execution_phase"], "idle")
             self.assertEqual(document["roles"][0]["tokens"]["fresh"], 7)
@@ -1356,7 +1370,7 @@ class StatusSummaryTest(unittest.TestCase):
             pull(workspace, workflow, "a1", False, None)
             submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={
-                "session_name": "demo/1", "lab_name": "t1",
+                "title": "demo@1", "lab_name": "t1",
                 "phase": "active", "workspace": str(workspace),
                 "workflow": workflow,
             })
@@ -1373,7 +1387,7 @@ class StatusSummaryTest(unittest.TestCase):
             self.assertEqual(summary["next_host_actions"], [{
                 "action": "submit_artifact",
                 "artifact": "output-2",
-                "command": "labflow host submit t1 demo/1 output-2",
+                "command": "labflow host submit t1 demo@1 output-2",
             }])
             self.assertIn("artifacts", verbose)
 
@@ -1396,7 +1410,7 @@ class StatusSummaryTest(unittest.TestCase):
             started_at_ns = task_records(workspace)["active"][0]["started_at_ns"]
             submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={
-                "session_name": "demo/1", "phase": "active", "workspace": str(workspace),
+                "title": "demo@1", "phase": "active", "workspace": str(workspace),
                 "workflow": workflow,
             })
             context.root = workspace / "execution"
@@ -1430,7 +1444,7 @@ class StatusSummaryTest(unittest.TestCase):
             })
             refresh_artifact(workspace, workflow, "input-0")
             context = mock.Mock(state={
-                "session_name": "demo/1", "phase": "active", "workspace": str(workspace),
+                "title": "demo@1", "phase": "active", "workspace": str(workspace),
                 "workflow": workflow,
             })
             context.root = workspace / "execution"
@@ -1514,7 +1528,7 @@ class WatchTest(unittest.TestCase):
     def test_persisted_cursor_deduplicates_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "plan").write_text("demo\n")
-            save_state(root, {"schema": SCHEMA, "plan_id": "demo", "session_name": "demo/1",
+            save_state(root, {"schema": SCHEMA, "plan_id": "demo", "title": "demo@1",
                                "phase": "finished", "workspace": "/tmp/ws",
                                "server_url": "http://127.0.0.1:1", "session_id": "ses"})
             manifest = Manifest("demo", root, (), {}, (), (), ())
@@ -1537,7 +1551,7 @@ class WatchTest(unittest.TestCase):
 class ReportingTest(unittest.TestCase):
     def context(self, root: Path, sinks: list[dict]) -> Context:
         manifest = Manifest("demo", root, (), {}, (), (), ())
-        state = {"session_name": "demo/1", "reporting": {"sinks": sinks}}
+        state = {"title": "demo@1", "reporting": {"sinks": sinks}}
         return Context(root, root / "execution", state, manifest)
 
     def test_without_sink_only_persists_locally(self):

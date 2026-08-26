@@ -371,7 +371,7 @@ def _sum_values(values: list[dict[str, int]], names: tuple[str, ...]) -> dict[st
 
 
 def collect_metrics(
-    session_name: str,
+    title: str,
     execution_phase: str,
     workspace: Path,
     children: list[dict[str, Any]],
@@ -465,7 +465,7 @@ def collect_metrics(
     last = max(ends) if ends else None
     return {
         "schema": "labflow.stats/v1",
-        "session_name": session_name,
+        "title": title,
         "execution_phase": execution_phase,
         "roles": roles,
         "aggregate": {

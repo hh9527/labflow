@@ -80,7 +80,7 @@ def list_files(workspace: Path, roots: tuple[str, ...]) -> list[dict[str, Any]]:
 def normalized(state: dict[str, Any], messages: list[dict[str, Any]], status: dict[str, Any], rounds: list[dict[str, Any]], observe_roots: tuple[str, ...], validation: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     workspace = Path(state["workspace"])
     return {
-        "meta": {"schema": "labflow.observation/v1", "session_name": state["session_name"], "plan_id": state["plan_id"]},
+        "meta": {"schema": "labflow.observation/v1", "title": state["title"], "plan_id": state["plan_id"]},
         "state": state, "status": status, "rounds": rounds, "messages": messages,
         "events": [], "summary": summarize(messages), "failures": failures(messages),
         "files": list_files(workspace, observe_roots) if workspace.exists() else [], "validation": validation or [],

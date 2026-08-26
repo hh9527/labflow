@@ -100,7 +100,7 @@ class BenchmarkModeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
-        self.root = self.base / "executions/bench/1"
+        self.root = self.base / "control/bench@1"
         self.workspace = self.base / "workspace"
         self.bundle = self.base / "bundle"
         self.workspace.mkdir()
@@ -138,10 +138,10 @@ class BenchmarkModeTest(unittest.TestCase):
             "workflow": None, "execution": execution,
         }).encode())
         state = {
-            "schema": SCHEMA, "plan_id": "bench", "session_name": "bench/1",
+            "schema": SCHEMA, "plan_id": "bench", "title": "bench@1",
             "phase": "idle", "workspace": str(self.workspace), "session_id": "ses_base",
-            "active_round": None, "next_round": 0, "session_base": "bench",
-            "session_title": "bench/1", "lab_root": str(self.base), "execution": execution,
+            "active_round": None, "next_round": 0, "execution_base": "bench",
+            "session_title": "bench@1", "lab_root": str(self.base), "execution": execution,
             "adapter_hashes": {}, "asset_hashes": {}, "metrics": {"roles": {}},
             "input_hashes": {"experiment.json": sha256(self.workspace / "experiment.json")},
         }

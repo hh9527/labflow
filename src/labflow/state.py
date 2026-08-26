@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -14,31 +15,35 @@ from .config import ControlError, validate_identifier
 SCHEMA = "labflow.execution/v1"
 CONNECT_TEST_SCHEMA = "labflow.connect-test/v1"
 PHASES = {"waiting", "preparing", "ready", "active", "idle", "finishing", "finished", "failed", "retired"}
+LAB_CONFIG_SCHEMA = "labflow.lab/v1"
+TITLE = re.compile(r"[a-z0-9][a-z0-9._-]*@[1-9][0-9]*\Z")
 
 
 def now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def validate_session_name(value: str) -> str:
-    parts = value.split("/")
-    if len(parts) != 2:
-        raise ControlError(f"invalid session-name: {value!r}", 64)
-    validate_identifier(parts[0], "session-name base")
-    if not parts[1].isdigit() or int(parts[1]) < 1:
-        raise ControlError(f"invalid session-name generation: {value!r}", 64)
+def validate_title(value: str) -> str:
+    if not isinstance(value, str) or not TITLE.fullmatch(value) or ".." in value:
+        raise ControlError(f"invalid execution title: {value!r}", 64)
     return value
 
 
-def execution_root(lab_root: Path, session_name: str) -> Path:
-    validate_session_name(session_name)
-    base, generation = session_name.split("/")
-    return lab_root.resolve() / "executions" / base / generation
+def execution_root(lab_root: Path, title: str) -> Path:
+    return lab_root.resolve() / "control" / validate_title(title)
 
 
-def lab_config_path(repo: Path, lab_name: str) -> Path:
+def workspace_root(lab_root: Path, title: str) -> Path:
+    return lab_root.resolve() / "ws" / validate_title(title)
+
+
+def archive_root(lab_root: Path, title: str) -> Path:
+    return lab_root.resolve() / "archive" / validate_title(title)
+
+
+def lab_link_path(repo: Path, lab_name: str) -> Path:
     validate_identifier(lab_name, "lab-name")
-    return repo / "target" / "labs" / lab_name / "config.json"
+    return repo.resolve() / ".labs" / lab_name
 
 
 def create_lab_config(repo: Path, lab_name: str, port: int, root: Path) -> dict[str, Any]:
@@ -48,21 +53,39 @@ def create_lab_config(repo: Path, lab_name: str, port: int, root: Path) -> dict[
     lab_root = root.resolve()
     if not lab_root.is_absolute() or not lab_root.is_dir():
         raise ControlError("lab root must be an existing absolute directory", 66)
-    path = lab_config_path(repo, lab_name)
-    if path.is_file():
+    host_workspace = repo.resolve()
+    path = lab_link_path(host_workspace, lab_name)
+    if path.exists() or path.is_symlink():
         value = load_lab_config(repo, lab_name)
-        if value != {"port": port, "root": str(lab_root)}:
+        if value != {
+            "schema": LAB_CONFIG_SCHEMA,
+            "name": lab_name,
+            "port": port,
+            "host_workspace": str(host_workspace),
+            "root": str(lab_root),
+        }:
             raise ControlError(f"lab {lab_name} is already configured differently")
         return value
-    value = {"port": port, "root": str(lab_root)}
-    atomic_json(path, value)
-    return value
+    value = {
+        "schema": LAB_CONFIG_SCHEMA,
+        "name": lab_name,
+        "port": port,
+        "host_workspace": str(host_workspace),
+    }
+    atomic_json(lab_root / "config.json", value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(lab_root, target_is_directory=True)
+    return {**value, "root": str(lab_root)}
 
 
 def load_lab_config(repo: Path, lab_name: str) -> dict[str, Any]:
-    path = lab_config_path(repo, lab_name)
+    host_workspace = repo.resolve()
+    path = lab_link_path(host_workspace, lab_name)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if not path.is_symlink():
+            raise FileNotFoundError(path)
+        lab_root = path.resolve(strict=True)
+        value = json.loads((lab_root / "config.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ControlError(
             f"missing lab {lab_name}; run labflow lab run {lab_name} before continuing",
@@ -72,26 +95,24 @@ def load_lab_config(repo: Path, lab_name: str) -> dict[str, Any]:
         raise ControlError(f"invalid lab configuration: {exc}") from None
     if (
         not isinstance(value, dict)
-        or set(value) != {"port", "root"}
+        or set(value) != {"schema", "name", "port", "host_workspace"}
+        or value.get("schema") != LAB_CONFIG_SCHEMA
+        or value.get("name") != lab_name
         or not isinstance(value.get("port"), int)
         or not 1 <= value["port"] <= 65535
-        or not isinstance(value.get("root"), str)
-        or not Path(value["root"]).is_absolute()
-        or not Path(value["root"]).is_dir()
+        or value.get("host_workspace") != str(host_workspace)
+        or not lab_root.is_dir()
     ):
         raise ControlError("invalid lab configuration")
-    return value
+    return {**value, "root": str(lab_root)}
 
 
 def remove_lab_config(repo: Path, lab_name: str, expected: dict[str, Any]) -> None:
-    path = lab_config_path(repo, lab_name)
-    try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    path = lab_link_path(repo, lab_name)
+    if not path.is_symlink():
         return
-    except (OSError, json.JSONDecodeError):
-        return
-    if current == expected:
+    expected_root = expected.get("root")
+    if isinstance(expected_root, str) and path.resolve(strict=False) == Path(expected_root):
         path.unlink()
         try:
             path.parent.rmdir()
@@ -158,12 +179,12 @@ def load_connect_test(lab_name: str, lab_root: Path) -> dict[str, Any]:
     return value
 
 
-def bind_plan(lab_root: Path, plan_id: str, session_name: str) -> Path:
-    root = execution_root(lab_root, session_name); root.mkdir(parents=True, exist_ok=True)
+def bind_plan(lab_root: Path, plan_id: str, title: str) -> Path:
+    root = execution_root(lab_root, title); root.mkdir(parents=True, exist_ok=True)
     binding = root / "plan"; expected = f"{plan_id}\n"
     if binding.exists():
         if binding.read_text(encoding="utf-8") != expected:
-            raise ControlError(f"session {session_name} is bound to another plan")
+            raise ControlError(f"execution {title} is bound to another plan")
     else:
         atomic_write(binding, expected.encode(), 0o444)
     return root
@@ -202,6 +223,7 @@ def load_state(root: Path) -> dict[str, Any]:
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise ControlError("unsupported execution state schema")
     if data.get("phase") not in PHASES: raise ControlError("invalid execution phase")
+    validate_title(data.get("title"))
     binding = (root / "plan").read_text(encoding="utf-8")
     if binding != f"{data.get('plan_id')}\n": raise ControlError("execution plan identity mismatch")
     return data

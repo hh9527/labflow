@@ -212,7 +212,7 @@ def _finalize_batch(context: Context, problems: list[dict[str, Any]], batch: int
         raise ControlError("Questioner must create exactly one Answerer per batch", 65)
     answerer_session = children[0]["id"]
     client.update_session(answerer_session,
-                          {"title": f"{context.state['session_name']}.batch-{batch}.a"})
+                          {"title": f"{context.state['title']}.batch-{batch}.a"})
     q_messages = client.session_messages(questioner_session)
     a_messages = client.session_messages(answerer_session)
     metric_roles = context.state.get("metrics", context.manifest.metrics).get("roles", {})
@@ -286,7 +286,7 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
         for offset in range(0, len(execution["problems"]), batch_size):
             batch = offset // batch_size + 1
             problems = execution["problems"][offset:offset + batch_size]
-            q_session = _new_session(client, f"{context.state['session_name']}.batch-{batch}.q",
+            q_session = _new_session(client, f"{context.state['title']}.batch-{batch}.q",
                                      None, execution["questioner"])
             with locked(context.root):
                 state = load_state(context.root)
@@ -317,7 +317,7 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
     events = project_events(context, since)
     observed = int(time.time() * 1000)
     response = {
-        "schema": "labflow.host-observation/v1", "session_name": context.state["session_name"],
+        "schema": "labflow.host-observation/v1", "title": context.state["title"],
         "timeline": {"clock": "unix_ms", "since": since,
                      "next_since": max([since, *(event["at"] for event in events)]),
                      "observed_at": observed, "waited_ms": observed - started, "events": events},
