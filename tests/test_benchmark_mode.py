@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from labflow.benchmark_mode import record_problem, run
+from labflow.benchmark_mode import end_problem, run, start_problem
 from labflow.bundle import install_bundle
 from labflow.config import ControlError, Manifest, sha256
 from labflow.runtime_opencode import generate
@@ -63,6 +63,7 @@ class FakeClient:
         self.children_by_parent[answerer] = []
         execution = json.loads((self.workspace / "experiment.json").read_text())["execution"]
         for index, problem in enumerate(execution["problems"]):
+            start_problem(self.workspace, problem["id"])
             created = int(time.time() * 1000)
             a_messages = self.values[answerer]
             a_messages.extend([
@@ -82,7 +83,9 @@ class FakeClient:
                 )
             elif self.evidence == "err":
                 (channel / "err-diagnostic.txt").write_text("diagnostic\n", encoding="utf-8")
-            record_problem(self.workspace, problem["id"])
+            end_problem(self.workspace, {"ok": "ok", "err": "error"}.get(
+                self.evidence, "cancel"
+            ))
             time.sleep(.002)
         completed = int(time.time() * 1000)
         q_messages.append({"info": {"id": f"a-{session}", "role": "assistant", "agent": agent,
@@ -118,8 +121,9 @@ class BenchmarkModeTest(unittest.TestCase):
         self.manifest = Manifest(
             "bench", self.base, (), {
                 "q": {"description": "questioner", "instructions": "q.md",
-                      "commands": ["labflow agent record *"],
-                      "preflight": ["labflow agent record sample"]},
+                      "commands": ["labflow problem start *", "labflow problem end *"],
+                      "preflight": ["labflow problem start sample",
+                                    "labflow problem end cancel"]},
                 "a": {"description": "answerer", "instructions": "a.md",
                       "commands": [], "preflight": []},
             }, (), (), (), execution=execution,
@@ -193,21 +197,31 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(list((self.workspace / "result/0000").iterdir()),
                          [self.workspace / "result/0000/report.md"])
 
-    def test_record_requires_report_and_rejects_mixed_evidence(self):
-        (self.workspace / "ch/out").mkdir(parents=True)
+    def test_end_requires_report_and_outcome_selects_evidence(self):
+        (self.workspace / "problem/0000").mkdir(parents=True)
+        (self.workspace / "problem/0000/q.md").write_text("exact question\n")
+        start_problem(self.workspace, "0000")
         with self.assertRaisesRegex(ControlError, "report.md"):
-            record_problem(self.workspace, "0000")
+            end_problem(self.workspace, "ok")
         channel = self.workspace / "ch/out"
         (channel / "report.md").write_text("report\n")
-        (channel / "ok-answer.json").write_text("{}\n")
+        (channel / "ok-note.txt").write_text("opaque success\n")
         (channel / "err-diagnostic.txt").write_text("error\n")
-        with self.assertRaisesRegex(ControlError, "cannot coexist"):
-            record_problem(self.workspace, "0000")
-        (channel / "ok-answer.json").unlink()
-        (channel / "err-diagnostic.txt").unlink()
-        (channel / "ok-note.txt").write_text("opaque evidence\n")
-        record_problem(self.workspace, "0000")
+        end_problem(self.workspace, "ok")
         self.assertTrue((self.workspace / "result/0000/ok-note.txt").is_file())
+        self.assertFalse((self.workspace / "result/0000/err-diagnostic.txt").exists())
+
+    def test_start_copies_exact_problem_and_generated_metadata(self):
+        source = self.workspace / "problem/0000"
+        source.mkdir(parents=True)
+        (source / "q.md").write_bytes("exact question\n".encode())
+        (source / "k.md").write_bytes("hidden knowledge\n".encode())
+        result = start_problem(self.workspace, "0000")
+        self.assertEqual(result["maxTurns"], 1)
+        self.assertEqual((self.workspace / "ch/q.md").read_bytes(),
+                         (source / "q.md").read_bytes())
+        self.assertEqual(json.loads((self.workspace / "ch/metadata.json").read_text()),
+                         {"id": "0000", "maxTurns": 1})
 
 
 if __name__ == "__main__":

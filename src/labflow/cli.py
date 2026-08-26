@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import cli_host, cli_lab, task_cli
+from . import cli_host, cli_lab, problem_cli, task_cli
 
 
 def parser() -> argparse.ArgumentParser:
@@ -15,6 +15,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("lab", add_help=False, help="run and inspect laboratory servers")
     commands.add_parser("host", add_help=False, help="control and observe experiment sessions")
     commands.add_parser("agent", add_help=False, help="pull and submit artifact DAG work")
+    commands.add_parser("problem", add_help=False, help="operate Benchmark problem channels")
     return root
 
 
@@ -30,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
         return cli_host.main(values, prog="labflow host")
     if group == "agent":
         return task_cli.main(values, prog="labflow agent")
+    if group == "problem":
+        return problem_cli.main(values, prog="labflow problem")
     parser().parse_args([group])
     return 2
 

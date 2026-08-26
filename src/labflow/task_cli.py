@@ -576,10 +576,6 @@ def parser(prog: str = "labflow agent") -> argparse.ArgumentParser:
     submit_command = commands.add_parser("submit")
     submit_command.add_argument("role")
     submit_command.add_argument("artifacts", nargs="+")
-    record_command = commands.add_parser(
-        "record", help="archive the current Benchmark channel for one problem"
-    )
-    record_command.add_argument("problem")
     commands.add_parser("status")
     return value
 
@@ -588,11 +584,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
     args = parser(prog).parse_args(argv)
     try:
         root = args.root.resolve() if args.root else find_root(Path.cwd())
-        if args.command == "record":
-            from .benchmark_mode import record_problem
-            result = record_problem(root, _id(args.problem, "problem id"))
-        else:
-            workflow = load_workflow(root)
+        workflow = load_workflow(root)
         if args.command == "pull":
             result = pull(root, workflow, _id(args.role, "role"), not args.no_wait, args.timeout)
         elif args.command == "submit":
@@ -605,11 +597,6 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
     except TaskError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)
         return exc.code
-    except Exception as exc:
-        if exc.__class__.__name__ != "ControlError" or not hasattr(exc, "code"):
-            raise
-        print(f"{prog}: {exc}", file=sys.stderr)
-        return int(exc.code)
     except KeyboardInterrupt:
         return 130
 

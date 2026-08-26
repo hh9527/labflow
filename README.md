@@ -160,9 +160,9 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 
 At start, Labflow copies the complete suite into the plan workspace as
 `problem/<id>/q.md` and optional `problem/<id>/k.md`, then triggers each batch once. The Questioner
-passes the active `q.md` verbatim through dialogue, maintains the required nonempty
-`ch/out/report.md`, and uses
-`labflow agent record <id>` to checkpoint each problem. The Answerer may leave `ch/out/ok-*` success
+opens each problem with `labflow problem start <id>`, which copies exact Q/K and generated metadata
+into `ch/`. It passes `ch/q.md` verbatim through dialogue, maintains the required nonempty
+`ch/out/report.md`, and closes with `labflow problem end ok|error|cancel`. The Answerer may leave `ch/out/ok-*` success
 evidence or `ch/out/err-*` failure evidence; both sets may be absent and they cannot coexist. Labflow
 does not interpret evidence file formats. The Answerer cannot write `report.md`.
 
@@ -173,7 +173,8 @@ while different groups remain isolated.
 
 Within one batch the Questioner reads all prepared Q/K files in order, asks through its one Answerer
 child, and supplies only requested clarification. Recording copies `report.md` and optional evidence
-to `result/<id>/`, clears the channel, and establishes the next problem's timing boundary. After the
+to `result/<id>/`, clears the channel, and establishes the next problem's timing boundary. `ok`
+retains only `ok-*`, `error` only `err-*`, and `cancel` neither evidence family. After the
 batch returns, Labflow writes one complete record per problem to `result/stats.jsonl`. Correctness
 remains a Host judgment; the Host does not participate in per-problem scheduling.
 

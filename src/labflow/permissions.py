@@ -57,6 +57,8 @@ def _preflight_family(pattern: str) -> str | None:
         return " ".join(tokens[:2])
     if len(tokens) >= 3 and tokens[:2] == ["labflow", "agent"]:
         return " ".join(tokens[:3])
+    if len(tokens) >= 3 and tokens[:2] == ["labflow", "problem"]:
+        return " ".join(tokens[:3])
     return None
 
 

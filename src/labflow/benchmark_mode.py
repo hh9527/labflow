@@ -92,12 +92,44 @@ def _safe_problem_id(value: str) -> str:
     return value
 
 
-def record_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
-    """Checkpoint one Q/A channel result from inside the Benchmark workspace."""
+def start_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
     execution = _read_runtime(workspace)
     problem_id = _safe_problem_id(problem_id)
-    if problem_id not in {problem["id"] for problem in execution["problems"]}:
+    problems = {problem["id"]: problem for problem in execution["problems"]}
+    if problem_id not in problems:
         raise ControlError(f"unknown Benchmark problem: {problem_id}", 64)
+    channel = workspace / CHANNEL_ROOT
+    metadata = channel / "metadata.json"
+    if metadata.exists():
+        raise ControlError("a Benchmark problem is already active", 75)
+    source = workspace / PROBLEM_ROOT / problem_id
+    if not (source / "q.md").is_file():
+        raise ControlError(f"missing prepared Benchmark problem: {problem_id}", 66)
+    output = channel / "out"
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise ControlError("Benchmark output channel is not clean", 75)
+    shutil.copy2(source / "q.md", channel / "q.md")
+    if (source / "k.md").is_file():
+        shutil.copy2(source / "k.md", channel / "k.md")
+    atomic_json(metadata, {"id": problem_id, "maxTurns": problems[problem_id]["maxTurns"]})
+    return {"schema": "labflow.problem-start/v1", "id": problem_id,
+            "maxTurns": problems[problem_id]["maxTurns"]}
+
+
+def end_problem(workspace: Path, outcome: str) -> dict[str, Any]:
+    _read_runtime(workspace)
+    if outcome not in ("ok", "error", "cancel"):
+        raise ControlError(f"invalid Benchmark outcome: {outcome!r}", 64)
+    metadata_path = workspace / CHANNEL_ROOT / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ControlError("no Benchmark problem is active", 75) from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"invalid Benchmark channel metadata: {exc}", 75) from None
+    problem_id = _safe_problem_id(metadata.get("id"))
+    started_at_ns = metadata_path.stat().st_mtime_ns
     channel = workspace / CHANNEL_OUTPUT
     report = channel / "report.md"
     if not report.is_file() or report.is_symlink() or not report.read_text(encoding="utf-8").strip():
@@ -105,28 +137,29 @@ def record_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
     evidence = [path for path in sorted(channel.iterdir())
                 if path.is_file() and not path.is_symlink()
                 and (path.name.startswith("ok-") or path.name.startswith("err-"))]
-    ok_files = [path for path in evidence if path.name.startswith("ok-")]
-    err_files = [path for path in evidence if path.name.startswith("err-")]
-    if ok_files and err_files:
-        raise ControlError("ok-* and err-* evidence cannot coexist", 75)
+    prefix = {"ok": "ok-", "error": "err-", "cancel": None}[outcome]
+    retained = [path for path in evidence if prefix is not None and path.name.startswith(prefix)]
 
     destination = workspace / RESULT_ROOT / problem_id
     if destination.exists():
         raise ControlError(f"Benchmark problem was already recorded: {problem_id}", 75)
     destination.mkdir(parents=True)
     shutil.copy2(report, destination / "report.md")
-    for path in evidence:
+    for path in retained:
         shutil.copy2(path, destination / path.name)
     checkpoint = {
         "schema": "labflow.benchmark-record/v1", "problem": problem_id,
-        "recorded_at_ns": time.time_ns(), "evidence": [path.name for path in evidence],
+        "outcome": outcome, "started_at_ns": started_at_ns,
+        "recorded_at_ns": time.time_ns(), "evidence": [path.name for path in retained],
     }
     atomic_json(workspace / RECORD_ROOT / f"{problem_id}.json", checkpoint)
-    for path in list(channel.iterdir()):
+    channel_root = workspace / CHANNEL_ROOT
+    for path in list(channel_root.iterdir()):
         if path.is_file() or path.is_symlink():
             path.unlink()
         elif path.is_dir():
             shutil.rmtree(path)
+    (channel_root / "out").mkdir()
     return checkpoint
 
 
@@ -150,10 +183,11 @@ def _batch_prompt(problems: list[dict[str, Any]]) -> str:
     limits = {problem["id"]: problem["maxTurns"] for problem in problems}
     return (
         "完成这一批 Benchmark：" + ", ".join(limits) + "。题面和可选隐藏知识已经一次性放入 "
-        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题处理，并把 q.md 原文逐字发送给 "
-        "Answerer，不得转述或改写。本批只创建一个 Answerer 子会话并持续复用。每题完成后"
-        "由你写 `ch/out/report.md`，然后执行 "
-        "`labflow agent record <id>`；归档成功后再开始下一题。每题最多进行的 Answerer 轮数为："
+        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题执行 `labflow problem start <id>`，然后"
+        "读取 `ch/q.md` 并把原文逐字发送给 Answerer，不得转述或改写；可选 K 位于 `ch/k.md`，"
+        "约束位于 `ch/metadata.json`。本批只创建一个 Answerer 子会话并持续复用。每题完成后"
+        "由你写 `ch/out/report.md`，然后根据结果执行 `labflow problem end ok|error|cancel`；归档"
+        "成功后再开始下一题。每题最多进行的 Answerer 轮数为："
         + json.dumps(limits, ensure_ascii=False, separators=(",", ":"))
         + "。全部归档后再结束回复。"
     )
@@ -195,8 +229,9 @@ def _finalize_batch(context: Context, problems: list[dict[str, Any]], batch: int
         record = {
             **checkpoint, "batch": batch,
             "status": "completed" if turns <= problem["maxTurns"] else "protocol_error",
-            "turns": turns, "started_at_ns": boundary, "end_at_ns": end_ns,
-            "elapsed_ms": (end_ns - boundary) // 1_000_000,
+            "turns": turns, "started_at_ns": int(checkpoint.get("started_at_ns", boundary)),
+            "end_at_ns": end_ns,
+            "elapsed_ms": (end_ns - int(checkpoint.get("started_at_ns", boundary))) // 1_000_000,
             "questioner_session_id": questioner_session,
             "answerer_session_id": answerer_session,
             "transcript": {"questioner": _transcript(q_window),
