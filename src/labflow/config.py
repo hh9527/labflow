@@ -324,6 +324,12 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
                                    output=False)
         outputs = _benchmark_assets(execution_value.get("output", []), "execution.output",
                                     output=True)
+        result_paths = [item["path"] for item in outputs
+                        if not item["path"].endswith("/") and item["path"].endswith(".json")]
+        if len(result_paths) != 1:
+            raise ControlError(
+                "benchmark-mode output must declare exactly one JSON result file"
+            )
         preflight = execution_value.get("preflight", 0)
         if isinstance(preflight, bool) or not isinstance(preflight, int) or preflight < 0:
             raise ControlError("execution.preflight must be a non-negative integer")
@@ -378,6 +384,7 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
             "preflight": preflight,
             "input": inputs,
             "output": outputs,
+            "result": result_paths[0],
             "problems": problems,
             "bundle": {"paths": bundle_paths} if bundle is not None else None,
         }

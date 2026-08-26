@@ -17,6 +17,7 @@ from labflow.state import SCHEMA, atomic_write, load_state, save_state
 class FakeClient:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
+        self.write_result = True
         self.values: dict[str, list[dict]] = {"ses_base": []}
         self.children_by_root: list[dict] = []
         self.forks: list[tuple[str, str | None]] = []
@@ -65,9 +66,9 @@ class FakeClient:
             reply = ({"action": "reply", "text": "EMEA"}
                      if "Which region?" in text else {"action": "done"})
             output = json.dumps(reply)
-        elif text.strip() == "measured question":
+        elif "measured question" in text:
             output = "Which region?"
-        elif text.strip() == "EMEA":
+        elif text.rstrip().endswith("EMEA"):
             output = "final EMEA"
         else:
             output = "warm final"
@@ -75,10 +76,10 @@ class FakeClient:
                                  "agent": agent, "finish": "stop",
                                  "time": {"created": now, "completed": now + 1}},
                        "parts": [{"type": "text", "text": output}]})
-        if agent == "a":
-            answer = self.workspace / "answers/result.txt"
+        if agent == "a" and self.write_result:
+            answer = self.workspace / "answers/answer.json"
             answer.parent.mkdir(parents=True, exist_ok=True)
-            answer.write_text(output + "\n", encoding="utf-8")
+            answer.write_text(json.dumps({"answer": output}) + "\n", encoding="utf-8")
 
 
 class BenchmarkModeTest(unittest.TestCase):
@@ -101,7 +102,8 @@ class BenchmarkModeTest(unittest.TestCase):
             "kind": "benchmark-mode", "questioner": "q", "answerer": "a",
             "preflight": 1,
             "input": [{"path": "knowledge.txt", "level": 0}],
-            "output": [{"path": "answers/", "level": 2}],
+            "output": [{"path": "answers/answer.json", "level": 2}],
+            "result": "answers/answer.json",
             "problems": [
                 {"id": "0000", "q": "0000.md", "k": None, "maxTurns": 1},
                 {"id": "0001", "q": "0001.md", "k": "0001-info.md", "maxTurns": 2},
@@ -152,7 +154,7 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(q_permission["read"], {"*": "deny", "experiment.json": "deny",
                                                 "**/experiment.json": "deny"})
         self.assertEqual(a_permission["read"]["knowledge.txt"], "allow")
-        self.assertEqual(a_permission["edit"]["answers/**"], "allow")
+        self.assertEqual(a_permission["edit"]["answers/answer.json"], "allow")
 
     def test_preflight_warms_one_baseline_and_measured_problem_forks_it(self):
         response = run(self.context, since=0)
@@ -164,17 +166,32 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(measured["metrics"]["answerer"]["assistant_messages"], 2)
         self.assertEqual(measured["metrics"]["questioner"]["assistant_messages"], 2)
         self.assertEqual(measured["metrics"]["answerer"]["rounds"][0]["round"], 1)
+        self.assertEqual(measured["outcome"], "success")
         baseline_reply = self.client.values["ses_base"][-1]["info"]["id"]
         self.assertEqual(self.client.forks, [("ses_base", baseline_reply)])
-        archived = self.root / "benchmark/problems/0001/outputs/answers/result.txt"
-        self.assertEqual(archived.read_text(), "final EMEA\n")
-        self.assertFalse((self.workspace / "answers/result.txt").exists())
+        archived = self.root / "benchmark/problems/0001/answer.json"
+        self.assertEqual(json.loads(archived.read_text()), {"answer": "final EMEA"})
+        self.assertEqual(
+            (self.root / "benchmark/problems/0001/report.md").read_text(), "final EMEA\n"
+        )
+        self.assertTrue((self.root / "benchmark/problems/0001/transcript.json").is_file())
+        self.assertTrue((self.root / "benchmark/problems/0001/metrics.json").is_file())
+        self.assertFalse((self.workspace / "answers/answer.json").exists())
         self.assertEqual(load_state(self.root)["benchmark"]["status"], "completed")
 
     def test_completed_run_is_idempotent(self):
         first = run(self.context, since=0)
         second = run(self.context, since=0)
         self.assertEqual(second, first)
+
+    def test_missing_json_is_archived_as_a_failure_report(self):
+        self.client.write_result = False
+        response = run(self.context, since=0)
+        measured = response["result"]["problems"][0]
+        self.assertEqual(measured["outcome"], "failure")
+        root = self.root / "benchmark/problems/0001"
+        self.assertTrue((root / "report.md").is_file())
+        self.assertFalse((root / "answer.json").exists())
 
 
 if __name__ == "__main__":

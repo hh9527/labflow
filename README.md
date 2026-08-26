@@ -150,7 +150,7 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
   "answerer": "a",
   "preflight": 1,
   "input": [{"path": "knowledge/"}],
-  "output": [{"path": "answers/", "level": 2}],
+  "output": [{"path": "work/answer.json", "level": 2}],
   "problems": [
     {"q": "problems/0000.md", "maxTurns": 2},
     {"q": "problems/0001.md", "k": "problems/0001-info.md", "maxTurns": 3}
@@ -158,11 +158,15 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 }
 ```
 
-The initial question is sent verbatim. After each Answerer reply, the Questioner either supplies a
-narrow clarification grounded only in `q` and `k`, or ends the conversation. Labflow archives the
-transcript, declared outputs, and per-role time, token, thinking, and command metrics for every
-problem. Forked baseline history is excluded from measured problem metrics. Correctness remains a
-Host judgment.
+The initial question is sent with one generic delivery contract. Every plan declares exactly one
+JSON output file. The Answerer writes that stable path only on success and never sees per-problem
+archive paths. After each Answerer reply, the Questioner either supplies a narrow clarification
+grounded only in `q` and `k`, or ends the conversation.
+
+For every problem Labflow automatically archives `report.md` from the final Answerer reply,
+`answer.json` when the declared JSON result is valid, plus `transcript.json`, `metrics.json`, and the
+declared outputs. A missing result is a reported failure; invalid JSON is a protocol error. Forked
+baseline history is excluded from measured problem metrics. Correctness remains a Host judgment.
 
 ## Run With uv
 

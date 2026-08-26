@@ -11,7 +11,7 @@ from .context import Context
 from .events import project_events
 from .metrics import summarize_thread_metrics
 from .observe import latest_assistant, text_parts
-from .state import load_state, locked, now, save_state
+from .state import atomic_json, atomic_write, load_state, locked, now, save_state
 
 
 def _completed_after(messages: list[dict[str, Any]], preceding: str | None) -> dict[str, Any] | None:
@@ -75,6 +75,16 @@ def _questioner_action(message: dict[str, Any]) -> dict[str, str]:
     raise ControlError("Questioner returned an invalid action payload", 65)
 
 
+def _answerer_prompt(text: str, result_path: str) -> str:
+    return (
+        "Benchmark 通用交付协议：最终回复必须是完整的 Markdown 报告。若成功，另将机器可读"
+        f"结果写入 `{result_path}`，且它必须是合法 JSON；若确信无法完成，不得保留该文件，"
+        "并在最终回复中说明业务层面的原因。Labflow 会自动完成分题归档，不要创建题号目录"
+        "或自行保存 transcript。\n\n"
+        f"本轮输入：\n{text}"
+    )
+
+
 def _reset_outputs(workspace: Path, outputs: list[dict[str, Any]]) -> None:
     for asset in outputs:
         directory = asset["path"].endswith("/")
@@ -87,6 +97,8 @@ def _reset_outputs(workspace: Path, outputs: list[dict[str, Any]]) -> None:
             path.unlink()
         if directory:
             path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _archive_outputs(context: Context, problem_id: str,
@@ -116,6 +128,43 @@ def _archive_outputs(context: Context, problem_id: str,
                 shutil.copy2(source, target)
         result.append(record)
     return result
+
+
+def _archive_problem(context: Context, record: dict[str, Any]) -> dict[str, Any]:
+    execution = context.manifest.execution
+    root = context.root / "benchmark" / "problems" / record["id"]
+    root.mkdir(parents=True, exist_ok=True)
+    answers = [item["text"] for item in record["transcript"] if item["role"] == "a"]
+    report = answers[-1].rstrip() + "\n" if answers else ""
+    atomic_write(root / "report.md", report.encode())
+    atomic_json(root / "transcript.json", record["transcript"])
+    atomic_json(root / "metrics.json", record["metrics"])
+
+    result_source = Path(context.state["workspace"]) / execution["result"]
+    if result_source.is_symlink() or result_source.is_dir():
+        record["outcome"] = "protocol_error"
+        record["result_error"] = "JSON result is not a regular file"
+    elif not result_source.exists():
+        record["outcome"] = "failure"
+    else:
+        try:
+            json.loads(result_source.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            record["outcome"] = "protocol_error"
+            record["result_error"] = f"invalid JSON result: {exc}"
+        else:
+            record["outcome"] = "success"
+            shutil.copy2(result_source, root / "answer.json")
+
+    record["outputs"] = _archive_outputs(context, record["id"], execution["output"])
+    record["archive"] = {
+        "report": "report.md",
+        "answer": "answer.json" if record["outcome"] == "success" else None,
+        "transcript": "transcript.json",
+        "metrics": "metrics.json",
+    }
+    atomic_json(root / "record.json", record)
+    return record
 
 
 def _new_session(client: Any, title: str, parent: str, role: str) -> str:
@@ -153,7 +202,9 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
     status = "turn_limit"
     for turn in range(1, problem["maxTurns"] + 1):
         answer_message = _prompt(
-            client, answerer_session, transcript[-1]["text"], execution["answerer"]
+            client, answerer_session,
+            _answerer_prompt(transcript[-1]["text"], execution["result"]),
+            execution["answerer"],
         )
         answer = "\n".join(text_parts(answer_message))
         transcript.append({"role": "a", "text": answer,
@@ -175,7 +226,7 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
     metric_roles = context.state.get("metrics", context.manifest.metrics).get("roles", {})
     answerer_messages = client.session_messages(answerer_session)[answerer_start:]
     questioner_messages = client.session_messages(questioner_session)
-    return {
+    record = {
         "id": problem["id"], "preflight": preflight, "status": status,
         "turns": sum(1 for item in transcript if item["role"] == "a"),
         "started_at": started, "end_at": ended, "elapsed_ms": ended - started,
@@ -194,8 +245,8 @@ def _run_problem(context: Context, problem: dict[str, Any], answerer_session: st
                 now_ms=ended,
             ),
         },
-        "outputs": _archive_outputs(context, problem["id"], execution["output"]),
     }
+    return _archive_problem(context, record)
 
 
 def run(context: Context, since: int | None = None) -> dict[str, Any]:
