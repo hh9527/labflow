@@ -6,12 +6,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import ControlError, sha256
+from .config import ControlError
 from .context import Context
 from .events import project_events
 from .metrics import summarize_thread_metrics
-from .observe import latest_assistant, text_parts
-from .state import atomic_json, atomic_write, load_state, locked, now, save_state
+from .observe import text_parts
+from .state import atomic_json, atomic_write, load_state, locked, save_state
+
+
+PROBLEM_ROOT = Path("problem")
+CHANNEL_ROOT = Path("ch")
+CHANNEL_OUTPUT = CHANNEL_ROOT / "out"
+RESULT_ROOT = Path("result")
+RECORD_ROOT = Path(".labflow") / "benchmark-records"
 
 
 def _completed_after(messages: list[dict[str, Any]], preceding: str | None) -> dict[str, Any] | None:
@@ -26,14 +33,13 @@ def _completed_after(messages: list[dict[str, Any]], preceding: str | None) -> d
     return values[-1] if values else None
 
 
-def _prompt(client: Any, session_id: str, text: str, role: str,
-            timeout: float = 600.0) -> dict[str, Any]:
-    statuses = client.statuses()
-    if statuses.get(session_id, {"type": "idle"}).get("type") == "busy":
+def _prompt(client: Any, session_id: str, prompt: str, role: str,
+            timeout: float = 3600.0) -> dict[str, Any]:
+    if client.statuses().get(session_id, {"type": "idle"}).get("type") == "busy":
         raise ControlError(f"Benchmark Session is busy: {session_id}", 75)
     messages = client.session_messages(session_id)
     preceding = messages[-1].get("info", {}).get("id") if messages else None
-    client.prompt_session(session_id, text, agent=role)
+    client.prompt_session(session_id, prompt, agent=role)
     deadline = time.monotonic() + timeout
     while True:
         messages = client.session_messages(session_id)
@@ -45,128 +51,6 @@ def _prompt(client: Any, session_id: str, text: str, role: str,
         time.sleep(.1)
 
 
-def _questioner_prompt(question: str, knowledge: str | None,
-                       answer: str, first: bool) -> str:
-    context = "题面之外没有可补充的信息。" if knowledge is None else knowledge
-    prefix = (
-        "你是 Benchmark 的 Questioner，只扮演提出业务问题的用户，不判断答案是否正确。\n"
-        "判断 Answerer 的最新回复是否在请求澄清。若是，只依据原始题面和隐含知识作最窄的"
-        "事实回答；不得主动提示解法或泄漏未被询问的信息。若不是澄清请求，则结束对话。\n"
-        "只输出一行 JSON：{\"action\":\"reply\",\"text\":\"...\"} 或 "
-        "{\"action\":\"done\"}。\n\n"
-        f"原始题面：\n{question}\n\n隐含知识：\n{context}\n\n"
-    ) if first else ""
-    return f"{prefix}Answerer 的最新回复：\n{answer}"
-
-
-def _questioner_action(message: dict[str, Any]) -> dict[str, str]:
-    raw = "\n".join(text_parts(message)).strip()
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ControlError(f"Questioner returned invalid JSON: {exc}", 65) from None
-    if not isinstance(value, dict) or value.get("action") not in ("reply", "done"):
-        raise ControlError("Questioner returned an invalid action", 65)
-    if value["action"] == "done" and set(value) == {"action"}:
-        return {"action": "done"}
-    if (value["action"] == "reply" and set(value) == {"action", "text"}
-            and isinstance(value.get("text"), str) and value["text"].strip()):
-        return {"action": "reply", "text": value["text"]}
-    raise ControlError("Questioner returned an invalid action payload", 65)
-
-
-def _answerer_prompt(text: str, result_path: str) -> str:
-    return (
-        "Benchmark 通用交付协议：最终回复必须是完整的 Markdown 报告。若成功，另将机器可读"
-        f"结果写入 `{result_path}`，且它必须是合法 JSON；若确信无法完成，不得保留该文件，"
-        "并在最终回复中说明业务层面的原因。Labflow 会自动完成分题归档，不要创建题号目录"
-        "或自行保存 transcript。\n\n"
-        f"本轮输入：\n{text}"
-    )
-
-
-def _reset_outputs(workspace: Path, outputs: list[dict[str, Any]]) -> None:
-    for asset in outputs:
-        directory = asset["path"].endswith("/")
-        path = workspace / asset["path"].rstrip("/")
-        if path.is_symlink():
-            path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
-        if directory:
-            path.mkdir(parents=True)
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _archive_outputs(context: Context, problem_id: str,
-                     outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    workspace = Path(context.state["workspace"])
-    root = context.root / "benchmark" / "problems" / problem_id / "outputs"
-    result = []
-    for asset in outputs:
-        relative = Path(asset["path"].rstrip("/"))
-        source = workspace / relative
-        record: dict[str, Any] = {"path": asset["path"], "level": asset["level"],
-                                  "present": source.exists()}
-        if source.is_dir():
-            files = []
-            for child in sorted(source.rglob("*")):
-                if child.is_file() and not child.is_symlink():
-                    files.append({"path": child.relative_to(source).as_posix(),
-                                  "sha256": sha256(child), "bytes": child.stat().st_size})
-            record["files"] = files
-            if asset["level"] > 0:
-                shutil.copytree(source, root / relative, dirs_exist_ok=True)
-        elif source.is_file() and not source.is_symlink():
-            record.update({"sha256": sha256(source), "bytes": source.stat().st_size})
-            if asset["level"] > 0:
-                target = root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
-        result.append(record)
-    return result
-
-
-def _archive_problem(context: Context, record: dict[str, Any]) -> dict[str, Any]:
-    execution = context.manifest.execution
-    root = context.root / "benchmark" / "problems" / record["id"]
-    root.mkdir(parents=True, exist_ok=True)
-    answers = [item["text"] for item in record["transcript"] if item["role"] == "a"]
-    report = answers[-1].rstrip() + "\n" if answers else ""
-    atomic_write(root / "report.md", report.encode())
-    atomic_json(root / "transcript.json", record["transcript"])
-    atomic_json(root / "metrics.json", record["metrics"])
-
-    result_source = Path(context.state["workspace"]) / execution["result"]
-    if result_source.is_symlink() or result_source.is_dir():
-        record["outcome"] = "protocol_error"
-        record["result_error"] = "JSON result is not a regular file"
-    elif not result_source.exists():
-        record["outcome"] = "failure"
-    else:
-        try:
-            json.loads(result_source.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            record["outcome"] = "protocol_error"
-            record["result_error"] = f"invalid JSON result: {exc}"
-        else:
-            record["outcome"] = "success"
-            shutil.copy2(result_source, root / "answer.json")
-
-    record["outputs"] = _archive_outputs(context, record["id"], execution["output"])
-    record["archive"] = {
-        "report": "report.md",
-        "answer": "answer.json" if record["outcome"] == "success" else None,
-        "transcript": "transcript.json",
-        "metrics": "metrics.json",
-    }
-    atomic_json(root / "record.json", record)
-    return record
-
-
 def _new_session(client: Any, title: str, parent: str, role: str) -> str:
     response = client.create_session(title, parent_id=parent, agent=role)
     session_id = response.get("id") if isinstance(response, dict) else None
@@ -175,78 +59,177 @@ def _new_session(client: Any, title: str, parent: str, role: str) -> str:
     return session_id
 
 
-def _fork_answerer(client: Any, baseline: str, message_id: str | None,
-                   title: str) -> str:
-    response = client.fork_session(baseline, message_id)
-    session_id = response.get("id") if isinstance(response, dict) else None
-    if not isinstance(session_id, str) or not session_id.startswith("ses_"):
-        raise ControlError("OpenCode returned an invalid Answerer fork identity", 69)
-    client.update_session(session_id, {"title": title})
-    return session_id
+def _transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for message in messages:
+        info = message.get("info", {})
+        if info.get("role") not in ("user", "assistant"):
+            continue
+        result.append({
+            "role": info.get("role"), "message_id": info.get("id"),
+            "created_at": info.get("time", {}).get("created"),
+            "completed_at": info.get("time", {}).get("completed"),
+            "text": "\n".join(text_parts(message)),
+        })
+    return result
 
 
-def _run_problem(context: Context, problem: dict[str, Any], answerer_session: str,
-                 preflight: bool) -> dict[str, Any]:
+def _read_runtime(workspace: Path) -> dict[str, Any]:
+    try:
+        runtime = json.loads((workspace / "experiment.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"cannot read Benchmark runtime: {exc}", 66) from None
+    execution = runtime.get("execution")
+    if not isinstance(execution, dict) or execution.get("kind") != "benchmark-mode":
+        raise ControlError("operation requires benchmark-mode", 64)
+    return execution
+
+
+def _safe_problem_id(value: str) -> str:
+    if (not value or value in (".", "..") or "/" in value or "\\" in value
+            or not all(character.isalnum() or character in "._-" for character in value)):
+        raise ControlError(f"invalid Benchmark problem id: {value!r}", 64)
+    return value
+
+
+def record_problem(workspace: Path, problem_id: str) -> dict[str, Any]:
+    """Checkpoint one Q/A channel result from inside the Benchmark workspace."""
+    execution = _read_runtime(workspace)
+    problem_id = _safe_problem_id(problem_id)
+    if problem_id not in {problem["id"] for problem in execution["problems"]}:
+        raise ControlError(f"unknown Benchmark problem: {problem_id}", 64)
+    channel = workspace / CHANNEL_OUTPUT
+    report = channel / "report.md"
+    if not report.is_file() or report.is_symlink() or not report.read_text(encoding="utf-8").strip():
+        raise ControlError("ch/out/report.md must be a nonempty regular file", 75)
+    evidence = [path for path in sorted(channel.iterdir())
+                if path.is_file() and not path.is_symlink()
+                and (path.name.startswith("ok-") or path.name.startswith("err-"))]
+    ok_files = [path for path in evidence if path.name.startswith("ok-")]
+    err_files = [path for path in evidence if path.name.startswith("err-")]
+    if ok_files and err_files:
+        raise ControlError("ok-* and err-* evidence cannot coexist", 75)
+    if ok_files:
+        json_files = [path for path in ok_files if path.suffix == ".json"]
+        if not json_files:
+            raise ControlError("ok-* evidence must include a JSON file", 75)
+        for path in json_files:
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ControlError(f"invalid JSON evidence {path.name}: {exc}", 75) from None
+
+    destination = workspace / RESULT_ROOT / problem_id
+    if destination.exists():
+        raise ControlError(f"Benchmark problem was already recorded: {problem_id}", 75)
+    destination.mkdir(parents=True)
+    shutil.copy2(report, destination / "report.md")
+    for path in evidence:
+        shutil.copy2(path, destination / path.name)
+    checkpoint = {
+        "schema": "labflow.benchmark-record/v1", "problem": problem_id,
+        "recorded_at_ns": time.time_ns(), "evidence": [path.name for path in evidence],
+    }
+    atomic_json(workspace / RECORD_ROOT / f"{problem_id}.json", checkpoint)
+    for path in list(channel.iterdir()):
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    (workspace / CHANNEL_ROOT / "q.md").unlink(missing_ok=True)
+    return checkpoint
+
+
+def _prepare_workspace(context: Context) -> None:
+    workspace = Path(context.state["workspace"])
+    problem_root = workspace / PROBLEM_ROOT
+    for path in (problem_root, workspace / CHANNEL_OUTPUT, workspace / RESULT_ROOT,
+                 workspace / RECORD_ROOT):
+        path.mkdir(parents=True, exist_ok=True)
+    if any(problem_root.iterdir()) or any((workspace / RESULT_ROOT).iterdir()):
+        raise ControlError("Benchmark workspace is not clean", 75)
+    for problem in context.manifest.execution["problems"]:
+        destination = problem_root / problem["id"]
+        destination.mkdir()
+        shutil.copy2(context.manifest.root / problem["q"], destination / "q.md")
+        if problem["k"] is not None:
+            shutil.copy2(context.manifest.root / problem["k"], destination / "k.md")
+
+
+def _batch_prompt(problems: list[dict[str, Any]]) -> str:
+    limits = {problem["id"]: problem["maxTurns"] for problem in problems}
+    return (
+        "完成这一批 Benchmark：" + ", ".join(limits) + "。题面和可选隐藏知识已经一次性放入 "
+        "`problem/<id>/{q,k}.md`。严格按编号顺序逐题处理；本批只创建一个 Answerer "
+        "子会话并持续复用。每题完成后由你写 `ch/out/report.md`，然后执行 "
+        "`labflow agent record <id>`；归档成功后再开始下一题。每题最多进行的 Answerer 轮数为："
+        + json.dumps(limits, ensure_ascii=False, separators=(",", ":"))
+        + "。全部归档后再结束回复。"
+    )
+
+
+def _messages_in_window(messages: list[dict[str, Any]], start_ns: int,
+                        end_ns: int) -> list[dict[str, Any]]:
+    start_ms, end_ms = start_ns // 1_000_000, end_ns // 1_000_000
+    return [message for message in messages
+            if start_ms <= int(message.get("info", {}).get("time", {}).get("created", 0)) <= end_ms]
+
+
+def _finalize_batch(context: Context, problems: list[dict[str, Any]], batch: int,
+                    questioner_session: str, started_ns: int) -> list[dict[str, Any]]:
+    workspace = Path(context.state["workspace"])
     execution = context.manifest.execution
     client = context.client()
-    question = (context.manifest.root / problem["q"]).read_text(encoding="utf-8")
-    knowledge = ((context.manifest.root / problem["k"]).read_text(encoding="utf-8")
-                 if problem["k"] is not None else None)
-    questioner_session = _new_session(
-        client, f"{context.state['session_name']}.{problem['id']}.q",
-        context.state["session_id"], execution["questioner"],
-    )
-    answerer_start = len(client.session_messages(answerer_session))
-    transcript = [{"role": "q", "text": question}]
-    started = int(time.time() * 1000)
-    status = "turn_limit"
-    for turn in range(1, problem["maxTurns"] + 1):
-        answer_message = _prompt(
-            client, answerer_session,
-            _answerer_prompt(transcript[-1]["text"], execution["result"]),
-            execution["answerer"],
-        )
-        answer = "\n".join(text_parts(answer_message))
-        transcript.append({"role": "a", "text": answer,
-                           "message_id": answer_message.get("info", {}).get("id")})
-        q_message = _prompt(
-            client, questioner_session,
-            _questioner_prompt(question, knowledge, answer, first=turn == 1),
-            execution["questioner"],
-        )
-        action = _questioner_action(q_message)
-        if action["action"] == "done":
-            status = "completed"
-            break
-        if turn == problem["maxTurns"]:
-            break
-        transcript.append({"role": "q", "text": action["text"],
-                           "message_id": q_message.get("info", {}).get("id")})
-    ended = int(time.time() * 1000)
+    children = [item for item in client.children(questioner_session)
+                if item.get("agent") == execution["answerer"]]
+    if len(children) != 1 or not isinstance(children[0].get("id"), str):
+        raise ControlError("Questioner must create exactly one Answerer per batch", 65)
+    answerer_session = children[0]["id"]
+    client.update_session(answerer_session,
+                          {"title": f"{context.state['session_name']}.batch-{batch}.a"})
+    q_messages = client.session_messages(questioner_session)
+    a_messages = client.session_messages(answerer_session)
     metric_roles = context.state.get("metrics", context.manifest.metrics).get("roles", {})
-    answerer_messages = client.session_messages(answerer_session)[answerer_start:]
-    questioner_messages = client.session_messages(questioner_session)
-    record = {
-        "id": problem["id"], "preflight": preflight, "status": status,
-        "turns": sum(1 for item in transcript if item["role"] == "a"),
-        "started_at": started, "end_at": ended, "elapsed_ms": ended - started,
-        "answerer_session_id": answerer_session,
-        "questioner_session_id": questioner_session,
-        "transcript": transcript,
-        "metrics": {
-            "answerer": summarize_thread_metrics(
-                answerer_messages,
-                metric_roles.get(execution["answerer"], {}).get("commands", {}),
-                now_ms=ended,
-            ),
-            "questioner": summarize_thread_metrics(
-                questioner_messages,
-                metric_roles.get(execution["questioner"], {}).get("commands", {}),
-                now_ms=ended,
-            ),
-        },
-    }
-    return _archive_problem(context, record)
+    records = []
+    boundary = started_ns
+    for problem in problems:
+        record_path = workspace / RECORD_ROOT / f"{problem['id']}.json"
+        if not record_path.is_file():
+            raise ControlError(f"Questioner did not record Benchmark problem {problem['id']}", 65)
+        checkpoint = json.loads(record_path.read_text(encoding="utf-8"))
+        end_ns = int(checkpoint["recorded_at_ns"])
+        q_window = _messages_in_window(q_messages, boundary, end_ns)
+        a_window = _messages_in_window(a_messages, boundary, end_ns)
+        turns = sum(message.get("info", {}).get("role") == "assistant" for message in a_window)
+        record = {
+            **checkpoint, "batch": batch,
+            "status": "completed" if turns <= problem["maxTurns"] else "protocol_error",
+            "turns": turns, "started_at_ns": boundary, "end_at_ns": end_ns,
+            "elapsed_ms": (end_ns - boundary) // 1_000_000,
+            "questioner_session_id": questioner_session,
+            "answerer_session_id": answerer_session,
+            "transcript": {"questioner": _transcript(q_window),
+                           "answerer": _transcript(a_window)},
+            "metrics": {
+                "questioner": summarize_thread_metrics(
+                    q_window, metric_roles.get(execution["questioner"], {}).get("commands", {}),
+                    now_ms=end_ns // 1_000_000),
+                "answerer": summarize_thread_metrics(
+                    a_window, metric_roles.get(execution["answerer"], {}).get("commands", {}),
+                    now_ms=end_ns // 1_000_000),
+            },
+        }
+        if turns > problem["maxTurns"]:
+            record["turn_error"] = f"Answerer used {turns} turns; maximum is {problem['maxTurns']}"
+        records.append(record)
+        boundary = end_ns + 1
+    return records
+
+
+def _write_stats(workspace: Path, records: list[dict[str, Any]]) -> None:
+    content = "".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                      for record in records)
+    atomic_write(workspace / RESULT_ROOT / "stats.jsonl", content.encode())
 
 
 def run(context: Context, since: int | None = None) -> dict[str, Any]:
@@ -258,44 +241,34 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
         return existing["response"]
     if isinstance(existing, dict) and existing.get("status") == "running":
         raise ControlError("Benchmark is already running", 75)
-
     started = int(time.time() * 1000)
     since = started if since is None else since
+    _prepare_workspace(context)
     with locked(context.root):
         state = load_state(context.root)
         state["phase"] = "active"
-        state["benchmark"] = {"status": "running", "started_at": started,
-                              "problems": []}
+        state["benchmark"] = {"status": "running", "started_at": started, "problems": []}
         save_state(context.root, state)
         context.state = state
 
     client = context.client()
-    workspace = Path(context.state["workspace"])
-    baseline_session = context.state["session_id"]
-    records = []
+    records: list[dict[str, Any]] = []
     try:
-        for index, problem in enumerate(execution["problems"]):
-            is_preflight = index < execution["preflight"]
-            _reset_outputs(workspace, execution["output"])
-            if is_preflight:
-                answerer_session = baseline_session
-            else:
-                baseline_message = latest_assistant(
-                    client.session_messages(baseline_session)
-                )
-                baseline_message_id = (baseline_message.get("info", {}).get("id")
-                                       if baseline_message else None)
-                answerer_session = _fork_answerer(
-                    client, baseline_session, baseline_message_id,
-                    f"{context.state['session_name']}.{problem['id']}.a",
-                )
-            record = _run_problem(context, problem, answerer_session, is_preflight)
-            records.append(record)
+        batch_size = execution["batchSize"]
+        for offset in range(0, len(execution["problems"]), batch_size):
+            batch = offset // batch_size + 1
+            problems = execution["problems"][offset:offset + batch_size]
+            q_session = _new_session(client, f"{context.state['session_name']}.batch-{batch}.q",
+                                     context.state["session_id"], execution["questioner"])
+            batch_started_ns = time.time_ns()
+            _prompt(client, q_session, _batch_prompt(problems), execution["questioner"])
+            records.extend(_finalize_batch(context, problems, batch, q_session, batch_started_ns))
+            _write_stats(Path(context.state["workspace"]), records)
             with locked(context.root):
                 state = load_state(context.root)
                 state["benchmark"]["problems"] = records
                 save_state(context.root, state)
-        _reset_outputs(workspace, execution["output"])
+                context.state = state
     except Exception:
         with locked(context.root):
             state = load_state(context.root)
@@ -308,20 +281,12 @@ def run(context: Context, since: int | None = None) -> dict[str, Any]:
 
     events = project_events(context, since)
     observed = int(time.time() * 1000)
-    result = {
-        "preflight": [record for record in records if record["preflight"]],
-        "problems": [record for record in records if not record["preflight"]],
-    }
     response = {
-        "schema": "labflow.host-observation/v1",
-        "session_name": context.state["session_name"],
-        "timeline": {
-            "clock": "unix_ms", "since": since,
-            "next_since": max([since, *(event["at"] for event in events)]),
-            "observed_at": observed, "waited_ms": observed - started,
-            "events": events,
-        },
-        "result": result,
+        "schema": "labflow.host-observation/v1", "session_name": context.state["session_name"],
+        "timeline": {"clock": "unix_ms", "since": since,
+                     "next_since": max([since, *(event["at"] for event in events)]),
+                     "observed_at": observed, "waited_ms": observed - started, "events": events},
+        "result": {"problems": records},
     }
     with locked(context.root):
         state = load_state(context.root)

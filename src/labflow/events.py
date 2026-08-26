@@ -197,23 +197,16 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
         client = context.client()
         if context.state.get("execution", {}).get("kind") == "benchmark-mode":
             execution = context.state["execution"]
-            root_session = context.state.get("session_id")
-            if isinstance(root_session, str):
-                result.extend(_message_events(
-                    root_session, execution["answerer"], client.session_messages(root_session)
-                ))
-                for child in client.children(root_session):
-                    child_id = child.get("id")
-                    if not isinstance(child_id, str):
-                        continue
-                    title = str(child.get("title", ""))
-                    role = child.get("agent") or (
-                        execution["questioner"] if title.endswith(".q")
-                        else execution["answerer"]
-                    )
-                    result.extend(_message_events(
-                        child_id, role, client.session_messages(child_id)
-                    ))
+            seen = set()
+            for record in context.state.get("benchmark", {}).get("problems", []):
+                for key, role in (("questioner_session_id", execution["questioner"]),
+                                  ("answerer_session_id", execution["answerer"])):
+                    session = record.get(key)
+                    if isinstance(session, str) and session not in seen:
+                        result.extend(_message_events(
+                            session, role, client.session_messages(session)
+                        ))
+                        seen.add(session)
         else:
             sessions = [(child.get("id"),
                          str(child.get("agent") or child.get("title") or child.get("id")))

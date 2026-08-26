@@ -308,7 +308,7 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
             raise ControlError("dag-mode execution requires a workflow")
         execution = {"kind": kind}
     elif kind == "benchmark-mode":
-        _keys(execution_value, {"kind", "questioner", "answerer", "preflight",
+        _keys(execution_value, {"kind", "questioner", "answerer", "batchSize",
                                 "input", "output", "problems", "bundle"}, "execution")
         questioner = execution_value.get("questioner")
         answerer = execution_value.get("answerer")
@@ -324,15 +324,18 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
                                    output=False)
         outputs = _benchmark_assets(execution_value.get("output", []), "execution.output",
                                     output=True)
-        result_paths = [item["path"] for item in outputs
-                        if not item["path"].endswith("/") and item["path"].endswith(".json")]
-        if len(result_paths) != 1:
+        output_directories = [item["path"] for item in outputs
+                              if item["path"].endswith("/")]
+        if len(outputs) != 1 or len(output_directories) != 1:
             raise ControlError(
-                "benchmark-mode output must declare exactly one JSON result file"
+                "benchmark-mode output must declare exactly one output directory"
             )
-        preflight = execution_value.get("preflight", 0)
-        if isinstance(preflight, bool) or not isinstance(preflight, int) or preflight < 0:
-            raise ControlError("execution.preflight must be a non-negative integer")
+        if outputs[0]["path"] != "ch/out/":
+            raise ControlError("benchmark-mode output directory must be ch/out/")
+        batch_size = execution_value.get("batchSize", 1)
+        if (isinstance(batch_size, bool) or not isinstance(batch_size, int)
+                or batch_size < 1):
+            raise ControlError("execution.batchSize must be a positive integer")
         raw_problems = execution_value.get("problems")
         if not isinstance(raw_problems, list) or not raw_problems:
             raise ControlError("execution.problems must be a nonempty array")
@@ -364,8 +367,6 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
                 raise ControlError(f"duplicate Benchmark problem id: {problem_id}")
             problems.append({"id": problem_id, "q": q, "k": k,
                              "maxTurns": max_turns})
-        if preflight > len(problems):
-            raise ControlError("execution.preflight exceeds the number of problems")
         bundle = execution_value.get("bundle")
         bundle_paths: list[str] = []
         if bundle is not None:
@@ -381,10 +382,9 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
             "kind": kind,
             "questioner": questioner,
             "answerer": answerer,
-            "preflight": preflight,
+            "batchSize": batch_size,
             "input": inputs,
             "output": outputs,
-            "result": result_paths[0],
             "problems": problems,
             "bundle": {"paths": bundle_paths} if bundle is not None else None,
         }

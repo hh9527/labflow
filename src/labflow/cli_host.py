@@ -427,20 +427,18 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
     if execution["kind"] == "benchmark-mode":
         client = context.client()
         statuses = client.statuses()
-        session_id = context.state.get("session_id")
         answerer = execution["answerer"]
         questioner = execution["questioner"]
-        sessions = ([{"id": session_id, "agent": answerer,
-                      "title": context.state["session_name"]}]
-                    if isinstance(session_id, str) else [])
-        if isinstance(session_id, str):
-            for child in client.children(session_id):
-                child_id = child.get("id")
-                if not isinstance(child_id, str):
-                    continue
-                title = str(child.get("title", ""))
-                agent = child.get("agent") or (questioner if title.endswith(".q") else answerer)
-                sessions.append({"id": child_id, "agent": agent, "title": title})
+        sessions = []
+        seen = set()
+        for record in context.state.get("benchmark", {}).get("problems", []):
+            for key, agent in (("questioner_session_id", questioner),
+                               ("answerer_session_id", answerer)):
+                session_id = record.get(key)
+                if isinstance(session_id, str) and session_id not in seen:
+                    sessions.append({"id": session_id, "agent": agent,
+                                     "title": f"batch {record.get('batch')} {agent}"})
+                    seen.add(session_id)
         message_map = {item["id"]: client.session_messages(item["id"])
                        for item in sessions}
         metrics = collect_metrics(
@@ -516,7 +514,7 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
                 "status": benchmark.get("status", "not_started"),
                 "completed_problems": len(benchmark.get("problems", [])),
                 "total_problems": len(context.manifest.execution["problems"]),
-                "preflight": context.manifest.execution["preflight"],
+                "batch_size": context.manifest.execution["batchSize"],
             },
             "agents": detail["agents"],
             "tokens": metrics["aggregate"]["tokens"],

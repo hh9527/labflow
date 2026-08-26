@@ -23,8 +23,8 @@ benchmark-mode  A Questioner and Answerer run a fixed, answer-free problem suite
 
 `dag-mode` requires a Workflow and derives role permissions from Artifact Assets. `benchmark-mode`
 has no Workflow or coordinator. It gives the Answerer read-only inputs and writable outputs while
-keeping each problem's optional hidden knowledge private to the Questioner. Leading `preflight`
-problems warm one Answerer Session; every measured problem forks the same warmed boundary.
+keeping each problem's optional hidden knowledge private to the Questioner. Each fresh Q/A pair
+handles a bounded batch of problems without Session forks.
 
 ## Commands
 
@@ -148,9 +148,9 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
   "kind": "benchmark-mode",
   "questioner": "q",
   "answerer": "a",
-  "preflight": 1,
+  "batchSize": 5,
   "input": [{"path": "knowledge/"}],
-  "output": [{"path": "work/answer.json", "level": 2}],
+  "output": [{"path": "ch/out/", "level": 2}],
   "problems": [
     {"q": "problems/0000.md", "maxTurns": 2},
     {"q": "problems/0001.md", "k": "problems/0001-info.md", "maxTurns": 3}
@@ -158,15 +158,23 @@ Benchmark plans declare inputs, outputs, and questions without expected answers:
 }
 ```
 
-The initial question is sent with one generic delivery contract. Every plan declares exactly one
-JSON output file. The Answerer writes that stable path only on success and never sees per-problem
-archive paths. After each Answerer reply, the Questioner either supplies a narrow clarification
-grounded only in `q` and `k`, or ends the conversation.
+At start, Labflow copies the complete suite into the plan workspace as
+`problem/<id>/q.md` and optional `problem/<id>/k.md`, then triggers each batch once. The Questioner
+copies the active question to `ch/q.md`, maintains the required nonempty `ch/out/report.md`, and uses
+`labflow agent record <id>` to checkpoint each problem. The Answerer may leave `ch/out/ok-*` success
+evidence or `ch/out/err-*` failure evidence; both sets may be absent and they cannot coexist. Present
+`ok-*` evidence must include valid JSON. The Answerer cannot write `report.md`.
 
-For every problem Labflow automatically archives `report.md` from the final Answerer reply,
-`answer.json` when the declared JSON result is valid, plus `transcript.json`, `metrics.json`, and the
-declared outputs. A missing result is a reported failure; invalid JSON is a protocol error. Forked
-baseline history is excluded from measured problem metrics. Correctness remains a Host judgment.
+Labflow partitions the suite into groups of `batchSize`. Each group gets a fresh Questioner Session;
+the Questioner creates one fresh Answerer child and reuses that pair for every problem in the group.
+There is no preflight or Session fork. Reuse amortizes language, documentation, and tool learning
+while different groups remain isolated.
+
+Within one batch the Questioner reads all prepared Q/K files in order, asks through its one Answerer
+child, and supplies only requested clarification. Recording copies `report.md` and optional evidence
+to `result/<id>/`, clears the channel, and establishes the next problem's timing boundary. After the
+batch returns, Labflow writes one complete record per problem to `result/stats.jsonl`. Correctness
+remains a Host judgment; the Host does not participate in per-problem scheduling.
 
 ## Run With uv
 
