@@ -16,10 +16,17 @@ class ControlError(Exception):
 
 
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+WORD = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 
 
 def validate_identifier(value: str, kind: str) -> str:
     if not IDENTIFIER.fullmatch(value) or value.startswith(".") or ".." in value.split("."):
+        raise ControlError(f"invalid {kind}: {value!r}", 64)
+    return value
+
+
+def validate_word(value: str, kind: str) -> str:
+    if not WORD.fullmatch(value):
         raise ControlError(f"invalid {kind}: {value!r}", 64)
     return value
 
@@ -136,7 +143,7 @@ def load_manifest(repo: Path, plan_id: str) -> Manifest:
         raise ControlError("roles must be a non-empty object")
     normalized_roles: dict[str, dict[str, Any]] = {}
     for name, role in roles.items():
-        validate_identifier(name, "role")
+        validate_word(name, "role")
         if not isinstance(role, dict):
             raise ControlError(f"roles.{name} must be an object")
         _keys(role, {"description", "instructions", "commands", "preflight"}, f"roles.{name}")

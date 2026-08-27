@@ -16,7 +16,9 @@ from .config import ControlError, repository_root
 from .events import pending_optional_requests, pending_requests
 from .runtime_opencode import task_prompt
 from .state import atomic_json, load_lab_config, load_state, validate_title
-from .task_cli import TaskError, assign_task, task_records, workflow_status
+from .task_cli import (
+    TaskError, assign_task, clear_session_qualifications, task_records, workflow_status,
+)
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
 
@@ -671,6 +673,10 @@ class Supervisor:
                 backend_id = effect.backend_id
                 delivered = True
                 if effect.kind == "create_session":
+                    if execution.workflow is not None:
+                        clear_session_qualifications(
+                            Path(execution.workspace), execution.workflow, effect.role,
+                        )
                     response = client.create_session(
                         effect.title, parent_id=execution.root_session_id,
                         agent=effect.role,

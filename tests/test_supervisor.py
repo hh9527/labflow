@@ -705,6 +705,58 @@ class SupervisorRuntimeTest(unittest.TestCase):
             self.assertEqual(active[0]["artifacts"], ["output.a1"])
             self.assertIn("input", supervisor.state.executions["demo@1"].artifacts)
 
+    def test_replacement_session_clears_qualification_before_work_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            workspace.mkdir(parents=True)
+            desired = root / "supervisor" / "demo@1" / "artifacts"
+            desired.mkdir(parents=True)
+            control = workspace / "control"
+            control.mkdir()
+            (control / "artifacts").symlink_to(desired, target_is_directory=True)
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {
+                    "input": {"desc": "input"},
+                    "learn.sess.a1": {
+                        "desc": "learn", "input": ["input"], "instruction": "learn",
+                    },
+                    "output.a1": {
+                        "desc": "output", "input": ["input", "learn.sess.a1"],
+                        "instruction": "build",
+                    },
+                },
+            })
+            refresh_artifact(workspace, workflow, "input")
+            refresh_artifact(workspace, workflow, "learn.sess.a1", force=True)
+            assign_task(workspace, workflow, "a1", "output.a1")
+            self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_root": {"type": "idle"}}
+            client.children.return_value = []
+            client.session_messages.return_value = []
+            client.create_session.return_value = {"id": "ses_a1"}
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    client.children.side_effect = lambda session_id: ([{
+                        "id": "ses_a1", "title": "a1", "agent": "a1",
+                    }] if session_id == "ses_root" else [])
+                    client.statuses.return_value = {
+                        "ses_root": {"type": "idle"}, "ses_a1": {"type": "idle"},
+                    }
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertFalse((desired / "learn.sess.a1").exists())
+            self.assertEqual(task_records(workspace)["history"][0]["reason"],
+                             "role Session was replaced")
+            client.prompt_session.assert_called_once()
+            self.assertIn("artifact `learn.sess.a1`",
+                          client.prompt_session.call_args.args[1])
+
     def test_failed_prompt_keeps_task_for_supervisor_restart_delivery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / "ws" / "demo@1"
