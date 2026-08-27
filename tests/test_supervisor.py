@@ -694,10 +694,12 @@ class SupervisorRuntimeTest(unittest.TestCase):
             )
             client.prompt_session.assert_called_once()
             prompt = client.prompt_session.call_args.args[1]
-            self.assertIn("目标：完成 artifact `output.a1`", prompt)
+            self.assertIn("任务对象：artifact `output.a1`", prompt)
             self.assertIn("任务要求：build", prompt)
             self.assertIn("`input`：本轮已更新", prompt)
             self.assertIn("`labflow agent submit a1 output.a1`", prompt)
+            self.assertIn("不表示任务要求已经达到", prompt)
+            self.assertIn("无法达到要求", prompt)
             self.assertNotIn('"target"', prompt)
             active = task_records(workspace)["active"]
             self.assertEqual(active[0]["artifacts"], ["output.a1"])

@@ -188,11 +188,13 @@ underlying Task record has this structure:
 when an optional input does not yet exist. `updated` follows the same Artifact publication boundary
 for Assets. Labflow does not hash Asset contents to infer workflow changes.
 
-The Agent completes exactly the delivered Task, runs `labflow agent submit <role> <artifact>`, and
-ends its Turn. It does not claim or wait for another Task. A later runnable Artifact causes another
-Supervisor prompt. A busy Session is never interrupted. Assignment and stale-Task replacement use
-the same lock as Artifact evaluation; failed prompt delivery leaves the active Task available for
-deterministic redelivery.
+The Agent works on exactly the delivered Task, runs `labflow agent submit <role> <artifact>`, and
+ends its Turn. Submit means that the Task attempt is complete and ready for Host review; it does not
+claim that the instruction was achieved. After sufficient attempts, an Agent that cannot achieve the
+instruction still preserves its work and explanation and submits the Task. It does not claim or wait
+for another Task. A later runnable Artifact causes another Supervisor prompt. A busy Session is never
+interrupted. Assignment and stale-Task replacement use the same lock as Artifact evaluation; failed
+prompt delivery leaves the active Task available for deterministic redelivery.
 
 Host pull distinguishes blocking `requests` from `opt_requests`. A Host Artifact used only through
 optional inputs appears in `opt_requests`; it remains visible but does not wake a waiting Host pull.

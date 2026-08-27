@@ -27,13 +27,15 @@ def task_prompt(role: str, task: dict[str, Any]) -> str:
     ) or "- 无输入资产"
     return (
         "# Labflow 任务\n\n"
-        f"目标：完成 artifact `{target['name']}`。\n\n"
+        f"任务对象：artifact `{target['name']}`。\n\n"
         f"任务要求：{target['instruction']}\n\n"
         f"输入状态：\n{inputs}\n\n"
         f"资产状态：\n{assets}\n\n"
-        "只完成这一项任务。完成后必须执行：\n\n"
+        "只处理这一项任务，并充分执行和验证。完成本次任务后必须执行：\n\n"
         f"`labflow agent submit {role} {target['name']}`\n\n"
-        "提交成功后结束当前 turn，不要领取或等待下一项任务。后续任务会由 Supervisor 主动投递。"
+        "`submit` 表示本次任务已经完成并交给 Host 检视，不表示任务要求已经达到。若充分尝试后"
+        "仍无法达到要求，也要整理现有产出和原因并提交。提交成功后结束当前 turn，不要领取或"
+        "等待下一项任务。后续任务会由 Supervisor 主动投递。"
     )
 
 
@@ -127,7 +129,9 @@ def _dag_role_protocol(role: str) -> str:
     return (
         "\n\n# Labflow Supervisor 协议\n\n"
         f"Supervisor 会主动投递一项完整任务，其中包含目标、要求、输入变化和提交命令。"
-        f"每次只完成被投递的唯一任务，并使用 `labflow agent submit {role} <artifact>` 提交。"
+        f"每次只处理被投递的唯一任务，并使用 `labflow agent submit {role} <artifact>` 提交。"
+        "submit 只表示本次任务完成并交给 Host 检视，不表示要求已经达到；无法达到要求时也要"
+        "整理现有产出和原因后提交。"
         "提交成功后自然结束当前 turn，不要自行领取、轮询或等待其他任务。Supervisor 会在"
         "下一项任务可执行时再次唤醒当前 Session。\n"
     )
