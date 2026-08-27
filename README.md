@@ -109,8 +109,13 @@ errors. Host event queries merge the persisted Timeline with operational Host-ac
 
 ## Artifact Workflow
 
-An Artifact is a timestamped workflow fact. A name ending in `.<role>` is owned by that role; every
-other Artifact is owned by the Host. The workflow does not contain a separate `owner` field.
+An Artifact is a timestamped workflow fact. Artifact names use lowercase words joined internally
+with `-` and structurally with `.`. Every word begins with a letter; its later `-`-separated parts
+may begin with a letter or digit. Formally, `word = ([a-z][a-z0-9]*)(-[a-z0-9]+)*` and
+`name = word ('.' word)*`. Role names are single `word` values and cannot contain `.`.
+
+A name ending in `.<role>` is owned by that role; every other Artifact is owned by the Host. The
+workflow does not contain a separate `owner` field.
 
 ```json
 {
@@ -141,6 +146,22 @@ other Artifact is owned by the Host. The workflow does not contain a separate `o
   }
 }
 ```
+
+### Session qualifications
+
+An Artifact ending in `.sess.<role>` is a qualification held by that role's current Session. For
+example, `language-learn.sess.a3` can record that the current A3 Session has learned the language.
+Only Artifacts owned by the same role may use the qualification as a required input.
+
+A qualification gates execution but is not persistent input data. Its timestamp does not
+participate in a target's freshness, and losing it does not invalidate an already current output.
+When that output later becomes stale, it is not runnable until the current Session earns the
+qualification. Creating a replacement role Session clears its qualifications and supersedes its
+active Task. Continuing the same Session preserves them; a deliberate Session fork may preserve
+them because it preserves context.
+
+Session qualifications cannot be optional, restored, or inherited into another execution. This
+keeps migrated output Assets valid while requiring a fresh Session to complete its own onboarding.
 
 An Asset path ending in `/` denotes a directory; every other path denotes a file. `level` defaults
 to `2` and controls retention only:

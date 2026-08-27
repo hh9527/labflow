@@ -18,7 +18,11 @@ from .config import ControlError
 
 SCHEMA = "labflow.workflow/v1"
 TASK_SCHEMA = "labflow.task-attempt/v1"
-IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+WORD = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
+NAME = re.compile(
+    r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
+    r"(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)*\Z"
+)
 
 
 class TaskError(Exception):
@@ -27,16 +31,22 @@ class TaskError(Exception):
         self.code = code
 
 
-def _id(value: Any, where: str) -> str:
-    if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+def _word(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not WORD.fullmatch(value):
         raise TaskError(f"invalid {where}: {value!r}")
     return value
 
 
-def _ids(value: Any, where: str) -> list[str]:
+def _words(value: Any, where: str) -> list[str]:
     if not isinstance(value, list):
         raise TaskError(f"{where} must be an id array")
-    return [_id(item, where) for item in value]
+    return [_word(item, where) for item in value]
+
+
+def _name(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not NAME.fullmatch(value):
+        raise TaskError(f"invalid {where}: {value!r}")
+    return value
 
 
 def _asset_path(value: Any, where: str) -> str:
@@ -84,11 +94,21 @@ def _artifact_ref(value: Any, where: str) -> tuple[str, bool]:
     if not isinstance(value, str) or not value:
         raise TaskError(f"{where} must be an artifact id")
     optional = value.endswith("?")
-    return _id(value[:-1] if optional else value, where), optional
+    return _name(value[:-1] if optional else value, where), optional
+
+
+def session_qualification_role(name: str) -> str | None:
+    parts = name.split(".")
+    return parts[-1] if len(parts) >= 3 and parts[-2] == "sess" else None
+
+
+def is_session_qualification(name: str) -> bool:
+    return session_qualification_role(name) is not None
 
 
 def _artifact_owner(name: str, roles: list[str]) -> str:
-    return next((role for role in roles if name.endswith(f".{role}")), "host")
+    suffix = name.rsplit(".", 1)[-1] if "." in name else None
+    return suffix if suffix in roles else "host"
 
 
 def validate_workflow(value: Any) -> dict[str, Any]:
@@ -98,7 +118,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
           "workflow")
     if value.get("schema") != SCHEMA:
         raise TaskError("unsupported workflow schema")
-    roles = _ids(value.get("roles", []), "workflow roles")
+    roles = _words(value.get("roles", []), "workflow roles")
     if not roles or len(set(roles)) != len(roles):
         raise TaskError("workflow roles must be a nonempty unique id array")
     raw_artifacts = value.get("artifacts")
@@ -107,7 +127,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
 
     artifacts: dict[str, dict[str, Any]] = {}
     for raw_name, raw in raw_artifacts.items():
-        name = _id(raw_name, "artifact id")
+        name = _name(raw_name, "artifact id")
         if not isinstance(raw, dict):
             raise TaskError(f"artifact {name} must be an object")
         _keys(raw, {"id", "desc", "input", "assets", "instruction"}, f"artifact {name}")
@@ -124,7 +144,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         for item in raw_inputs:
             if isinstance(item, dict):
                 _keys(item, {"id", "optional"}, f"artifact {name} input")
-                dependency = _id(item.get("id"), f"artifact {name} input")
+                dependency = _name(item.get("id"), f"artifact {name} input")
                 optional = item.get("optional")
                 if not isinstance(optional, bool):
                     raise TaskError(f"artifact {name} input optional must be boolean")
@@ -135,6 +155,11 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             seen.add(dependency)
             inputs.append({"id": dependency, "optional": optional})
         owner = _artifact_owner(name, roles)
+        qualification_role = session_qualification_role(name)
+        if qualification_role is not None and qualification_role not in roles:
+            raise TaskError(
+                f"session qualification {name} names unknown role: {qualification_role}"
+            )
         instruction = raw.get("instruction")
         if owner != "host" and (not isinstance(instruction, str) or not instruction.strip()):
             raise TaskError(f"role-owned artifact {name} instruction must be nonempty")
@@ -153,6 +178,17 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         for dependency in artifact["input"]:
             if dependency["id"] not in artifacts:
                 raise TaskError(f"artifact {artifact['id']} has unknown input: {dependency['id']}")
+            qualification_role = session_qualification_role(dependency["id"])
+            if qualification_role is not None:
+                if dependency["optional"]:
+                    raise TaskError(
+                        f"session qualification input cannot be optional: {dependency['id']}"
+                    )
+                if artifact["owner"] != qualification_role:
+                    raise TaskError(
+                        f"session qualification {dependency['id']} can only gate "
+                        f"artifacts owned by {qualification_role}"
+                    )
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -371,14 +407,31 @@ def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
         assets = _asset_state(root, artifact["assets"])
         path = _artifact_path(root, name)
         stamp = path.stat().st_mtime_ns if path.is_file() else 0
-        input_mtime = max((dependency["stamp_mtime_ns"] for reference, dependency in dependencies
-                           if not reference["optional"] or dependency["stamp_mtime_ns"]), default=0)
-        blocked_by = [reference["id"] for reference, dependency in dependencies
-                      if (not reference["optional"] and not dependency["current"])
-                      or (reference["optional"] and dependency["stamp_mtime_ns"]
-                          and not dependency["current"])]
+        data_dependencies = [
+            (reference, dependency) for reference, dependency in dependencies
+            if not is_session_qualification(reference["id"])
+        ]
+        qualification_dependencies = [
+            (reference, dependency) for reference, dependency in dependencies
+            if is_session_qualification(reference["id"])
+        ]
+        input_mtime = max((
+            dependency["stamp_mtime_ns"] for reference, dependency in data_dependencies
+            if not reference["optional"] or dependency["stamp_mtime_ns"]
+        ), default=0)
+        data_blocked_by = [reference["id"] for reference, dependency in data_dependencies
+                           if (not reference["optional"] and not dependency["current"])
+                           or (reference["optional"] and dependency["stamp_mtime_ns"]
+                               and not dependency["current"])]
+        current = bool(
+            stamp and assets["ready"] and not data_blocked_by and stamp > input_mtime
+        )
+        missing_qualifications = [
+            reference["id"] for reference, dependency in qualification_dependencies
+            if not dependency["current"]
+        ]
+        blocked_by = data_blocked_by + ([] if current else missing_qualifications)
         ready = not blocked_by
-        current = bool(stamp and assets["ready"] and ready and stamp > input_mtime)
         values[name] = {
             "id": name,
             "owner": artifact["owner"],
@@ -389,6 +442,7 @@ def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
             "stamp_mtime_ns": stamp,
             "input_mtime_ns": input_mtime,
             "blocked_by": blocked_by,
+            "missing_qualifications": missing_qualifications,
             "assets": assets,
         }
         return values[name]
@@ -452,6 +506,11 @@ def restore_artifacts(root: Path, workflow: dict[str, Any], names: list[str]) ->
     unknown = requested - set(workflow["artifacts"])
     if unknown:
         raise TaskError(f"unknown artifact(s): {', '.join(sorted(unknown))}", 64)
+    qualifications = sorted(name for name in requested if is_session_qualification(name))
+    if qualifications:
+        raise TaskError(
+            f"cannot restore session qualifications: {', '.join(qualifications)}", 64
+        )
     restored = []
     with _locked(root):
         pending = set(requested)
@@ -462,7 +521,11 @@ def restore_artifacts(root: Path, workflow: dict[str, Any], names: list[str]) ->
                 if name not in pending:
                     continue
                 value = status[name]
-                if value["blocked_by"]:
+                data_blocked_by = [
+                    dependency for dependency in value["blocked_by"]
+                    if dependency not in value["missing_qualifications"]
+                ]
+                if data_blocked_by:
                     continue
                 if not value["assets"]["ready"]:
                     raise TaskError(f"cannot restore {name}; assets are incomplete", 75)
@@ -473,10 +536,39 @@ def restore_artifacts(root: Path, workflow: dict[str, Any], names: list[str]) ->
             if not progressed:
                 blocked = evaluate(root, workflow)["artifacts"]
                 details = "; ".join(
-                    f"{name}: {', '.join(blocked[name]['blocked_by'])}" for name in sorted(pending)
+                    f"{name}: {', '.join(
+                        dependency for dependency in blocked[name]['blocked_by']
+                        if dependency not in blocked[name]['missing_qualifications']
+                    )}" for name in sorted(pending)
                 )
                 raise TaskError(f"cannot restore artifacts; inputs are incomplete: {details}", 75)
     return restored
+
+
+def clear_session_qualifications(
+    root: Path, workflow: dict[str, Any], role: str,
+) -> list[str]:
+    """Invalidate knowledge tied to a replaced role Session."""
+    if role not in workflow["roles"]:
+        raise TaskError(f"unknown workflow role: {role}", 64)
+    names = [
+        name for name in workflow["artifacts"]
+        if session_qualification_role(name) == role
+    ]
+    with _locked(root):
+        removed = []
+        for name in names:
+            path = _artifact_path(root, name)
+            if path.is_file():
+                path.unlink()
+                removed.append(name)
+        active_path = _active_task_path(root, role)
+        active = _read_json(active_path)
+        if active is not None:
+            _archive_active(
+                root, active_path, active, "stale", "role Session was replaced"
+            )
+    return removed
 
 
 def assign_task(root: Path, workflow: dict[str, Any], role: str,
@@ -582,8 +674,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
         root = args.root.resolve() if args.root else find_root(Path.cwd())
         if args.command == "submit":
             workflow = load_workflow(root)
-            result = submit(root, workflow, _id(args.role, "role"),
-                            [_id(name, "artifact") for name in args.artifacts])
+            result = submit(root, workflow, _word(args.role, "role"),
+                            [_name(name, "artifact") for name in args.artifacts])
         elif args.command == "status":
             workflow = load_workflow(root)
             result = workflow_status(root, workflow)

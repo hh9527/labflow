@@ -580,12 +580,13 @@ class ConfigStateTest(unittest.TestCase):
                 "schema": "labflow.workflow/v1",
                 "roles": ["a1", "a5"],
                 "artifacts": {
+                    "learn.sess.a1": {"desc": "A1 learning", "instruction": "learn"},
                     "input-0": {"desc": "input",
                                 "assets": [{"path": "GOAL.md", "level": 0}]},
                     "input-1": {"desc": "optional input",
                                 "assets": [{"path": "NOTES.md", "level": 1}]},
                     "output-1.a1": {"desc": "output",
-                                 "input": ["input-0", "input-1?"],
+                                 "input": ["input-0", "input-1?", "learn.sess.a1"],
                                  "assets": ["output.txt"], "instruction": "build"},
                     "output-2": {"desc": "host output", "input": ["output-1.a1"]},
                     "output-3.a5": {"desc": "role output",
@@ -597,6 +598,8 @@ class ConfigStateTest(unittest.TestCase):
             source_workspace = workspace_root(lab_root, "demo@1")
             source_workspace.mkdir(parents=True)
             (source_workspace / "GOAL.md").write_text("old language", encoding="utf-8")
+            assign_task(source_workspace, workflow, "a1", "learn.sess.a1")
+            submit(source_workspace, workflow, "a1", ["learn.sess.a1"])
             refresh_artifact(source_workspace, workflow, "input-0")
             (source_workspace / "NOTES.md").write_text("process notes", encoding="utf-8")
             refresh_artifact(source_workspace, workflow, "input-1")
@@ -618,6 +621,7 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual((target / "NOTES.md").read_text(), "process notes")
             self.assertEqual((target / "GOAL.md").read_text(), "old language")
             status = evaluate(target, workflow)["artifacts"]
+            self.assertFalse(status["learn.sess.a1"]["current"])
             self.assertTrue(status["output-2"]["current"])
             self.assertTrue(status["output-3.a5"]["runnable"])
             self.assertFalse((target / ".labflow" / "active").exists())

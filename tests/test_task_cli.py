@@ -8,9 +8,9 @@ from io import StringIO
 from pathlib import Path
 
 from labflow.task_cli import (
-    TaskError, assign_task, evaluate, load_workflow, parser, refresh_artifact,
-    remove_artifact, restore_artifacts, role_asset_permissions, submit, task_records,
-    validate_workflow,
+    TaskError, assign_task, clear_session_qualifications, evaluate, load_workflow,
+    parser, refresh_artifact, remove_artifact, restore_artifacts,
+    role_asset_permissions, submit, task_records, validate_workflow,
 )
 
 
@@ -220,6 +220,48 @@ class ArtifactWorkflowTest(unittest.TestCase):
             self.assertEqual([item["artifact"] for item in restored], ["input-0", "output-1.a1"])
             self.assertEqual(task_records(root), {"active": [], "history": []})
 
+    def test_session_qualification_gates_work_without_invalidating_output(self):
+        workflow = validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["a1"],
+            "artifacts": {
+                "language": {"desc": "language"},
+                "learn.sess.a1": {
+                    "desc": "learn", "input": ["language"], "instruction": "learn",
+                },
+                "work.a1": {
+                    "desc": "work", "input": ["language", "learn.sess.a1"],
+                    "assets": ["work.txt"], "instruction": "work",
+                },
+                "done": {"desc": "done", "input": ["work.a1"]},
+            },
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            refresh_artifact(root, workflow, "language")
+            status = evaluate(root, workflow)["artifacts"]
+            self.assertTrue(status["learn.sess.a1"]["runnable"])
+            self.assertFalse(status["work.a1"]["runnable"])
+            self.assertEqual(status["work.a1"]["missing_qualifications"], [
+                "learn.sess.a1",
+            ])
+
+            assign_task(root, workflow, "a1", "learn.sess.a1")
+            submit(root, workflow, "a1", ["learn.sess.a1"])
+            self.assertTrue(evaluate(root, workflow)["artifacts"]["work.a1"]["runnable"])
+            (root / "work.txt").write_text("done", encoding="utf-8")
+            assign_task(root, workflow, "a1", "work.a1")
+            submit(root, workflow, "a1", ["work.a1"])
+
+            self.assertEqual(clear_session_qualifications(root, workflow, "a1"), [
+                "learn.sess.a1",
+            ])
+            status = evaluate(root, workflow)["artifacts"]
+            self.assertFalse(status["learn.sess.a1"]["current"])
+            self.assertTrue(status["work.a1"]["current"])
+            self.assertTrue(status["done"]["submittable"])
+            with self.assertRaisesRegex(TaskError, "cannot restore session qualifications"):
+                restore_artifacts(root, workflow, ["learn.sess.a1"])
+
     def test_changed_inputs_supersede_active_task(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -257,6 +299,41 @@ class ArtifactWorkflowTest(unittest.TestCase):
         base["artifacts"]["start"]["owner"] = "host"
         with self.assertRaisesRegex(TaskError, "unknown artifact start key.*owner"):
             validate_workflow(base)
+
+    def test_validation_enforces_names_and_session_qualification_edges(self):
+        validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["a1"],
+            "artifacts": {"input-0": {"desc": "valid numeric second segment"}},
+        })
+        for name in ("Input", "input_0", "0-input", "input-", ".input", "input..value"):
+            with self.subTest(name=name), self.assertRaisesRegex(TaskError, "invalid artifact id"):
+                validate_workflow({
+                    "schema": "labflow.workflow/v1", "roles": ["a1"],
+                    "artifacts": {name: {"desc": "bad"}},
+                })
+        with self.assertRaisesRegex(TaskError, "invalid workflow roles"):
+            validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["team.a1"],
+                "artifacts": {"input": {"desc": "input"}},
+            })
+        with self.assertRaisesRegex(TaskError, "can only gate artifacts owned by a1"):
+            validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1", "a2"],
+                "artifacts": {
+                    "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
+                    "work.a2": {"desc": "work", "input": ["learn.sess.a1"],
+                                "instruction": "work"},
+                },
+            })
+        with self.assertRaisesRegex(TaskError, "cannot be optional"):
+            validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {
+                    "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
+                    "work.a1": {"desc": "work", "input": ["learn.sess.a1?"],
+                                "instruction": "work"},
+                },
+            })
 
     def test_cli_exposes_dag_and_benchmark_agent_commands(self):
         self.assertEqual(parser().parse_args(["submit", "a1", "output-1.a1"]).artifacts, ["output-1.a1"])
