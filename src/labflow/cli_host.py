@@ -14,7 +14,7 @@ from typing import Any
 from .client import Client
 from .config import ControlError, load_manifest, repository_root, sha256, validate_identifier
 from .context import Context, resolve
-from .events import event_detail, pending_optional_requests, pending_requests, project_events
+from .events import event_detail
 from .lifecycle import (
     create_execution_session,
     next_session_title,
@@ -69,8 +69,6 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
     )
     pull = commands.add_parser("pull")
     target(pull)
-    pull.add_argument("since", nargs="?", type=int,
-                      help="previous response's next_since; Unix milliseconds, defaults to call start")
     pull.add_argument("--timeout", type=float, default=60.0,
                       help="seconds to wait for a Host decision; range 0..60 (default: 60)")
     event = commands.add_parser("event")
@@ -187,9 +185,11 @@ def _record_intervention(context: Context, kind: str, targets: list[dict[str, An
         "recorded_at_ns": time.time_ns(),
         "targets": targets,
     }
-    name = f"{event['recorded_at_ns']}-{kind}.json"
-    atomic_json(context.root / "host-interventions" / name, event)
-    atomic_json(_workspace(context) / "control" / "host-interventions" / name, event)
+    with locked(context.root):
+        state = load_state(context.root)
+        state.setdefault("host_interventions", []).append(event)
+        save_state(context.root, state)
+        context.state = state
     return event
 
 
@@ -412,14 +412,9 @@ def _live_children(context: Context) -> tuple[list[dict[str, Any]], dict[str, li
 
 
 def _intervention_summary(context: Context) -> dict[str, Any]:
-    directory = context.root / "host-interventions"
-    events = []
-    if directory.is_dir():
-        for path in sorted(directory.glob("*.json")):
-            try:
-                events.append(json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                raise ControlError(f"invalid Host intervention event: {path}") from None
+    events = context.state.get("host_interventions", [])
+    if not isinstance(events, list):
+        raise ControlError("invalid Host intervention history")
     return {"count": len(events), "latest": events[-1] if events else None,
             "host_forced": bool(events)}
 
@@ -428,7 +423,7 @@ def _add_timeline_statistics(context: Context, metrics: dict[str, Any]) -> None:
     lab_root = context.state.get("lab_root")
     title = context.state.get("title")
     if isinstance(lab_root, str) and isinstance(title, str):
-        value = timeline_statistics(Path(lab_root) / "timeline.sqlite3", title)
+        value = timeline_statistics(Path(lab_root) / "db.sqlite3", title)
         if value is not None:
             metrics["timeline"] = value
 
@@ -618,71 +613,53 @@ def _status(context: Context, verbose: bool = False) -> dict[str, Any]:
     return result
 
 
-def _request_snapshot(context: Context) -> list[str]:
-    path = context.root / "observer" / "host-pull.json"
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, json.JSONDecodeError):
-        raise ControlError(f"invalid Host pull state: {path}") from None
-    requests = value.get("requests") if isinstance(value, dict) else None
-    if not isinstance(requests, list) or not all(isinstance(name, str) for name in requests):
-        raise ControlError(f"invalid Host pull state: {path}")
-    return requests
-
-
-def _save_request_snapshot(context: Context, requests: list[str]) -> None:
-    atomic_json(context.root / "observer" / "host-pull.json", {
-        "schema": "labflow.host-pull-state/v1",
-        "requests": requests,
-        "updated_at": time.time_ns(),
+def _host_tasks(context: Context) -> tuple[dict[str, list[str]], int | None]:
+    path = Path(context.state["lab_root"]) / "host-task.json"
+    while True:
+        try:
+            before = path.stat().st_mtime_ns
+            value = json.loads(path.read_text(encoding="utf-8"))
+            after = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return {"tasks": [], "optional_tasks": []}, None
+        except (OSError, json.JSONDecodeError):
+            raise ControlError(f"invalid Host tasks: {path}") from None
+        if before == after:
+            break
+    if not isinstance(value, dict):
+        raise ControlError(f"invalid Host tasks: {path}")
+    value = value.get(context.state["title"], {
+        "tasks": [], "optional_tasks": [],
     })
+    if not isinstance(value, dict):
+        raise ControlError(f"invalid Host tasks: {path}")
+    for key in ("tasks", "optional_tasks"):
+        items = value.get(key)
+        if not isinstance(items, list) or not all(isinstance(name, str) for name in items):
+            raise ControlError(f"invalid Host tasks: {path}")
+    return {"tasks": value["tasks"], "optional_tasks": value["optional_tasks"]}, after
 
 
-def _host_pull(context: Context, since_ms: int | None, timeout: float = 60.0) -> dict[str, Any]:
+def _host_pull(context: Context, timeout: float = 60.0) -> dict[str, list[str]] | None:
     workflow = context.state.get("workflow")
     if not workflow:
         raise ControlError("execution workflow is not prepared", 75)
-    if since_ms is not None and since_ms < 0:
-        raise ControlError("since must be a non-negative Unix millisecond timestamp", 64)
     if timeout < 0 or timeout > 60:
         raise ControlError("timeout must be between 0 and 60 seconds", 64)
-    started_ms = int(time.time() * 1000)
-    since = started_ms if since_ms is None else since_ms
     deadline = time.monotonic() + timeout
-    requests = []
-    previous_requests = _request_snapshot(context)
+    tasks, modified = _host_tasks(context)
+    if tasks["tasks"]:
+        return tasks
     while True:
-        artifacts = workflow_status(_workspace(context), workflow)
-        requests = pending_requests(workflow, artifacts)
-        if requests != previous_requests:
-            break
         if time.monotonic() >= deadline:
-            break
+            return tasks if tasks["optional_tasks"] else None
         time.sleep(min(.2, max(0.0, deadline - time.monotonic())))
-
-    ended_ms = int(time.time() * 1000)
-    events = project_events(context, since)
-    artifacts = workflow_status(_workspace(context), workflow)
-    requests = pending_requests(workflow, artifacts)
-    opt_requests = pending_optional_requests(workflow, artifacts)
-    _save_request_snapshot(context, requests)
-    next_since = max([since, *(event["at"] for event in events)])
-    return {
-        "schema": "labflow.host-observation/v1",
-        "title": context.state["title"],
-        "timeline": {
-            "clock": "unix_ms",
-            "since": since,
-            "next_since": next_since,
-            "observed_at": int(time.time() * 1000),
-            "waited_ms": ended_ms - started_ms,
-            "events": events,
-        },
-        "result": ({"requests": requests, "opt_requests": opt_requests}
-                   if requests or opt_requests else None),
-    }
+        current, current_modified = _host_tasks(context)
+        if current_modified == modified:
+            continue
+        tasks, modified = current, current_modified
+        if tasks["tasks"]:
+            return tasks
 
 
 def _start(context: Context) -> dict[str, Any]:
@@ -786,7 +763,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
         if args.command == "status":
             emit(_status(context, args.verbose))
         elif args.command == "pull":
-            emit(_host_pull(context, args.since, args.timeout))
+            emit(_host_pull(context, args.timeout))
         elif args.command == "event":
             emit(event_detail(context, args.event_id))
         elif args.command == "stat":

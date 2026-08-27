@@ -186,8 +186,9 @@ def validate_workflow(value: Any) -> dict[str, Any]:
 
 
 def load_workflow(root: Path) -> dict[str, Any]:
+    runtime = root.parent if root.name == "ws" else root
     try:
-        manifest = json.loads((root / "experiment.json").read_text(encoding="utf-8"))
+        manifest = json.loads((runtime / "experiment.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise TaskError(f"missing experiment.json under {root}", 66) from None
     except (OSError, json.JSONDecodeError) as exc:
@@ -216,7 +217,8 @@ def find_root(start: Path) -> Path:
     current = start.resolve()
     for candidate in (current, *current.parents):
         if (candidate / "experiment.json").is_file():
-            return candidate
+            workspace = candidate / "ws"
+            return workspace if workspace.is_dir() and current.is_relative_to(workspace) else candidate
     raise TaskError("cannot find experiment.json from current directory", 66)
 
 
@@ -240,7 +242,7 @@ def _atomic_write(path: Path, content: bytes, minimum_ns: int = 0) -> int:
 
 @contextmanager
 def _locked(root: Path) -> Iterator[None]:
-    state = root / ".labflow"
+    state = _task_root(root)
     state.mkdir(exist_ok=True)
     with (state / "lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -265,15 +267,27 @@ def _asset_state(root: Path, assets: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _artifact_path(root: Path, name: str) -> Path:
-    return root / "control" / "artifacts" / name
+    execution = root.parent
+    if root.name == "ws" and (execution / ".labflow-plan").is_file():
+        return execution / "artifacts" / name
+    # Standalone workflow evaluation keeps the same timestamp semantics without
+    # pretending that the workspace belongs to a laboratory execution.
+    return root / "artifacts" / name
+
+
+def _task_root(root: Path) -> Path:
+    execution = root.parent
+    if root.name == "ws" and (execution / ".labflow-plan").is_file():
+        return execution / "tasks"
+    return root / "tasks"
 
 
 def _active_task_path(root: Path, role: str) -> Path:
-    return root / ".labflow" / "active" / f"{role}.json"
+    return _task_root(root) / "active" / f"{role}.json"
 
 
 def _task_history_path(root: Path, task_id: str) -> Path:
-    return root / ".labflow" / "history" / f"{task_id}.json"
+    return _task_root(root) / "history" / f"{task_id}.json"
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -316,11 +330,11 @@ def _task_response(workflow: dict[str, Any], status: dict[str, Any], task: dict[
 def task_records(root: Path) -> dict[str, list[dict[str, Any]]]:
     active = []
     history = []
-    for path in sorted((root / ".labflow" / "active").glob("*.json")):
+    for path in sorted((_task_root(root) / "active").glob("*.json")):
         value = _read_json(path)
         if value is not None:
             active.append(value)
-    for path in sorted((root / ".labflow" / "history").glob("*.json")):
+    for path in sorted((_task_root(root) / "history").glob("*.json")):
         value = _read_json(path)
         if value is not None:
             history.append(value)

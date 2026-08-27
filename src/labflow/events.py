@@ -153,39 +153,26 @@ def _task_events(workspace: Path) -> list[dict[str, Any]]:
     return result
 
 
-def _json_events(directory: Path, kind: str) -> list[tuple[Path, dict[str, Any]]]:
-    result = []
-    if not directory.is_dir():
-        return result
-    for path in sorted(directory.glob("*.json")):
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise ControlError(f"invalid {kind} event: {path}") from None
-        result.append((path, value))
-    return result
-
-
 def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
     lab_root = context.state.get("lab_root")
     title = context.state.get("title")
-    database = (Path(lab_root) / "timeline.sqlite3"
+    database = (Path(lab_root) / "db.sqlite3"
                 if isinstance(lab_root, str) and isinstance(title, str) else None)
     has_timeline = database is not None and database.is_file()
     workspace = Path(context.state["workspace"])
     result = _task_events(workspace)
-    for path, value in _json_events(context.root / "artifact-events", "artifact"):
+    for value in context.state.get("artifact_events", []):
         created = _ms_from_ns(value.get("mtime_ns"))
         if created is not None:
             result.append({
-                "id": f"artifact:{value.get('number', path.stem.split('-', 1)[0])}",
+                "id": f"artifact:{value.get('number')}",
                 "type": "artifact",
                 "created_at": created,
                 "at": created,
                 "artifact": value.get("artifact"),
                 "action": value.get("reason"),
             })
-    for _path, value in _json_events(context.root / "host-interventions", "Host intervention"):
+    for value in context.state.get("host_interventions", []):
         created = _ms_from_ns(value.get("recorded_at_ns"))
         if created is not None:
             result.append({
@@ -287,7 +274,7 @@ def event_detail(context: Context, event_id: str) -> dict[str, Any]:
     lab_root = context.state.get("lab_root")
     title = context.state.get("title")
     if isinstance(lab_root, str) and isinstance(title, str):
-        values = read_timeline(Path(lab_root) / "timeline.sqlite3", title, 0, event_id)
+        values = read_timeline(Path(lab_root) / "db.sqlite3", title, 0, event_id)
         if values:
             return {"id": event_id, "type": values[0]["type"], "detail": values[0]}
     parts = event_id.split(":")
@@ -298,11 +285,11 @@ def event_detail(context: Context, event_id: str) -> dict[str, Any]:
             if record.get("task_id") == parts[1]:
                 return {"id": event_id, "type": kind, "detail": record}
     elif kind == "artifact" and len(parts) == 2:
-        for path, value in _json_events(context.root / "artifact-events", "artifact"):
-            if str(value.get("number", path.stem.split('-', 1)[0])) == parts[1]:
+        for value in context.state.get("artifact_events", []):
+            if str(value.get("number")) == parts[1]:
                 return {"id": event_id, "type": kind, "detail": value}
     elif kind == "host-action" and len(parts) == 2:
-        for _path, value in _json_events(context.root / "host-interventions", "Host intervention"):
+        for value in context.state.get("host_interventions", []):
             if str(value.get("recorded_at_ns")) == parts[1]:
                 return {"id": event_id, "type": "host_action", "detail": value}
     elif kind == "reply" and len(parts) == 3:

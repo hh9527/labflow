@@ -60,13 +60,13 @@ def _preflight_family(pattern: str) -> str | None:
     return None
 
 
-def preflight_permissions(manifest: Manifest, workspace: Path) -> dict[str, list[dict[str, str]]]:
-    config = json.loads((workspace / "opencode.json").read_text(encoding="utf-8"))
+def preflight_permissions(manifest: Manifest, runtime_root: Path) -> dict[str, list[dict[str, str]]]:
+    config = json.loads((runtime_root / "opencode.json").read_text(encoding="utf-8"))
     default = config.get("permission", "ask")
     _reject_ask(default, "opencode.permission")
     if not isinstance(default, str):
         raise ControlError("opencode.permission must be a default allow or deny decision")
-    agents = workspace / ".opencode" / "agents"
+    agents = runtime_root / ".opencode" / "agents"
     results: dict[str, list[dict[str, str]]] = {}
     for role, commands in manifest.permission_preflight.items():
         path = agents / f"{role}.md"

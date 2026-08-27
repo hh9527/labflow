@@ -13,7 +13,7 @@ from labflow.state import SCHEMA, bind_plan, save_state
 from labflow.supervisor import (
     EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
 )
-from labflow.task_cli import refresh_artifact, validate_workflow
+from labflow.task_cli import refresh_artifact, task_records, validate_workflow, workflow_status
 from labflow.timeline_projection import closed_message_events
 from labflow.timeline_store import TimelineWriter, read, statistics
 
@@ -36,7 +36,10 @@ class ReducerTest(unittest.TestCase):
         reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
             "sessions": [],
         }))
-        created = reduce(state, self.execution())
+        reduce(state, self.execution())
+        created = reduce(state, LifecycleEvent(
+            "session_missing", "plan@1", {"role": "a1"},
+        ))
         self.assertEqual([effect.kind for effect in created], ["create_session"])
         self.assertEqual(reduce(state, self.execution()), [])
 
@@ -203,6 +206,10 @@ class ReducerTest(unittest.TestCase):
             "status": "idle", "completed_turn": True,
         }))
 
+        self.assertEqual(retried, [])
+        retried = reduce(state, LifecycleEvent("workflow_observed", "plan@1", {
+            "runnable": {"a1": [("output.a1", 11)]},
+        }))
         self.assertEqual([effect.kind for effect in retried], ["prompt_session"])
         self.assertNotEqual(prompted.key, retried[0].key)
 
@@ -278,7 +285,7 @@ class TimelineProjectionTest(unittest.TestCase):
 class TimelineStoreTest(unittest.TestCase):
     def test_writer_appends_and_deduplicates_without_reader_state(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "timeline.sqlite3"
+            path = Path(temporary) / "db.sqlite3"
             record = {
                 "id": "action:1", "execution": "plan@1", "session": "a1",
                 "role": "a1", "type": "action", "at": 100, "duration": 20,
@@ -300,7 +307,7 @@ class TimelineStoreTest(unittest.TestCase):
     def test_host_projection_reads_the_laboratory_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            writer = TimelineWriter(root / "timeline.sqlite3", flush_seconds=.01)
+            writer = TimelineWriter(root / "db.sqlite3", flush_seconds=.01)
             writer.submit([{
                 "id": "reply:plan@1:a1:msg:complete",
                 "execution": "plan@1", "session": "a1", "role": "a1",
@@ -324,13 +331,11 @@ class TimelineStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / "ws"
             workspace.mkdir()
-            event_root = root / "control" / "artifact-events"
-            event_root.mkdir(parents=True)
-            (event_root / "1.json").write_text(json.dumps({
+            artifact_event = {
                 "schema": "labflow.artifact-event/v1", "number": 1,
                 "artifact": "input", "reason": "refresh", "mtime_ns": 150_000_000,
-            }))
-            writer = TimelineWriter(root / "timeline.sqlite3", flush_seconds=.01)
+            }
+            writer = TimelineWriter(root / "db.sqlite3", flush_seconds=.01)
             writer.submit([{
                 "id": "reply:plan@1:a1:msg:complete",
                 "execution": "plan@1", "session": "a1", "role": "a1",
@@ -340,7 +345,7 @@ class TimelineStoreTest(unittest.TestCase):
             context = mock.Mock(
                 root=root / "control",
                 state={"lab_root": str(root), "title": "plan@1",
-                       "workspace": str(workspace)},
+                       "workspace": str(workspace), "artifact_events": [artifact_event]},
             )
 
             events = project_events(context, 100)
@@ -353,7 +358,7 @@ class TimelineStoreTest(unittest.TestCase):
             root = Path(temporary); workspace = root / "ws"
             workspace.mkdir()
             event_id = "reply:plan@1:启动 a1:msg:complete"
-            writer = TimelineWriter(root / "timeline.sqlite3", flush_seconds=.01)
+            writer = TimelineWriter(root / "db.sqlite3", flush_seconds=.01)
             writer.submit([{
                 "id": event_id, "execution": "plan@1", "session": "启动 a1",
                 "role": "a1", "type": "reply", "at": 200, "duration": 0,
@@ -371,7 +376,7 @@ class TimelineStoreTest(unittest.TestCase):
 
     def test_statistics_aggregate_timing_tokens_commands_and_failures(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "timeline.sqlite3"
+            path = Path(temporary) / "db.sqlite3"
             writer = TimelineWriter(path, flush_seconds=.01)
             writer.submit([
                 {"id": "t1", "execution": "plan@1", "session": "a1", "role": "a1",
@@ -398,6 +403,10 @@ class SupervisorRuntimeTest(unittest.TestCase):
     def _state(self, root: Path, title: str, workspace: Path,
                workflow: dict | None, execution: dict) -> None:
         control = bind_plan(root, "demo", title)
+        (control / "active").touch()
+        workspace.mkdir(parents=True, exist_ok=True)
+        if workflow is not None:
+            (control / "artifacts").mkdir(exist_ok=True)
         save_state(control, {
             "schema": SCHEMA, "plan_id": "demo", "title": title,
             "phase": "active", "workspace": str(workspace),
@@ -406,11 +415,6 @@ class SupervisorRuntimeTest(unittest.TestCase):
         })
 
     def _dag(self, root: Path, workspace: Path) -> dict:
-        desired = root / "supervisor" / "demo@1" / "artifacts"
-        desired.mkdir(parents=True)
-        control = workspace / "control"
-        control.mkdir()
-        (control / "artifacts").symlink_to(desired, target_is_directory=True)
         workflow = validate_workflow({
             "schema": "labflow.workflow/v1", "roles": ["a1"],
             "artifacts": {
@@ -419,15 +423,14 @@ class SupervisorRuntimeTest(unittest.TestCase):
                               "instruction": "build"},
             },
         })
-        refresh_artifact(workspace, workflow, "input")
         self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+        refresh_artifact(workspace, workflow, "input")
         return workflow
 
     def test_observe_only_goal_collects_existing_sessions_without_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            root = Path(temporary); workspace = root / "exec" / "bench@1" / "ws"
             workspace.mkdir(parents=True)
-            (root / "supervisor" / "bench@1").mkdir(parents=True)
             self._state(root, "bench@1", workspace, None, {
                 "kind": "benchmark-mode", "questioner": "q",
             })
@@ -451,17 +454,61 @@ class SupervisorRuntimeTest(unittest.TestCase):
             finally:
                 supervisor.close()
 
-            self.assertEqual(len(read(root / "timeline.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
             client.create_session.assert_not_called()
             status = json.loads((root / "supervisor-status.json").read_text())
             self.assertEqual(status["executions"][0]["title"], "bench@1")
 
+    def test_materializes_host_tasks_from_workflow_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
+            workspace.mkdir(parents=True)
+            desired = root / "exec" / "demo@1" / "artifacts"
+            desired.mkdir(parents=True)
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {
+                    "input": {"desc": "input"},
+                    "approval": {"desc": "approval", "input": ["input"]},
+                    "feedback": {"desc": "feedback"},
+                    "output.a1": {
+                        "desc": "output", "input": ["feedback?"],
+                        "instruction": "build output",
+                    },
+                },
+            })
+            self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+            refresh_artifact(workspace, workflow, "input")
+            client = mock.Mock()
+            client.statuses.return_value = {
+                "ses_root": {"type": "idle"}, "ses_a1": {"type": "idle"},
+            }
+            client.children.return_value = [{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }]
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    path = root / "host-task.json"
+                    modified = path.stat().st_mtime_ns
+                    supervisor.step()
+                    self.assertEqual(path.stat().st_mtime_ns, modified)
+            finally:
+                supervisor.close()
+
+            tasks = json.loads(path.read_text())
+            self.assertEqual(tasks["demo@1"], {
+                "tasks": ["approval"], "optional_tasks": ["feedback"],
+            })
+
     def test_benchmark_detached_sessions_are_observed_and_collected(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            root = Path(temporary); workspace = root / "exec" / "bench@1" / "ws"
             workspace.mkdir(parents=True)
-            (root / "supervisor" / "bench@1").mkdir(parents=True)
             control = bind_plan(root, "demo", "bench@1")
+            (control / "active").touch()
             save_state(control, {
                 "schema": SCHEMA, "plan_id": "demo", "title": "bench@1",
                 "phase": "idle", "workspace": str(workspace),
@@ -499,7 +546,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
             finally:
                 supervisor.close()
 
-            events = read(root / "timeline.sqlite3", "bench@1")
+            events = read(root / "db.sqlite3", "bench@1")
             self.assertEqual({event["session"] for event in events}, {
                 "bench@1", "bench@1.batch-1.q", "bench@1.batch-1.a",
             })
@@ -508,12 +555,12 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_timeline_only_duplicate_roles_do_not_fail_or_create_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
-            (root / "supervisor" / "demo@1").mkdir(parents=True)
             self._state(root, "demo@1", workspace, {
                 "schema": "labflow.workflow/v1", "roles": ["a1"], "artifacts": {},
             }, {"kind": "dag-mode"})
+            (root / "exec" / "demo@1" / "artifacts").rmdir()
             client = mock.Mock()
             client.statuses.return_value = {}
             client.children.side_effect = lambda session_id: ([
@@ -536,9 +583,8 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_restarting_once_does_not_duplicate_timeline_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            root = Path(temporary); workspace = root / "exec" / "bench@1" / "ws"
             workspace.mkdir(parents=True)
-            (root / "supervisor" / "bench@1").mkdir(parents=True)
             self._state(root, "bench@1", workspace, None, {
                 "kind": "benchmark-mode", "questioner": "q",
             })
@@ -561,11 +607,11 @@ class SupervisorRuntimeTest(unittest.TestCase):
                     finally:
                         supervisor.close()
 
-            self.assertEqual(len(read(root / "timeline.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
 
     def test_dag_goal_creates_and_prompts_one_missing_runnable_role(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             self._dag(root, workspace)
             client = mock.Mock()
@@ -584,11 +630,95 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 "a1", parent_id="ses_root", agent="a1",
             )
             client.prompt_session.assert_called_once()
+            prompt = client.prompt_session.call_args.args[1]
+            self.assertIn("`output.a1`", prompt)
+            self.assertIn("Supervisor 负责校验资产、结算 Artifact", prompt)
+            self.assertTrue((root / "exec" / "demo@1" / "working" / "a1").is_file())
             self.assertIn("input", supervisor.state.executions["demo@1"].artifacts)
+
+    def test_completed_turn_is_settled_by_supervisor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
+            workspace.mkdir(parents=True)
+            workflow = self._dag(root, workspace)
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            working = root / "exec" / "demo@1" / "working" / "a1"
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    completed = working.stat().st_mtime_ns // 1_000_000 + 1
+                    client.session_messages.return_value = [{
+                        "info": {
+                            "id": "msg_done", "role": "assistant", "finish": "stop",
+                            "time": {"created": completed - 1, "completed": completed},
+                            "tokens": {"output": 1},
+                        },
+                        "parts": [{"type": "text", "text": "done"}],
+                    }]
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertFalse(working.exists())
+            self.assertTrue((root / "exec" / "demo@1" / "artifacts/output.a1").is_file())
+            self.assertEqual(task_records(workspace)["history"][0]["status"], "submitted")
+            self.assertFalse(workflow_status(workspace, workflow)["artifacts"]
+                             ["output.a1"]["runnable"])
+            client.prompt_session.assert_called_once()
+
+    def test_incomplete_assets_are_reprompted_without_submitting_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
+            workspace.mkdir(parents=True)
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {
+                    "input": {"desc": "input"},
+                    "output.a1": {
+                        "desc": "output", "input": ["input"],
+                        "assets": ["result.txt"], "instruction": "build",
+                    },
+                },
+            })
+            self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+            refresh_artifact(workspace, workflow, "input")
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_a1": {"type": "idle"}}
+            client.children.side_effect = lambda session_id: ([{
+                "id": "ses_a1", "title": "a1", "agent": "a1",
+            }] if session_id == "ses_root" else [])
+            client.session_messages.return_value = []
+            supervisor = Supervisor(root, 4199)
+            working = root / "exec" / "demo@1" / "working" / "a1"
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    completed = working.stat().st_mtime_ns // 1_000_000 + 1
+                    client.session_messages.return_value = [{
+                        "info": {
+                            "id": "msg_done", "role": "assistant", "finish": "stop",
+                            "time": {"created": completed - 1, "completed": completed},
+                        },
+                        "parts": [{"type": "text", "text": "done"}],
+                    }]
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertTrue(working.is_file())
+            self.assertFalse((root / "exec" / "demo@1" / "artifacts/output.a1").exists())
+            self.assertEqual(len(client.prompt_session.call_args_list), 2)
+            self.assertIn("artifact assets are incomplete", client.prompt_session.call_args.args[1])
 
     def test_dag_startup_reuses_existing_role_without_duplicate_create_or_prompt(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             self._dag(root, workspace)
             client = mock.Mock()
@@ -607,9 +737,37 @@ class SupervisorRuntimeTest(unittest.TestCase):
             client.create_session.assert_not_called()
             client.prompt_session.assert_called_once()
 
+    def test_active_marker_controls_scheduling_without_hiding_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
+            workspace.mkdir(parents=True)
+            self._dag(root, workspace)
+            active = root / "exec" / "demo@1" / "active"
+            active.unlink()
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_root": {"type": "idle"}}
+            client.children.return_value = []
+            client.session_messages.return_value = []
+            client.create_session.return_value = {"id": "ses_a1"}
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    self.assertIn("demo@1", supervisor.state.executions)
+                    client.create_session.assert_not_called()
+                    active.touch()
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            client.create_session.assert_called_once_with(
+                "a1", parent_id="ses_root", agent="a1",
+            )
+            client.prompt_session.assert_called_once()
+
     def test_dag_refresh_waits_for_busy_role_then_prompts_when_idle(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             workflow = self._dag(root, workspace)
             refresh_artifact(workspace, workflow, "output.a1", force=True)
@@ -639,7 +797,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_dag_disappeared_role_is_recreated(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             workflow = self._dag(root, workspace)
             refresh_artifact(workspace, workflow, "output.a1", force=True)
@@ -667,7 +825,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_dag_duplicate_role_is_failed_without_prompt(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             self._dag(root, workspace)
             client = mock.Mock()
@@ -694,7 +852,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_removing_artifact_mode_stops_scheduling_and_clears_pressure(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "demo@1"
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             self._dag(root, workspace)
             client = mock.Mock()
@@ -707,7 +865,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
             try:
                 with mock.patch("labflow.supervisor.Client", return_value=client):
                     supervisor.step()
-                    artifacts = root / "supervisor" / "demo@1" / "artifacts"
+                    artifacts = root / "exec" / "demo@1" / "artifacts"
                     for path in artifacts.iterdir():
                         path.unlink()
                     artifacts.rmdir()
@@ -723,10 +881,9 @@ class SupervisorRuntimeTest(unittest.TestCase):
 
     def test_removing_execution_goal_keeps_timeline_history(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); workspace = root / "ws" / "bench@1"
+            root = Path(temporary); workspace = root / "exec" / "bench@1" / "ws"
             workspace.mkdir(parents=True)
-            desired = root / "supervisor" / "bench@1"
-            desired.mkdir(parents=True)
+            desired = root / "exec" / "bench@1" / ".labflow-plan"
             self._state(root, "bench@1", workspace, None, {
                 "kind": "benchmark-mode", "questioner": "q",
             })
@@ -745,13 +902,13 @@ class SupervisorRuntimeTest(unittest.TestCase):
             try:
                 with mock.patch("labflow.supervisor.Client", return_value=client):
                     supervisor.step()
-                    desired.rmdir()
+                    desired.unlink()
                     supervisor.step()
             finally:
                 supervisor.close()
 
             self.assertNotIn("bench@1", supervisor.state.executions)
-            self.assertEqual(len(read(root / "timeline.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
 
 
 if __name__ == "__main__":

@@ -5,8 +5,10 @@ import os
 import shutil
 import socket
 import subprocess
+import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +39,7 @@ from labflow.state import (
 from labflow.lifecycle import (
     _inherit_execution,
     _inheritance_compatible,
+    archive_assets,
     copy_archive,
     export_session,
     lab_sessions,
@@ -167,8 +170,8 @@ class ConfigStateTest(unittest.TestCase):
             "workspace": ["seed.txt"],
             "roles": {"a1": {
                 "description": "worker", "instructions": "roles/a1.md",
-                "commands": ["labflow agent pull a1", "labflow agent submit a1 *"],
-                "preflight": ["labflow agent pull a1", "labflow agent submit a1 *"],
+                "commands": ["just a1 *"],
+                "preflight": ["just a1 check"],
             }},
             "assets": [{"source": "tool", "path": "bin/tool", "mode": "0555"}],
             "validation": [], "observe": ["bin"],
@@ -236,8 +239,8 @@ class ConfigStateTest(unittest.TestCase):
         self.assertEqual(set(control_parser()._subparsers._group_actions[0].choices),
                          {"test-connect", "start", "stat", "status", "pull", "event",
                           "update", "submit", "resume", "abort-sessions"})
-        args = control_parser().parse_args(["pull", "t1", "demo@1", "123", "--timeout", "5"])
-        self.assertEqual((args.title, args.since, args.timeout), ("demo@1", 123, 5.0))
+        args = control_parser().parse_args(["pull", "t1", "demo@1", "--timeout", "5"])
+        self.assertEqual((args.title, args.timeout), ("demo@1", 5.0))
         event = control_parser().parse_args(["event", "t1", "demo@1", "task:a1-1"])
         self.assertEqual((event.title, event.event_id), ("demo@1", "task:a1-1"))
         abort = control_parser().parse_args(["abort-sessions", "t1", "demo@1"])
@@ -632,8 +635,24 @@ class ConfigStateTest(unittest.TestCase):
             status = evaluate(target, workflow)["artifacts"]
             self.assertTrue(status["output-2"]["current"])
             self.assertTrue(status["output-3.a5"]["runnable"])
-            self.assertFalse((target / ".labflow" / "active").exists())
-            self.assertFalse((target / ".labflow" / "history").exists())
+            self.assertFalse((target / "tasks" / "active").exists())
+            self.assertFalse((target / "tasks" / "history").exists())
+
+            archive = lab_root / "archive/demo-test.tar"
+            archive_assets(Context(repo, source_root, {
+                "workspace": str(source_workspace), "workflow": workflow,
+            }, mock.Mock()), archive)
+            source_state = load_state(source_root)
+            source_state["archive"] = str(archive)
+            save_state(source_root, source_state)
+            shutil.rmtree(source_workspace)
+            restored = lab_root / "restored-workspace"
+            restored.mkdir()
+            (restored / "GOAL.md").write_text("old language", encoding="utf-8")
+            archived = _inherit_execution(lab_root, "demo@1", "demo", restored, workflow)
+            self.assertEqual(archived["artifacts"], ["input-0", "output-1.a1", "output-2"])
+            self.assertEqual((restored / "output.txt").read_text(), "result")
+            self.assertFalse((restored / "NOTES.md").exists())
 
     def test_inheritance_requires_an_identical_artifact_definition(self):
         old = {
@@ -657,7 +676,7 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(value["port"], 4199)
             self.assertEqual(value["root"], str(lab_root))
             self.assertEqual((repo / ".labs/t1").resolve(), lab_root)
-            self.assertEqual(json.loads((lab_root / "config.json").read_text()), {
+            self.assertEqual(json.loads((lab_root / ".labflow.config").read_text()), {
                 "schema": "labflow.lab/v1", "name": "t1", "port": 4199,
                 "host_workspace": str(repo),
             })
@@ -742,7 +761,7 @@ class ConfigStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             connection = root / "connection"; connection.mkdir()
-            workspace = root / "ws" / "demo@1"
+            workspace = root / "exec" / "demo@1" / "ws"
             workspace.mkdir(parents=True)
             primary = mock.Mock(workspace=str(connection), url="http://127.0.0.1:4199",
                                 timeout=5)
@@ -869,24 +888,22 @@ class ConfigStateTest(unittest.TestCase):
                 },
             })
             context = mock.Mock()
-            context.root = root / "execution"
+            context.root = bind_plan(root, "demo", "demo@1")
             context.state = {"title": "demo@1", "phase": "idle",
-                             "workspace": str(workspace), "workflow": workflow}
+                             "plan_id": "demo", "workspace": str(workspace),
+                             "workflow": workflow, "schema": SCHEMA}
+            save_state(context.root, context.state)
             with self.assertRaisesRegex(ControlError, "requires --force"):
                 _update(context, [f"output.txt={source}"])
             updated = _update(context, [f"output.txt={source}"], force=True)
             self.assertTrue(updated[0]["host_forced"])
             removed = _submit(context, ["output-1.a1=!"], force=True)
             self.assertTrue(removed[0]["host_forced"])
-            events = list((context.root / "host-interventions").glob("*.json"))
-            self.assertEqual(len(events), 2)
-            self.assertEqual(
-                len(list((workspace / "control/host-interventions").glob("*.json"))), 2
-            )
+            self.assertEqual(len(load_state(context.root)["host_interventions"]), 2)
 
     def test_atomic_state(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); (root / "plan").write_text("plan\n")
+            root = Path(temporary); (root / ".labflow-plan").write_text("plan\n")
             state = {"schema": SCHEMA, "plan_id": "plan", "title": "plan@1", "phase": "ready"}; save_state(root, state)
             self.assertEqual(load_state(root), state)
 
@@ -935,14 +952,18 @@ class ConfigStateTest(unittest.TestCase):
                 )
             self.assertTrue(created)
             workspace = Path(state["workspace"])
-            self.assertTrue((workspace / "experiment.json").is_file())
+            execution = execution_root(lab_root, "demo@1")
+            self.assertTrue((execution / "experiment.json").is_file())
             self.assertNotIn(
                 "owner",
-                json.loads((workspace / "experiment.json").read_text())["workflow"]
+                json.loads((execution / "experiment.json").read_text())["workflow"]
                 ["artifacts"]["input"],
             )
             self.assertEqual(load_workflow(workspace), state["workflow"])
-            self.assertTrue((workspace / ".opencode/agents/a1.md").is_file())
+            self.assertTrue((execution / ".opencode/agents/a1.md").is_file())
+            self.assertFalse((workspace / ".opencode").exists())
+            self.assertFalse((workspace / "experiment.json").exists())
+            self.assertFalse((workspace / "opencode.json").exists())
             self.assertEqual((workspace / "bin/tool").read_text(), "tool")
             self.assertEqual((workspace / "seed.txt").read_text(), "seed\n")
             self.assertFalse((workspace / "host/secret.md").exists())
@@ -952,11 +973,11 @@ class ConfigStateTest(unittest.TestCase):
             self.assertEqual(state["metrics"], {"roles": {}})
             self.assertEqual(workspace, workspace_root(lab_root, "demo@1"))
             self.assertEqual(_root, execution_root(lab_root, "demo@1"))
-            self.assertEqual(Path(state["archive"]), archive_root(lab_root, "demo@1"))
-            artifact_link = workspace / "control" / "artifacts"
-            artifact_root = lab_root / "supervisor" / "demo@1" / "artifacts"
-            self.assertTrue(artifact_link.is_symlink())
-            self.assertEqual(artifact_link.resolve(), artifact_root.resolve())
+            self.assertIsNone(state["archive"])
+            self.assertEqual(archive_root(lab_root), lab_root / "archive")
+            self.assertEqual((execution / ".labflow-plan").read_text(), "demo\n")
+            self.assertTrue((execution / "active").is_file())
+            self.assertTrue((execution / "artifacts").is_dir())
 
     def test_prepare_reuses_a_named_session_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1317,6 +1338,34 @@ class ArchiveExportTest(unittest.TestCase):
             os.symlink("/tmp", workspace / "output" / "escape")
             with self.assertRaises(ControlError): copy_archive(context, destination)
 
+    def test_tar_archive_contains_only_selected_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "workspace"
+            (workspace / "output").mkdir(parents=True)
+            (workspace / "output/x").write_text("x")
+            (workspace / "process.txt").write_text("process")
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["worker"],
+                "artifacts": {"result": {
+                    "desc": "result", "assets": [
+                        {"path": "output/", "level": 2},
+                        {"path": "process.txt", "level": 1},
+                    ],
+                }},
+            })
+            refresh_artifact(workspace, workflow, "result")
+            context = Context(root, root / "execution", {
+                "workspace": str(workspace), "workflow": workflow,
+            }, mock.Mock())
+            destination = root / "archive/demo-test.tar"
+
+            archive_assets(context, destination)
+
+            with tarfile.open(destination) as bundle:
+                names = {member.name for member in bundle.getmembers()}
+            self.assertIn("output/x", names)
+            self.assertNotIn("process.txt", names)
+
     def test_export_retries_truncated_json(self):
         context = mock.Mock()
         context.state = {"workspace": "/tmp/ws"}
@@ -1469,7 +1518,7 @@ class StatusSummaryTest(unittest.TestCase):
             self.assertEqual(status["supervision"]["updated_at"], 123)
             self.assertEqual(status["supervision"]["errors"][0]["role"], "a1")
 
-    def test_host_pull_returns_immediately_for_submitable_gate_and_summarizes_window(self):
+    def test_host_pull_returns_supervisor_tasks_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
             workflow = validate_workflow({
@@ -1484,29 +1533,19 @@ class StatusSummaryTest(unittest.TestCase):
                 },
             })
             refresh_artifact(workspace, workflow, "input-0")
-            pull(workspace, workflow, "a1", False, None)
-            started_at_ns = task_records(workspace)["active"][0]["started_at_ns"]
-            submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={
                 "title": "demo@1", "phase": "active", "workspace": str(workspace),
-                "workflow": workflow,
+                "workflow": workflow, "lab_root": str(workspace),
             })
             context.root = workspace / "execution"
-            context.client.return_value.children.return_value = []
-            result = _host_pull(context, started_at_ns // 1_000_000 - 1, timeout=60)
-            self.assertLess(result["timeline"]["waited_ms"], 1000)
-            self.assertEqual(result["result"], {
-                "requests": ["output-2"], "opt_requests": [],
-            })
-            self.assertFalse(workflow_status(workspace, workflow)["artifacts"]["output-2"]["submittable"])
-            self.assertEqual([event["status"] for event in result["timeline"]["events"]
-                              if event["type"] == "task"], ["submitted"])
-            repeated = _host_pull(context, result["timeline"]["next_since"], timeout=0)
-            self.assertEqual([event["id"] for event in repeated["timeline"]["events"]],
-                             [event["id"] for event in result["timeline"]["events"]
-                              if event["at"] == result["timeline"]["next_since"]])
-            self.assertEqual(repeated["result"], {
-                "requests": ["output-2"], "opt_requests": [],
+            atomic_json(workspace / "host-task.json", {"demo@1": {
+                "tasks": ["output-2"], "optional_tasks": [],
+            }})
+            started = time.monotonic()
+            result = _host_pull(context, timeout=60)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(result, {
+                "tasks": ["output-2"], "optional_tasks": [],
             })
 
     def test_host_pull_reports_optional_host_artifacts_without_waking(self):
@@ -1527,22 +1566,52 @@ class StatusSummaryTest(unittest.TestCase):
             refresh_artifact(workspace, workflow, "input-0")
             context = mock.Mock(state={
                 "title": "demo@1", "phase": "active", "workspace": str(workspace),
-                "workflow": workflow,
+                "workflow": workflow, "lab_root": str(workspace),
             })
             context.root = workspace / "execution"
-            context.client.return_value.children.return_value = []
+            atomic_json(workspace / "host-task.json", {"demo@1": {
+                "tasks": [], "optional_tasks": ["input-optional"],
+            }})
 
-            result = _host_pull(context, None, timeout=.02)
+            started = time.monotonic()
+            result = _host_pull(context, timeout=.02)
 
-            self.assertGreaterEqual(result["timeline"]["waited_ms"], 10)
-            self.assertEqual(result["result"], {
-                "requests": [], "opt_requests": ["input-optional"],
+            self.assertGreaterEqual(time.monotonic() - started, .01)
+            self.assertEqual(result, {
+                "tasks": [], "optional_tasks": ["input-optional"],
             })
+
+    def test_host_pull_wakes_when_supervisor_file_gains_required_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context = mock.Mock(state={
+                "title": "demo@1", "workflow": {"roles": []},
+                "lab_root": str(root),
+            })
+            context.root = root / "execution"
+            atomic_json(root / "host-task.json", {"demo@1": {
+                "tasks": [], "optional_tasks": [],
+            }})
+
+            def update() -> None:
+                time.sleep(.02)
+                atomic_json(root / "host-task.json", {"demo@1": {
+                    "tasks": ["approval"], "optional_tasks": [],
+                }})
+
+            worker = threading.Thread(target=update)
+            worker.start()
+            try:
+                self.assertEqual(_host_pull(context, timeout=1), {
+                    "tasks": ["approval"], "optional_tasks": [],
+                })
+            finally:
+                worker.join()
 
     def test_host_pull_rejects_waits_longer_than_one_minute(self):
         context = mock.Mock(state={"workflow": {"roles": []}})
         with self.assertRaisesRegex(ControlError, "between 0 and 60"):
-            _host_pull(context, None, timeout=61)
+            _host_pull(context, timeout=61)
 
 
 class EventProjectionTest(unittest.TestCase):
@@ -1611,7 +1680,7 @@ class WatchTest(unittest.TestCase):
 
     def test_persisted_cursor_deduplicates_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); (root / "plan").write_text("demo\n")
+            root = Path(temporary); (root / ".labflow-plan").write_text("demo\n")
             save_state(root, {"schema": SCHEMA, "plan_id": "demo", "title": "demo@1",
                                "phase": "finished", "workspace": "/tmp/ws",
                                "server_url": "http://127.0.0.1:1", "session_id": "ses"})

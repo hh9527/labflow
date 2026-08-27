@@ -17,7 +17,7 @@ protocol are independent of the application, language, and domain under test.
 Labflow has two distinct execution modes:
 
 ```text
-dag-mode      A Supervisor maintains role Sessions; Artifact pressure drives pull/submit work.
+dag-mode      A Supervisor maintains role Sessions and settles Artifact work after each turn.
 benchmark-mode  A Questioner and Answerer run a fixed, answer-free problem suite.
 ```
 
@@ -52,11 +52,11 @@ labflow lab remove local
 ```
 
 `labflow lab run` creates `.labs/<lab-name>` as a symbolic link to the temporary Lab root. The Lab
-root's `config.json` is the configuration source of truth; it records the Lab name, port, and Host
-workspace. Agent workspaces live at `ws/<plan-id>[.<variant>]@<generation>/`, while Host-only state
-and archives live under `control/` and `archive/`. `lab run` replaces its own process with the
-OpenCode server, so a running laboratory does not retain Labflow's runtime. After stopping the
-server, `lab remove` removes the symbolic link and reclaims the Lab root.
+root's `.labflow.config` is the configuration source of truth; it records the Lab name, port, and
+Host workspace. Each execution owns its workspace, Artifact facts, and private bookkeeping under
+`exec/<execution>/`. `lab run` replaces its own process with the OpenCode server, so a running
+laboratory does not retain Labflow's runtime. After stopping the server, `lab remove` removes the
+symbolic link and reclaims the Lab root.
 
 Run exactly one `labflow supervisor <lab-name>` as a separate foreground process for each Lab. It
 can start before any execution exists and does not currently own or stop `labflow lab run`. A
@@ -66,18 +66,43 @@ maintenance directory; the Supervisor then observes its Sessions and Timeline. A
 
 ```text
 <lab-root>/
-  supervisor/
-    <plan-id>[.<variant>]@<generation>/
+  .labflow.config
+  db.sqlite3
+  host-task.json
+  archive/
+    <plan-id>-<UTC datetime>.tar
+  exec/
+    <execution>/
+      .labflow-plan       # immutable; contains plan-id
+      active              # empty controllable scheduling marker
+      experiment.json
+      opencode.json
+      .opencode/
+      state.json
+      lock
+      ws/
       artifacts/
-        <artifact>
-  timeline.sqlite3
+        <artifact>          # empty timestamped fact
+      working/
+        <role>              # empty in-flight assignment marker
+      tasks/
+        lock
+        active/
+        history/
 ```
 
-The Supervisor directory is desired state. For DAG executions its Artifact directory is canonical;
-the Agent workspace `control/artifacts` path is a generated link to it. `timeline.sqlite3` is one
-laboratory-wide append-only observation database. The Supervisor only writes closed `thinking`,
-`action`, and `reply` records; Host observation and statistics read it. Reducer scheduling state is
-kept in memory and never recovered from Timeline data.
+The immutable `.labflow-plan` file identifies an execution and binds it to the plan-id stored in the
+file. The empty `active` file controls scheduling: removing it pauses new Session and prompt effects;
+creating or touching it reactivates reconciliation. In-flight turns may still settle while paused.
+For DAG executions, `artifacts/` contains the canonical empty Artifact timestamp files. A
+`working/<role>` file exists only while that role has an assigned turn. `host-task.json` is the
+Supervisor's current Host-work projection. `db.sqlite3` is one laboratory-wide append-only
+observation database. Reducer scheduling state is kept in memory and never recovered from Timeline
+data.
+
+`ws/` contains only plan-provided business files and Assets. The experiment definition, OpenCode
+adapter, task ledger, Artifact facts, and execution state live beside it and are not visible as
+workspace files. OpenCode discovers its execution-level adapter from the parent directory.
 
 Scheduling is a reconciliation loop over desired and observed state:
 
@@ -87,13 +112,14 @@ desired execution/Artifact state + observed Workflow/Session state
     -> observed backend state
 ```
 
-The Workflow snapshot is taken under the same lock used by Agent Artifact operations. A missing role
+The Workflow snapshot is taken under the same lock used by Artifact operations. A missing role
 Session is created, a busy Session is only observed, and an idle Session is prompted only while it
 owns runnable Artifact pressure. After a prompt, a newly completed assistant turn or an observed
 busy-to-idle transition makes the Session eligible for reconciliation again. Correctness does not
 depend on sleeping for a grace period or guessing that an asynchronous operation has completed.
-Removing `artifacts/` clears scheduling pressure while preserving Timeline observation; removing the
-execution maintenance directory forgets its scheduling state without deleting Timeline history.
+Removing `artifacts/` clears DAG scheduling pressure while preserving Timeline observation. Removing
+`active` pauses scheduling. Removing `.labflow-plan` makes the directory cease to be a recognized
+execution without deleting its files or Timeline history.
 
 The latest observation is written atomically to `<lab-root>/supervisor-status.json`, including all
 observed Session identities and states, required and optional Host requests, and role-level runtime
@@ -156,16 +182,12 @@ Role file permissions are derived from the same graph. The Assets of Artifacts o
 read/write; the Assets of their direct inputs are read-only. A write grant wins when a path occurs
 in both sets. Plans therefore do not maintain separate role `read` or `write` lists.
 
-## Agent Loop
+## Agent Turns
 
-An Agent repeatedly runs:
-
-```bash
-labflow agent pull a1
-labflow agent submit a1 output.a1
-```
-
-A successful pull returns the complete direct input and input Asset sets:
+The Supervisor converts one runnable role-owned Artifact into a direct textual assignment. Before
+prompting the role Session, it creates `exec/<execution>/working/<role>` and records the active task.
+The assignment includes the complete direct input and input Asset sets, corresponding to this internal
+structure:
 
 ```json
 {
@@ -185,12 +207,25 @@ A successful pull returns the complete direct input and input Asset sets:
 when an optional input does not yet exist. `updated` follows the same Artifact publication boundary
 for Assets. Labflow does not hash Asset contents to infer workflow changes.
 
-When no work becomes available before the bounded timeout, pull returns JSON `null`. The Agent then
-ends its current turn. When new Artifact work becomes runnable, the Supervisor resumes the same
-Session with a fixed instruction to pull again. A busy Session is never interrupted or prompted.
+The Agent receives one direct assignment, completes the work or determines that it cannot proceed,
+and then ends the turn. The Supervisor owns workflow state and task settlement. After observing the
+final assistant reply, it validates the declared output Assets. A valid turn refreshes the Artifact
+timestamp and removes the working marker. A failed validation leaves the Artifact untouched and
+carries the requirement into the next assignment. A busy Session is observed until it becomes idle.
 
-Host pull distinguishes blocking `requests` from `opt_requests`. A Host Artifact used only through
-optional inputs appears in `opt_requests`; it remains visible but does not wake a waiting Host pull.
+## Asset Archives
+
+Finishing an execution creates an atomic uncompressed tar archive named
+`archive/<plan-id>-<UTC datetime>.tar`. The tar contains only current workflow Assets: level `2` by
+default, level `1` when process assets are explicitly requested, and never level `0`. Paths remain
+relative to `ws/`. Session exports, messages, Timeline rows, task history, runtime configuration,
+Artifact markers, and execution state are not archived. A later execution may inherit archived
+Assets through its source execution state even after the original `ws/` has been removed.
+
+The Supervisor materializes every execution's current Host work in the Lab's `host-task.json`.
+`labflow host pull` waits for and reads that file; it does not evaluate the Artifact graph. Blocking
+`tasks` wake a waiting pull. An Artifact used only through optional inputs appears in
+`optional_tasks`; it remains visible but does not wake a waiting pull.
 
 ## Benchmark Mode
 

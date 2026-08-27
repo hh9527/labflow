@@ -30,15 +30,19 @@ def validate_title(value: str) -> str:
 
 
 def execution_root(lab_root: Path, title: str) -> Path:
-    return lab_root.resolve() / "control" / validate_title(title)
+    return lab_root.resolve() / "exec" / validate_title(title)
 
 
 def workspace_root(lab_root: Path, title: str) -> Path:
-    return lab_root.resolve() / "ws" / validate_title(title)
+    return execution_root(lab_root, title) / "ws"
 
 
-def archive_root(lab_root: Path, title: str) -> Path:
-    return lab_root.resolve() / "archive" / validate_title(title)
+def archive_root(lab_root: Path) -> Path:
+    return lab_root.resolve() / "archive"
+
+
+def plan_marker(root: Path) -> Path:
+    return root / ".labflow-plan"
 
 
 def lab_link_path(repo: Path, lab_name: str) -> Path:
@@ -72,7 +76,7 @@ def create_lab_config(repo: Path, lab_name: str, port: int, root: Path) -> dict[
         "port": port,
         "host_workspace": str(host_workspace),
     }
-    atomic_json(lab_root / "config.json", value)
+    atomic_json(lab_root / ".labflow.config", value)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.symlink_to(lab_root, target_is_directory=True)
     return {**value, "root": str(lab_root)}
@@ -85,7 +89,7 @@ def load_lab_config(repo: Path, lab_name: str) -> dict[str, Any]:
         if not path.is_symlink():
             raise FileNotFoundError(path)
         lab_root = path.resolve(strict=True)
-        value = json.loads((lab_root / "config.json").read_text(encoding="utf-8"))
+        value = json.loads((lab_root / ".labflow.config").read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ControlError(
             f"missing lab {lab_name}; run labflow lab run {lab_name} before continuing",
@@ -121,7 +125,7 @@ def remove_lab_config(repo: Path, lab_name: str, expected: dict[str, Any]) -> No
 
 
 def connect_test_path(lab_root: Path) -> Path:
-    return lab_root.resolve() / "control" / "connect-test.json"
+    return lab_root.resolve() / "connect-test.json"
 
 
 def record_connect_test(lab_name: str, lab_root: Path,
@@ -181,7 +185,7 @@ def load_connect_test(lab_name: str, lab_root: Path) -> dict[str, Any]:
 
 def bind_plan(lab_root: Path, plan_id: str, title: str) -> Path:
     root = execution_root(lab_root, title); root.mkdir(parents=True, exist_ok=True)
-    binding = root / "plan"; expected = f"{plan_id}\n"
+    binding = plan_marker(root); expected = f"{plan_id}\n"
     if binding.exists():
         if binding.read_text(encoding="utf-8") != expected:
             raise ControlError(f"execution {title} is bound to another plan")
@@ -224,7 +228,7 @@ def load_state(root: Path) -> dict[str, Any]:
         raise ControlError("unsupported execution state schema")
     if data.get("phase") not in PHASES: raise ControlError("invalid execution phase")
     validate_title(data.get("title"))
-    binding = (root / "plan").read_text(encoding="utf-8")
+    binding = plan_marker(root).read_text(encoding="utf-8")
     if binding != f"{data.get('plan_id')}\n": raise ControlError("execution plan identity mismatch")
     return data
 

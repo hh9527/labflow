@@ -18,7 +18,13 @@ PROBLEM_ROOT = Path("problem")
 CHANNEL_ROOT = Path("ch")
 CHANNEL_OUTPUT = CHANNEL_ROOT / "out"
 RESULT_ROOT = Path("result")
-RECORD_ROOT = Path(".labflow") / "benchmark-records"
+
+
+def _record_root(workspace: Path) -> Path:
+    execution = workspace.parent
+    return (execution / "tasks" / "benchmark-records"
+            if workspace.name == "ws" and (execution / ".labflow-plan").is_file()
+            else workspace / "tasks" / "benchmark-records")
 
 
 def _completed_after(messages: list[dict[str, Any]], preceding: str | None) -> dict[str, Any] | None:
@@ -76,8 +82,9 @@ def _transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _read_runtime(workspace: Path) -> dict[str, Any]:
+    runtime_root = workspace.parent if workspace.name == "ws" else workspace
     try:
-        runtime = json.loads((workspace / "experiment.json").read_text(encoding="utf-8"))
+        runtime = json.loads((runtime_root / "experiment.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ControlError(f"cannot read Benchmark runtime: {exc}", 66) from None
     execution = runtime.get("execution")
@@ -153,7 +160,7 @@ def end_problem(workspace: Path, outcome: str) -> dict[str, Any]:
         "outcome": outcome, "started_at_ns": started_at_ns,
         "recorded_at_ns": time.time_ns(), "evidence": [path.name for path in retained],
     }
-    atomic_json(workspace / RECORD_ROOT / f"{problem_id}.json", checkpoint)
+    atomic_json(_record_root(workspace) / f"{problem_id}.json", checkpoint)
     channel_root = workspace / CHANNEL_ROOT
     for path in list(channel_root.iterdir()):
         if path.is_file() or path.is_symlink():
@@ -168,7 +175,7 @@ def _prepare_workspace(context: Context) -> None:
     workspace = Path(context.state["workspace"])
     problem_root = workspace / PROBLEM_ROOT
     for path in (problem_root, workspace / CHANNEL_OUTPUT, workspace / RESULT_ROOT,
-                 workspace / RECORD_ROOT):
+                 _record_root(workspace)):
         path.mkdir(parents=True, exist_ok=True)
     if any(problem_root.iterdir()) or any((workspace / RESULT_ROOT).iterdir()):
         raise ControlError("Benchmark workspace is not clean", 75)
@@ -219,7 +226,7 @@ def _finalize_batch(context: Context, problems: list[dict[str, Any]], batch: int
     records = []
     boundary = started_ns
     for problem in problems:
-        record_path = workspace / RECORD_ROOT / f"{problem['id']}.json"
+        record_path = _record_root(workspace) / f"{problem['id']}.json"
         if not record_path.is_file():
             raise ControlError(f"Questioner did not record Benchmark problem {problem['id']}", 65)
         checkpoint = json.loads(record_path.read_text(encoding="utf-8"))

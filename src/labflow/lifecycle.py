@@ -6,11 +6,14 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .client import Client
 from .config import ControlError, Manifest, load_manifest, repository_root, sha256, validate_identifier
@@ -40,9 +43,12 @@ def lab_sessions(client: Client, lab_root: str | Path) -> list[dict[str, Any]]:
     connection = root / "connection"
     if connection.is_dir():
         workspaces.add(connection)
-    workspace_directory = root / "ws"
-    if workspace_directory.is_dir():
-        workspaces.update(path for path in workspace_directory.iterdir() if path.is_dir())
+    execution_directory = root / "exec"
+    if execution_directory.is_dir():
+        workspaces.update(
+            path / "ws" for path in execution_directory.iterdir()
+            if path.is_dir() and (path / "ws").is_dir()
+        )
     records: dict[str, dict[str, Any]] = {}
     for workspace in sorted(workspaces):
         source = client if workspace == Path(client.workspace).resolve() else Client(
@@ -65,10 +71,8 @@ def next_session_title(client: Client, base: str, lab_root: str | Path) -> str:
         if match:
             generations.append(int(match.group(1)))
     root = Path(lab_root).resolve()
-    for prefix in ("ws", "control", "archive"):
-        directory = root / prefix
-        if not directory.is_dir():
-            continue
+    directory = root / "exec"
+    if directory.is_dir():
         for path in directory.iterdir():
             match = pattern.fullmatch(path.name) if path.is_dir() else None
             if match:
@@ -145,12 +149,13 @@ def _copy_plan_workspace(manifest: Manifest, workspace: Path) -> None:
 
 def verify_prepared(manifest: Manifest, state: dict[str, Any]) -> None:
     workspace = Path(state["workspace"])
+    runtime_root = workspace.parent
     if state.get("workflow") != manifest.workflow:
         raise ControlError("workflow changed since preparation")
     if sha256(manifest.root / manifest.manifest_name) != state["input_hashes"].get(manifest.manifest_name):
         raise ControlError(f"{manifest.manifest_name} changed since preparation")
     for relative, expected in state.get("adapter_hashes", {}).items():
-        path = workspace / relative
+        path = runtime_root / relative
         if not path.is_file() or sha256(path) != expected:
             raise ControlError(f"generated runtime adapter changed after preparation: {relative}")
     for item in manifest.assets:
@@ -161,22 +166,21 @@ def verify_prepared(manifest: Manifest, state: dict[str, Any]) -> None:
 
 def configure_supervision(lab_root: Path, title: str, workspace: Path,
                           workflow: dict[str, Any] | None) -> Path:
-    """Publish maintenance intent and make its Artifact directory canonical."""
-    desired = lab_root.resolve() / "supervisor" / validate_title(title)
+    """Publish maintenance intent in the execution's canonical directory."""
+    desired = execution_root(lab_root, validate_title(title))
+    if workspace.resolve() != (desired / "ws").resolve():
+        raise ControlError(f"workspace is outside its execution directory: {workspace}")
     desired.mkdir(parents=True, exist_ok=True)
-    if workflow is None:
-        return desired
-    artifacts = desired / "artifacts"
-    artifacts.mkdir(exist_ok=True)
-    link = workspace / "control" / "artifacts"
-    if link.is_symlink():
-        if link.resolve(strict=False) != artifacts.resolve():
-            raise ControlError(f"workspace Artifact link targets another directory: {link}")
-        return desired
-    if link.exists():
-        raise ControlError(f"workspace Artifact path is not managed by Supervisor: {link}")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(artifacts, target_is_directory=True)
+    marker = desired / ".labflow-plan"
+    if not marker.is_file():
+        raise ControlError(f"missing execution plan marker: {marker}")
+    active = desired / "active"
+    if not active.exists():
+        atomic_write(active, b"")
+    elif not active.is_file():
+        raise ControlError(f"invalid execution active marker: {active}")
+    if workflow is not None:
+        (desired / "artifacts").mkdir(exist_ok=True)
     return desired
 
 
@@ -208,9 +212,8 @@ def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] |
         port = port or 4096
         revision, dirty = git_metadata(repo); plan_revision, plan_source = plan_git_metadata(repo, manifest)
         workspace = workspace_root(selected_lab_root, title)
-        archive = archive_root(selected_lab_root, title)
         state: dict[str, Any] = {"schema": SCHEMA, "plan_id": plan_id, "title": title, "run_id": uuid.uuid4().hex,
-            "phase": "preparing", "workspace": str(workspace), "archive": str(archive),
+            "phase": "preparing", "workspace": str(workspace), "archive": None,
             "session_id": None,
             "server_url": f"http://127.0.0.1:{port}", "repository_revision": revision, "repository_dirty": dirty,
             "lab_root": str(selected_lab_root),
@@ -228,7 +231,7 @@ def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] |
         save_state(root, state)
         try:
             _copy_plan_workspace(manifest, workspace)
-            state["adapter_hashes"] = generate_opencode_adapter(manifest, workspace)
+            state["adapter_hashes"] = generate_opencode_adapter(manifest, workspace, root)
             configure_supervision(selected_lab_root, title, workspace, manifest.workflow)
             for item in manifest.assets:
                 name = str(item["path"]); source = Path((assets or {}).get(name, str(item["source"])))
@@ -237,7 +240,7 @@ def prepare(plan_id: str, title: str, port: int | None, assets: dict[str, str] |
                     result = subprocess.run(resolve_command(item["build"], repo), cwd=repo)
                     if result.returncode: raise ControlError(f"asset build failed: {name}", 70)
                 target = workspace / name; _copy_file(source.resolve(), target, int(str(item.get("mode", "0555")), 8)); state["asset_hashes"][name] = sha256(target)
-            state["permission_preflight"] = preflight_permissions(manifest, workspace)
+            state["permission_preflight"] = preflight_permissions(manifest, root)
             state["reporting"] = manifest.reporting
             state["metrics"] = manifest.metrics
             state["input_hashes"][manifest.manifest_name] = sha256(manifest.root / manifest.manifest_name)
@@ -258,17 +261,77 @@ def _inherit_execution(lab_root: Path, source_id: str, plan_id: str, workspace: 
     source_state = load_state(source_root)
     if source_state["plan_id"] != plan_id:
         raise ControlError("source execution uses another plan", 64)
-    source_workspace_value = source_state.get("workspace")
-    source_workspace = (Path(source_workspace_value)
-                        if isinstance(source_workspace_value, str) and source_workspace_value
-                        else archive_root(lab_root, source_id) / "workspace")
-    if not source_workspace.is_dir():
-        source_workspace = archive_root(lab_root, source_id) / "workspace"
-    if not source_workspace.is_dir():
-        raise ControlError(f"source execution workspace is unavailable: {source_id}", 66)
     source_workflow = source_state.get("workflow")
     if not isinstance(source_workflow, dict):
         raise ControlError("source execution has no artifact workflow", 64)
+    with _inheritance_workspace(source_root, source_state, workspace) as source_workspace:
+        return _inherit_from_workspace(
+            source_id, source_state, source_workspace, source_workflow, workspace, workflow,
+        )
+
+
+@contextmanager
+def _inheritance_workspace(source_root: Path,
+                           source_state: dict[str, Any],
+                           target_workspace: Path) -> Iterator[Path]:
+    value = source_state.get("workspace")
+    workspace = Path(value) if isinstance(value, str) and value else None
+    if workspace is not None and workspace.is_dir():
+        yield workspace
+        return
+    archive_value = source_state.get("archive")
+    archive = Path(archive_value) if isinstance(archive_value, str) else None
+    if archive is None or not archive.is_file():
+        raise ControlError(
+            f"source execution assets are unavailable: {source_state['title']}", 66,
+        )
+    with tempfile.TemporaryDirectory(prefix="labflow-inherit-") as temporary:
+        root = Path(temporary)
+        with tarfile.open(archive, "r") as bundle:
+            members = bundle.getmembers()
+            for member in members:
+                path = Path(member.name)
+                if (path.is_absolute() or ".." in path.parts
+                        or not (member.isfile() or member.isdir())):
+                    raise ControlError(f"unsafe archive entry: {member.name}", 66)
+            bundle.extractall(root, members=members, filter="data")
+        artifact_root = root / "artifacts"
+        artifact_root.mkdir()
+        source_artifacts = source_root / "artifacts"
+        workflow = source_state.get("workflow", {})
+        level_zero = {
+            asset["path"]
+            for artifact in workflow.get("artifacts", {}).values()
+            for asset in artifact.get("assets", [])
+            if asset.get("level") == 0
+        }
+        for name in level_zero:
+            relative = Path(name.rstrip("/"))
+            source = target_workspace / relative
+            destination = root / relative
+            if source.is_dir() and name.endswith("/"):
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            elif source.is_file() and not source.is_symlink():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        if source_artifacts.is_dir():
+            for marker in source_artifacts.iterdir():
+                artifact = workflow.get("artifacts", {}).get(marker.name, {})
+                usable = all(
+                    asset.get("level") == 0
+                    or ((root / asset["path"].rstrip("/")).is_dir()
+                        if asset["path"].endswith("/")
+                        else (root / asset["path"]).is_file())
+                    for asset in artifact.get("assets", [])
+                )
+                if marker.is_file() and not marker.is_symlink() and usable:
+                    shutil.copy2(marker, artifact_root / marker.name)
+        yield root
+
+
+def _inherit_from_workspace(source_id: str, source_state: dict[str, Any],
+                            source_workspace: Path, source_workflow: dict[str, Any],
+                            workspace: Path, workflow: dict[str, Any]) -> dict[str, Any]:
     try:
         source_status = evaluate(source_workspace, source_workflow)["artifacts"]
     except TaskError as exc:
@@ -345,9 +408,7 @@ def refresh_workflow_artifact(context: Context, artifact: str, reason: str, *,
             raise ControlError(str(exc), exc.code) from None
         number = int(state.get("next_artifact_event", 0))
         event = {**result, "number": number, "reason": reason, "refreshed_at": now()}
-        directory = context.root / "artifact-events"
-        directory.mkdir(exist_ok=True)
-        atomic_json(directory / f"{number:03d}-{artifact.replace('/', '-')}.json", event)
+        state.setdefault("artifact_events", []).append(event)
         state["next_artifact_event"] = number + 1
         if once:
             state[once] = event
@@ -460,14 +521,12 @@ def reconcile(context: Context) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 
 
 def run_validation(context: Context) -> list[dict[str, Any]]:
-    directory = Path(context.state["archive"]) / "validation"
-    directory.mkdir(parents=True, exist_ok=True)
     results = []
     for item in context.manifest.validation:
         workspace = Path(context.state["workspace"]); cwd = workspace / item.get("cwd", "")
         started = now(); command = resolve_command(item["command"], cwd); result = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         record = {"name": item["name"], "command": item["command"], "cwd": item.get("cwd", ""), "started_at": started, "finished_at": now(), "exit": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
-        atomic_json(directory / f"{item['name']}.json", record); results.append(record)
+        results.append(record)
     return results
 
 
@@ -508,6 +567,43 @@ def copy_archive(context: Context, destination: Path, *, include_process: bool =
         if staging.exists(): shutil.rmtree(staging)
 
 
+def _archive_path(lab_root: Path, plan_id: str) -> Path:
+    directory = archive_root(lab_root)
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    sequence = 1
+    while True:
+        suffix = "" if sequence == 1 else f"-{sequence}"
+        candidate = directory / f"{plan_id}-{timestamp}{suffix}.tar"
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            sequence += 1
+            continue
+        os.close(descriptor)
+        return candidate
+
+
+def archive_assets(context: Context, destination: Path, *,
+                   include_process: bool = False) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="labflow-assets-") as temporary:
+        assets = Path(temporary) / "assets"
+        copy_archive(context, assets, include_process=include_process)
+        descriptor, temporary_tar = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=destination.parent,
+        )
+        os.close(descriptor)
+        try:
+            with tarfile.open(temporary_tar, "w") as bundle:
+                for path in sorted(assets.iterdir(), key=lambda item: item.name):
+                    bundle.add(path, arcname=path.name, recursive=True)
+            os.replace(temporary_tar, destination)
+        finally:
+            if os.path.exists(temporary_tar):
+                os.unlink(temporary_tar)
+
+
 def export_session(context: Context, session_id: str) -> Any:
     error = ""
     for attempt in range(3):
@@ -539,34 +635,24 @@ def finish(context: Context) -> dict[str, Any]:
         with locked(context.root): state = load_state(context.root); state["phase"] = "failed"; save_state(context.root, state)
         raise ControlError("required validation failed", 1)
     try:
-        result = Path(state["archive"])
-        result.mkdir(parents=True, exist_ok=True)
-        copy_archive(context, result / "workspace")
-        raw_session = export_session(context, state["session_id"])
-        atomic_json(result / "session.json", raw_session)
-        children = context.client().children()
-        child_exports = []
-        child_dir = result / "children"; child_dir.mkdir(exist_ok=True)
-        for child in children:
-            child_id = child.get("id")
-            if not isinstance(child_id, str): continue
-            value = export_session(context, child_id); atomic_json(child_dir / f"{child_id}.json", value)
-            atomic_json(child_dir / f"{child_id}.messages.json", context.client().session_messages(child_id))
-            child_exports.append({"session_id": child_id, "title": child.get("title")})
-        atomic_json(result / "children.json", child_exports)
-        atomic_json(result / "messages.json", messages)
         final_state = dict(state); final_state["phase"] = "finished"; final_state["finished_at"] = now()
         document = normalized(final_state, messages, context.client().status(), context.rounds(), context.manifest.observe, validation)
-        atomic_json(result / "query.json", document)
-        summary = document["summary"]
-        atomic_write(result / "RUNLOG.md", ("# Run log\n\n```json\n" + json.dumps(summary, indent=2) + "\n```\n").encode())
-        atomic_write(result / "SUMMARY.md", f"# {state['title']} summary\n\nExecution data was frozen at {now()}.\n".encode())
+        result = _archive_path(Path(state["lab_root"]), state["plan_id"])
+        try:
+            archive_assets(context, result)
+        except Exception:
+            result.unlink(missing_ok=True)
+            raise
+        final_state["archive"] = str(result)
     except Exception:
         with locked(context.root):
             current = load_state(context.root); current["phase"] = "idle"; save_state(context.root, current)
         raise
     with locked(context.root):
-        state = load_state(context.root); state["phase"] = "finished"; state["finished_at"] = final_state["finished_at"]; save_state(context.root, state)
+        state = load_state(context.root); state["phase"] = "finished"
+        state["finished_at"] = final_state["finished_at"]
+        state["archive"] = final_state["archive"]
+        save_state(context.root, state)
     return document
 
 
@@ -575,6 +661,6 @@ def safe_cleanup(state: dict[str, Any]) -> None:
     lab_root = Path(state["lab_root"]).resolve()
     expected = workspace_root(lab_root, state["title"])
     if (workspace != expected or workspace.is_symlink()
-            or not workspace.resolve().is_relative_to(lab_root / "ws")):
+            or not workspace.resolve().is_relative_to(lab_root / "exec")):
         raise ControlError("refusing unsafe temporary cleanup")
     if workspace.exists(): shutil.rmtree(workspace)

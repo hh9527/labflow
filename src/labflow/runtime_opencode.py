@@ -11,15 +11,31 @@ from .task_cli import role_asset_permissions
 
 MODEL = "deepseek/deepseek-v4-flash"
 ENVIRONMENT = {"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "128000"}
-START_PROMPT = "请启动实验角色循环。"
+START_PROMPT = "请初始化实验角色。"
 
 
-def resume_prompt(role: str) -> str:
+def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
+                  task: dict[str, Any] | None = None, error: str | None = None) -> str:
+    if artifact is None or task is None:
+        return (
+            f"继续完成 Supervisor 已经分配给 {role} 的唯一任务。完成工作或确信无法继续后直接"
+            "结束本次执行。Supervisor 负责结算任务并投递后续工作。"
+        )
+    inputs = ", ".join(
+        f"{item['name']} ({'本轮更新' if item['fresh'] else '可用'})"
+        for item in task["inputs"] if item["fresh"] is not None
+    ) or "none"
+    assets = ", ".join(
+        f"{item['path']} ({'本轮更新' if item['updated'] else '可用'})"
+        for item in task["assets"]
+    ) or "none"
+    validation = f"\n交付校验要求：{error}\n" if error else ""
     return (
-        f"Supervisor 检测到 {role} 有可执行工作。立即执行 labflow agent pull {role}；"
-        "领取任务后完成唯一 artifact、submit，然后继续 pull。领取任务时先查看 inputs 中的 "
-        "fresh 和 assets 中的 updated，重新读取发生变化的资产。pull 返回 null 时自然结束当前 "
-        "turn；未来有新工作时 Supervisor 会再次恢复你。"
+        f"请完成唯一任务 `{artifact['id']}`：{artifact['desc']}\n"
+        f"要求：{artifact['instruction']}\n"
+        f"输入：{inputs}\n需要读取的资产：{assets}\n"
+        f"{validation}在角色权限允许的资产内完成交付。完成工作或确信无法继续后直接结束"
+        "本次执行。Supervisor 负责校验资产、结算 Artifact 并投递后续工作。"
     )
 
 
@@ -87,10 +103,10 @@ def _benchmark_answerer_protocol(manifest: Manifest) -> str:
     output = manifest.execution["output"][0]["path"]
     return (
         "\n\n# Labflow Benchmark 交付协议\n\n"
-        f"证据文件只写入 `{output}`。成功证据写 `ok-*`，失败证据写 `err-*`。两类证据不得"
-        "同时存在，也都可以不存在。"
-        "`report.md` 由 Questioner 编写，你不得创建或修改。每题开始清理上一题的 `ok-*` 与 "
-        "`err-*`。原始提问、必要追问和澄清走对话管道；完成后最后一条消息只说明本题完成。\n"
+        f"证据文件写入 `{output}`。成功证据使用 `ok-*`，失败证据使用 `err-*`；每题选择至多"
+        "一类，也可以不写证据。`report.md` 由 Questioner 负责。每题开始时清理通道中的 "
+        "`ok-*` 与 `err-*`。原始提问、必要追问和澄清使用对话管道；完成后最后一条消息说明"
+        "本题完成。\n"
     )
 
 
@@ -101,20 +117,20 @@ def _benchmark_questioner_protocol(manifest: Manifest) -> str:
         "Host 会一次性准备并触发整批题目。按 Host 给出的编号顺序执行 "
         "`labflow agent start-problem <id>`，再读取通道中的 `ch/q.md`、可选 `ch/k.md` 和只读 "
         "`ch/metadata.json`。本批开始时通过 task 工具创建唯一的 "
-        f"`{answerer}` 子会话，所有题目持续复用它。必须把 q.md 原文逐字发送给 Answerer，"
-        "不得概括、转述、改写或补充。Answerer 追问时，只依据当前 K 作最窄澄清，不得主动泄漏 "
-        "K、提示解法或判断正确性。Answerer 完成后读取其可选证据，综合题面与对话写出必需、"
-        "非空的 `ch/out/report.md`，然后执行 `labflow agent end-problem ok|error|cancel`。只有归档成功后"
-        "才能继续下一题；全部题目完成后才结束。\n"
+        f"`{answerer}` 子会话，所有题目持续复用它。把 q.md 原文逐字发送给 Answerer，保持题面"
+        "完整。Answerer 追问时，仅依据当前 K 作最窄澄清，并保留 K 中与追问无关的信息。"
+        "Answerer 完成后读取其可选证据，综合题面与对话写出必需、非空的 "
+        "`ch/out/report.md`，然后执行 `labflow agent end-problem ok|error|cancel`。归档成功后继续"
+        "下一题；全部题目完成后结束。\n"
     )
 
 
 def _dag_role_protocol(role: str) -> str:
     return (
         "\n\n# Labflow Supervisor 协议\n\n"
-        f"每次被唤醒后执行 `labflow agent pull {role}`。领取任务后只完成该任务并 submit，"
-        "然后继续 pull；pull 返回 `null` 时自然结束当前 turn。不要自行阻塞等待，也不要因为"
-        "暂时无工作而退出 Session；Supervisor 会在新任务可执行时再次唤醒。\n"
+        "Supervisor 每次直接投递一个 Artifact 任务。一次只处理题面指定的任务，在角色权限"
+        "允许的资产内完成交付。完成工作或确信无法继续后直接结束本次执行。Supervisor 负责"
+        "校验资产、结算 Artifact，并在新任务可执行时再次投递。\n"
     )
 
 
@@ -142,20 +158,22 @@ def _coordinator(manifest: Manifest) -> str:
     launches = "、".join(roles)
     body = (
         f"收到 `{START_PROMPT}` 时，同时启动 {labels} 各一次。向每个角色只发送：\n\n"
-        "`按照你的角色协议启动 labflow agent 任务循环。`\n\n"
-        "全部启动调用完成后立即结束，不观察文件、不判断流程、不创建 artifact。\n\n"
+        "`初始化你的角色，阅读角色说明后结束本次执行，等待 Supervisor 投递具体任务。`\n\n"
+        "全部启动调用完成后立即结束；本角色的职责范围是启动指定角色。\n\n"
         f"收到 `恢复角色 <role>` 时，确认 role 属于 {launches}，只重新启动该角色一次，"
-        "并发送同一条启动消息；不要启动其他角色。"
+        "并发送同一条初始化消息。"
     )
     return _frontmatter("启动和恢复由 artifact DAG 驱动的长期角色。", "primary", permission) + body + "\n"
 
 
-def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
+def generate(manifest: Manifest, workspace: Path,
+             runtime_root: Path | None = None) -> dict[str, str]:
     """Generate the complete OpenCode adapter from a runtime-neutral plan."""
-    agents = workspace / ".opencode" / "agents"
+    runtime_root = workspace if runtime_root is None else runtime_root
+    agents = runtime_root / ".opencode" / "agents"
     agents.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
-    config = workspace / "opencode.json"
+    config = runtime_root / "opencode.json"
     primary = (manifest.execution["questioner"]
                if manifest.execution["kind"] == "benchmark-mode" else "coordinator")
     atomic_json(config, {
@@ -165,7 +183,7 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
         "permission": "deny",
     })
     generated.append(config)
-    runtime_manifest = workspace / "experiment.json"
+    runtime_manifest = runtime_root / "experiment.json"
     runtime_workflow = json.loads(json.dumps(manifest.workflow))
     if runtime_workflow is not None:
         for artifact in runtime_workflow["artifacts"].values():
@@ -200,6 +218,9 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
                 if manifest.execution["kind"] == "benchmark-mode"
                 and name == manifest.execution["questioner"] else "deny")
         permission = _role_permission(role, assets, task=task)
+        if manifest.execution["kind"] == "dag-mode":
+            permission["bash"]["labflow agent *"] = "deny"
+            permission["bash"]["./labflow agent *"] = "deny"
         if (manifest.execution["kind"] == "benchmark-mode"
                 and name == manifest.execution["answerer"]):
             permission["edit"]["ch/out/report.md"] = "deny"
@@ -209,4 +230,4 @@ def generate(manifest: Manifest, workspace: Path) -> dict[str, str]:
         path = agents / f"{name}.md"
         atomic_write(path, text.encode(), 0o444)
         generated.append(path)
-    return {str(path.relative_to(workspace)): sha256(path) for path in generated}
+    return {str(path.relative_to(runtime_root)): sha256(path) for path in generated}

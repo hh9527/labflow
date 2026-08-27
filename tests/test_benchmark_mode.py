@@ -63,7 +63,7 @@ class FakeClient:
             {"id": answerer, "title": "answerer", "agent": "a"}
         )
         self.children_by_parent[answerer] = []
-        execution = json.loads((self.workspace / "experiment.json").read_text())["execution"]
+        execution = json.loads((self.workspace.parent / "experiment.json").read_text())["execution"]
         for index, problem in enumerate(execution["problems"]):
             start_problem(self.workspace, problem["id"])
             created = int(time.time() * 1000)
@@ -100,10 +100,10 @@ class BenchmarkModeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)
-        self.root = self.base / "control/bench@1"
-        self.workspace = self.base / "workspace"
+        self.root = self.base / "exec/bench@1"
+        self.workspace = self.root / "ws"
         self.bundle = self.base / "bundle"
-        self.workspace.mkdir()
+        self.workspace.mkdir(parents=True)
         self.bundle.mkdir()
         (self.bundle / "knowledge.txt").write_text("knowledge\n", encoding="utf-8")
         for name, content in (("q.md", "questioner"), ("a.md", "answerer"),
@@ -131,9 +131,8 @@ class BenchmarkModeTest(unittest.TestCase):
                       "commands": [], "preflight": []},
             }, (), (), (), execution=execution,
         )
-        self.root.mkdir(parents=True)
-        atomic_write(self.root / "plan", b"bench\n")
-        atomic_write(self.workspace / "experiment.json", json.dumps({
+        atomic_write(self.root / ".labflow-plan", b"bench\n")
+        atomic_write(self.root / "experiment.json", json.dumps({
             "schema": "labflow.experiment-runtime/v1", "plan_id": "bench",
             "workflow": None, "execution": execution,
         }).encode())
@@ -143,7 +142,7 @@ class BenchmarkModeTest(unittest.TestCase):
             "active_round": None, "next_round": 0, "execution_base": "bench",
             "session_title": "bench@1", "lab_root": str(self.base), "execution": execution,
             "adapter_hashes": {}, "asset_hashes": {}, "metrics": {"roles": {}},
-            "input_hashes": {"experiment.json": sha256(self.workspace / "experiment.json")},
+            "input_hashes": {"experiment.json": sha256(self.root / "experiment.json")},
         }
         save_state(self.root, state)
         state = install_bundle(self.root, state, self.manifest, str(self.bundle))
@@ -177,7 +176,7 @@ class BenchmarkModeTest(unittest.TestCase):
         self.assertEqual(a_permission["edit"]["ch/out/report.md"], "deny")
         self.assertIn("Host 会一次性准备并触发整批题目", q_text)
         self.assertIn("原文逐字发送", q_text)
-        self.assertIn("`report.md` 由 Questioner 编写", a_text)
+        self.assertIn("`report.md` 由 Questioner 负责", a_text)
 
     def test_one_host_trigger_runs_and_archives_the_whole_batch(self):
         response = run(self.context, since=0)

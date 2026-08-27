@@ -16,7 +16,7 @@ from .config import ControlError, repository_root
 from .events import pending_optional_requests, pending_requests
 from .runtime_opencode import resume_prompt
 from .state import atomic_json, load_lab_config, load_state, validate_title
-from .task_cli import workflow_status
+from .task_cli import TaskError, pull, submit, task_records, workflow_status
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
 
@@ -65,6 +65,7 @@ class ExecutionState:
     active: bool
     dag: bool
     roles: tuple[str, ...]
+    workflow: dict[str, Any] | None = None
     artifacts: dict[str, int] = field(default_factory=dict)
     runnable: dict[str, tuple[tuple[str, int], ...]] = field(default_factory=dict)
     requests: tuple[str, ...] = ()
@@ -158,6 +159,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             bool(data.get("active")),
             bool(data.get("dag")),
             tuple(data.get("roles", ())),
+            workflow=data.get("workflow"),
             artifacts=previous.artifacts if previous else {},
             sessions=previous.sessions if previous else {},
             runnable=(previous.runnable if previous and data.get("dag") else {}),
@@ -168,7 +170,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             sessions_initialized=previous.sessions_initialized if previous else False,
         )
         state.executions[event.execution] = execution
-        return _reconcile_execution(state, execution)
+        return []
     execution = state.executions.get(event.execution)
     if execution is None:
         return []
@@ -211,8 +213,9 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         session.title = str(event.data["title"])
         session.backend_id = str(event.data["backend_id"])
         session.observed = True
-        session.error = event.data.get("error")
-        return _reconcile_role(state, execution, role)
+        if "error" in event.data:
+            session.error = event.data.get("error")
+        return []
     if event.kind == "session_missing":
         role = str(event.data["role"])
         session = execution.sessions.setdefault(role, SessionState(role, role))
@@ -325,18 +328,19 @@ class Supervisor:
         self.server_url = f"http://127.0.0.1:{port}"
         self.poll_interval = poll_interval
         self.state = SupervisorState()
-        self.writer = TimelineWriter(self.root / "timeline.sqlite3")
+        self.writer = TimelineWriter(self.root / "db.sqlite3")
 
     def close(self) -> None:
         self.writer.close()
 
     def _desired(self) -> dict[str, Path]:
-        root = self.root / "supervisor"
+        root = self.root / "exec"
         if not root.is_dir():
             return {}
         result = {}
         for path in root.iterdir():
-            if path.is_dir() and not path.is_symlink():
+            if (path.is_dir() and not path.is_symlink()
+                    and (path / ".labflow-plan").is_file()):
                 try:
                     result[validate_title(path.name)] = path
                 except ControlError:
@@ -344,17 +348,18 @@ class Supervisor:
         return result
 
     def _execution_event(self, title: str, desired: Path) -> tuple[LifecycleEvent, dict[str, Any]]:
-        control = self.root / "control" / title
-        value = load_state(control)
+        value = load_state(desired)
         workflow = value.get("workflow")
         roles = tuple(workflow.get("roles", ())) if isinstance(workflow, dict) else ()
-        active = value.get("phase") in {"ready", "active", "idle"}
+        active = ((desired / "active").is_file()
+                  and value.get("phase") in {"ready", "active", "idle"})
         event = LifecycleEvent("execution_updated", title, {
             "workspace": value["workspace"],
             "root_session_id": value.get("session_id"),
             "active": active,
             "dag": (desired / "artifacts").is_dir() and isinstance(workflow, dict),
             "roles": roles,
+            "workflow": workflow,
         })
         return event, value
 
@@ -412,6 +417,7 @@ class Supervisor:
         ))
         effects: list[Effect] = []
         completed_turns: set[str] = set()
+        stopped_at: dict[str, int] = {}
         for session in sessions:
             session_id = session["id"]
             role = session["role"]
@@ -426,6 +432,11 @@ class Supervisor:
                     continue
                 if info.get("role") == "assistant":
                     completed_turns.add(session_id)
+                    completed = info.get("time", {}).get("completed")
+                    if info.get("finish") == "stop" and isinstance(completed, (int, float)):
+                        stopped_at[session_id] = max(
+                            stopped_at.get(session_id, 0), int(completed),
+                        )
                 records = closed_message_events(
                     title, session["title"], role, message,
                 )
@@ -441,13 +452,35 @@ class Supervisor:
                     )))
                 elif len(matches) == 1:
                     session = matches[0]
+                    runtime_status = statuses.get(
+                        session["id"], {"type": "idle"}
+                    ).get("type", "idle")
+                    working = self.root / "exec" / title / "working" / role
+                    if (runtime_status == "idle" and working.is_file()
+                            and stopped_at.get(session["id"], 0)
+                            >= working.stat().st_mtime_ns // 1_000_000):
+                        active = [
+                            item for item in task_records(Path(value["workspace"]))["active"]
+                            if item.get("role") == role
+                        ]
+                        if active:
+                            try:
+                                submit(
+                                    Path(value["workspace"]), value["workflow"], role,
+                                    list(active[0]["artifacts"]),
+                                )
+                                working.unlink(missing_ok=True)
+                            except TaskError as exc:
+                                self.state.executions[title].sessions.setdefault(
+                                    role, SessionState(role, role)
+                                ).error = str(exc)
+                        else:
+                            working.unlink(missing_ok=True)
                     effects.extend(reduce(self.state, LifecycleEvent(
                         "session_observed", title, {
                             "role": role, "title": session["title"],
                             "backend_id": session["id"],
-                            "status": statuses.get(
-                                session["id"], {"type": "idle"}
-                            ).get("type", "idle"),
+                            "status": runtime_status,
                             "completed_turn": session["id"] in completed_turns,
                         },
                     )))
@@ -483,7 +516,35 @@ class Supervisor:
                 elif effect.kind == "prompt_session":
                     if not backend_id:
                         raise ControlError("prompt effect has no backend Session identity")
-                    client.prompt_session(backend_id, resume_prompt(effect.role), agent=effect.role)
+                    workflow = execution.workflow
+                    if workflow is None:
+                        raise ControlError("DAG execution has no workflow")
+                    task = pull(
+                        Path(execution.workspace), workflow, effect.role, False, 0,
+                    )
+                    if task is None:
+                        session = execution.sessions.setdefault(
+                            effect.role, SessionState(effect.role, effect.role)
+                        )
+                        session.status = "idle"
+                        self.state.effects.pop(effect.key, None)
+                        continue
+                    target = str(task["target"]["name"])
+                    working = self.root / "exec" / effect.execution / "working" / effect.role
+                    working.parent.mkdir(exist_ok=True)
+                    working.touch()
+                    session = execution.sessions.setdefault(
+                        effect.role, SessionState(effect.role, effect.role)
+                    )
+                    client.prompt_session(
+                        backend_id,
+                        resume_prompt(
+                            effect.role, workflow["artifacts"][target], task,
+                            session.error,
+                        ),
+                        agent=effect.role,
+                    )
+                    session.error = None
                 else:
                     raise ControlError(f"unknown Supervisor effect: {effect.kind}")
                 pending.extend(reduce(self.state, LifecycleEvent(
@@ -525,6 +586,22 @@ class Supervisor:
             } for execution in self.state.executions.values()],
         }
 
+    def _write_host_tasks(self) -> None:
+        path = self.root / "host-task.json"
+        value = {
+            title: {
+                "tasks": list(execution.requests),
+                "optional_tasks": list(execution.optional_requests),
+            }
+            for title, execution in sorted(self.state.executions.items())
+        }
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            current = None
+        if current != value:
+            atomic_json(path, value)
+
     def step(self) -> None:
         self.writer.check()
         desired = self._desired()
@@ -541,6 +618,7 @@ class Supervisor:
             if workflow is not None:
                 effects.extend(reduce(self.state, workflow))
             self._execute(effects)
+        self._write_host_tasks()
         atomic_json(self.root / "supervisor-status.json", self._status())
 
     def run(self, *, once: bool = False) -> None:
