@@ -56,8 +56,8 @@ from labflow.events import event_detail, project_events
 from labflow.permissions import preflight_permissions
 from labflow.reporting import submit_report
 from labflow.task_cli import (
-    evaluate, load_workflow, refresh_artifact, pull, submit, task_records, validate_workflow,
-    workflow_status,
+    assign_task, evaluate, load_workflow, refresh_artifact, submit, task_records,
+    validate_workflow, workflow_status,
 )
 from labflow.watch import WatchWindow, acp_events, message_events, watch_progress
 from labflow.cli_host import (
@@ -279,10 +279,11 @@ class ConfigStateTest(unittest.TestCase):
         client.sessions.return_value = []
         context.client.return_value = client
 
-        result = _resume(context, "a5", .01)
+        result = _resume(context, "a5")
         self.assertEqual(result["session_id"], "ses_a5")
-        self.assertTrue(result["loop_observed"])
-        client.prompt_session.assert_called_once()
+        self.assertEqual((result["action"], result["managed_by"]),
+                         ("retained", "supervisor"))
+        client.prompt_session.assert_not_called()
 
     def test_resume_is_idempotent_for_a_busy_role(self):
         client = mock.Mock()
@@ -315,16 +316,14 @@ class ConfigStateTest(unittest.TestCase):
         client.sessions.return_value = []
         context.client.return_value = client
 
-        result = _resume(context, "a5", .01, force=True)
+        result = _resume(context, "a5", force=True)
 
         self.assertEqual((result["action"], result["session_id"]),
                          ("recreated", "ses_a5_new"))
         client.abort_session.assert_called_once_with("ses_a5_old")
-        client.prompt_session.assert_called_once_with(
-            "ses_a5_new", mock.ANY, agent="a5"
-        )
+        client.prompt_session.assert_not_called()
         client.create_session.assert_called_once_with(
-            "demo.a5@1", parent_id="ses_coordinator"
+            "demo.a5@1", parent_id="ses_coordinator", agent="a5"
         )
 
     def test_resume_rejects_unknown_role_and_recreates_missing_session(self):
@@ -344,13 +343,14 @@ class ConfigStateTest(unittest.TestCase):
         client.create_session.return_value = {"id": "ses_a5_new"}
         client.sessions.return_value = []
         context.client.return_value = client
-        result = _resume(context, "a5", .01)
+        result = _resume(context, "a5")
         self.assertEqual((result["action"], result["session_id"]), ("recreated", "ses_a5_new"))
-        client.prompt_session.assert_called_once_with(
-            "ses_a5_new", mock.ANY, agent="a5"
+        client.prompt_session.assert_not_called()
+        client.create_session.assert_called_once_with(
+            "demo.a5@1", parent_id="ses_coordinator", agent="a5"
         )
 
-    def test_resume_replaces_an_existing_session_that_does_not_reenter_loop(self):
+    def test_resume_retains_an_existing_idle_supervisor_managed_session(self):
         client = mock.Mock()
         old = {"id": "ses_a5_old", "agent": "a5"}
         new = {"id": "ses_a5_new", "agent": "a5"}
@@ -368,12 +368,11 @@ class ConfigStateTest(unittest.TestCase):
                          "lab_root": "/tmp/lab"}
         client.sessions.return_value = []
         context.client.return_value = client
-        with mock.patch("labflow.cli_host.time.monotonic",
-                        side_effect=[0, 1, 1, 1]):
-            result = _resume(context, "a5", .5)
-        self.assertEqual((result["action"], result["session_id"]), ("recreated", "ses_a5_new"))
-        self.assertEqual(client.prompt_session.call_args_list[0].args[0], "ses_a5_old")
-        self.assertEqual(client.prompt_session.call_args_list[1].args[0], "ses_a5_new")
+        result = _resume(context, "a5")
+        self.assertEqual((result["action"], result["session_id"]),
+                         ("retained", "ses_a5_old"))
+        client.prompt_session.assert_not_called()
+        client.create_session.assert_not_called()
 
     def test_start_requires_lab_and_plan_identity(self):
         args = control_parser().parse_args(["start", "t1", "sample-plan"])
@@ -616,7 +615,7 @@ class ConfigStateTest(unittest.TestCase):
             (source_workspace / "NOTES.md").write_text("process notes", encoding="utf-8")
             refresh_artifact(source_workspace, workflow, "input-1")
             (source_workspace / "output.txt").write_text("result", encoding="utf-8")
-            pull(source_workspace, workflow, "a1", False, None)
+            assign_task(source_workspace, workflow, "a1", "output-1.a1")
             submit(source_workspace, workflow, "a1", ["output-1.a1"])
             refresh_artifact(source_workspace, workflow, "output-2")
             save_state(source_root, {
@@ -961,6 +960,9 @@ class ConfigStateTest(unittest.TestCase):
             )
             self.assertEqual(load_workflow(workspace), state["workflow"])
             self.assertTrue((execution / ".opencode/agents/a1.md").is_file())
+            coordinator = (execution / ".opencode/agents/coordinator.md").read_text()
+            self.assertIn('"task":"deny"', coordinator)
+            self.assertIn("Supervisor 负责创建角色 Session", coordinator)
             self.assertFalse((workspace / ".opencode").exists())
             self.assertFalse((workspace / "experiment.json").exists())
             self.assertFalse((workspace / "opencode.json").exists())
@@ -1457,7 +1459,7 @@ class StatusSummaryTest(unittest.TestCase):
                 },
             })
             refresh_artifact(workspace, workflow, "input-0")
-            pull(workspace, workflow, "a1", False, None)
+            assign_task(workspace, workflow, "a1", "output-1.a1")
             submit(workspace, workflow, "a1", ["output-1.a1"])
             context = mock.Mock(state={
                 "title": "demo@1", "lab_name": "t1",

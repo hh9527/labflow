@@ -13,7 +13,10 @@ from labflow.state import SCHEMA, bind_plan, save_state
 from labflow.supervisor import (
     EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
 )
-from labflow.task_cli import refresh_artifact, task_records, validate_workflow, workflow_status
+from labflow.task_cli import (
+    assign_task, refresh_artifact, submit, task_records, validate_workflow,
+    workflow_status,
+)
 from labflow.timeline_projection import closed_message_events
 from labflow.timeline_store import TimelineWriter, read, statistics
 
@@ -252,12 +255,13 @@ class TimelineProjectionTest(unittest.TestCase):
         events = closed_message_events("plan@1", "a1", "a1", self.message())
 
         self.assertEqual([event["type"] for event in events],
-                         ["action", "thinking", "thinking", "reply"])
-        action = events[0]
+                         ["turn_started", "action", "thinking", "thinking",
+                          "reply", "turn_ended"])
+        action = next(event for event in events if event["type"] == "action")
         self.assertEqual((action["action"], action["success"], action["command"]),
                          ("shell", True, "just validate --all"))
         self.assertEqual((action["at"], action["duration"]), (1200, 200))
-        reply = events[-1]
+        reply = next(event for event in events if event["type"] == "reply")
         self.assertEqual((reply["tokens"], reply["reasoning_tokens"]), (3, 5))
         self.assertNotIn("must not be stored", repr(events))
 
@@ -269,7 +273,10 @@ class TimelineProjectionTest(unittest.TestCase):
                 "output": "permission denied", "time": {"start": 1200, "end": 1250},
             },
         }
-        action = closed_message_events("plan@1", "a1", "a1", message)[0]
+        action = next(
+            event for event in closed_message_events("plan@1", "a1", "a1", message)
+            if event["type"] == "action"
+        )
         self.assertEqual(action["paths"], ["result/output.json"])
         self.assertFalse(action["success"])
 
@@ -350,7 +357,7 @@ class TimelineStoreTest(unittest.TestCase):
 
             events = project_events(context, 100)
 
-            self.assertEqual([event["type"] for event in events], ["artifact", "reply"])
+            self.assertEqual([event["type"] for event in events], ["reply"])
             context.client.assert_not_called()
 
     def test_unicode_timeline_identity_can_be_read_by_event_id(self):
@@ -454,7 +461,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
             finally:
                 supervisor.close()
 
-            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 5)
             client.create_session.assert_not_called()
             status = json.loads((root / "supervisor-status.json").read_text())
             self.assertEqual(status["executions"][0]["title"], "bench@1")
@@ -607,7 +614,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
                     finally:
                         supervisor.close()
 
-            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 5)
 
     def test_dag_goal_creates_and_prompts_one_missing_runnable_role(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -671,6 +678,58 @@ class SupervisorRuntimeTest(unittest.TestCase):
             self.assertFalse(workflow_status(workspace, workflow)["artifacts"]
                              ["output.a1"]["runnable"])
             client.prompt_session.assert_called_once()
+            types = [event["type"] for event in read(root / "db.sqlite3", "demo@1")]
+            self.assertIn("task_started", types)
+            self.assertIn("task_completed", types)
+            self.assertIn("artifact_refreshed", types)
+
+    def test_replacement_session_clears_qualification_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); workspace = root / "exec" / "demo@1" / "ws"
+            workspace.mkdir(parents=True)
+            workflow = validate_workflow({
+                "schema": "labflow.workflow/v1", "roles": ["a1"],
+                "artifacts": {
+                    "input": {"desc": "input"},
+                    "learn.sess.a1": {
+                        "desc": "learn", "input": ["input"], "instruction": "learn",
+                    },
+                    "output.a1": {
+                        "desc": "output", "input": ["input", "learn.sess.a1"],
+                        "instruction": "build",
+                    },
+                },
+            })
+            self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
+            refresh_artifact(workspace, workflow, "input")
+            assign_task(workspace, workflow, "a1", "learn.sess.a1")
+            submit(workspace, workflow, "a1", ["learn.sess.a1"])
+            assign_task(workspace, workflow, "a1", "output.a1")
+            client = mock.Mock()
+            client.statuses.return_value = {"ses_root": {"type": "idle"}}
+            client.children.return_value = []
+            client.session_messages.return_value = []
+            client.create_session.return_value = {"id": "ses_a1"}
+            supervisor = Supervisor(root, 4199)
+            try:
+                with mock.patch("labflow.supervisor.Client", return_value=client):
+                    supervisor.step()
+                    client.children.side_effect = lambda session_id: ([{
+                        "id": "ses_a1", "title": "a1", "agent": "a1",
+                    }] if session_id == "ses_root" else [])
+                    client.statuses.return_value = {
+                        "ses_root": {"type": "idle"}, "ses_a1": {"type": "idle"},
+                    }
+                    supervisor.step()
+            finally:
+                supervisor.close()
+
+            self.assertFalse((root / "exec" / "demo@1" / "artifacts"
+                              / "learn.sess.a1").exists())
+            stale = next(item for item in task_records(workspace)["history"]
+                         if item["status"] == "stale")
+            self.assertEqual(stale["reason"], "role Session was replaced")
+            self.assertIn("`learn.sess.a1`", client.prompt_session.call_args.args[1])
 
     def test_incomplete_assets_are_reprompted_without_submitting_artifact(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -908,7 +967,7 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 supervisor.close()
 
             self.assertNotIn("bench@1", supervisor.state.executions)
-            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 2)
+            self.assertEqual(len(read(root / "db.sqlite3", "bench@1")), 5)
 
 
 if __name__ == "__main__":

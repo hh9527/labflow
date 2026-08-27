@@ -25,7 +25,6 @@ from .lifecycle import (
 )
 from .metrics import collect_metrics
 from .observe import assistant_messages, text_parts
-from .runtime_opencode import resume_prompt
 from .state import (
     atomic_write,
     atomic_json,
@@ -96,10 +95,8 @@ def parser(prog: str = "labflow host") -> argparse.ArgumentParser:
     resume = commands.add_parser("resume")
     target(resume)
     resume.add_argument("role")
-    resume.add_argument("--timeout", type=float, default=15.0,
-                        help="seconds to wait until the role loop is observed")
     resume.add_argument("--force", action="store_true",
-                        help="abort the current role turn before re-entering its loop")
+                        help="abort the current role turn and recreate its Session")
     abort_sessions = commands.add_parser(
         "abort-sessions",
         help="abort active sessions belonging to a completed or retired execution",
@@ -282,35 +279,11 @@ def _submit(context: Context, values: list[str], *, force: bool = False) -> list
     return results
 
 
-def _loop_state(context: Context, client: Any, role: str, session_id: str) -> str | None:
-    workspace = context.state.get("workspace")
-    if isinstance(workspace, str) and Path(workspace).is_dir():
-        if any(record.get("role") == role for record in task_records(Path(workspace))["active"]):
-            return "working"
-    messages = client.session_messages(session_id)
-    if not isinstance(messages, list):
-        return None
-    expected = (f"labflow agent pull {role}", f"labflow agent pull {role}")
-    for message in reversed(messages):
-        if message.get("info", {}).get("role") != "assistant":
-            continue
-        for part in reversed(message.get("parts", [])):
-            state = part.get("state", {})
-            command = state.get("input", {}).get("command", "")
-            if (part.get("type") == "tool" and part.get("tool") == "bash"
-                    and state.get("status") in ("pending", "running")
-                    and isinstance(command, str) and any(value in command for value in expected)):
-                return "waiting_on_pull"
-    return None
-
-
-def _resume(context: Context, role: str, timeout: float = 15.0,
-            *, force: bool = False) -> dict[str, Any]:
+def _resume(context: Context, role: str, *, force: bool = False) -> dict[str, Any]:
     workflow = context.state.get("workflow")
     if not workflow or role not in workflow.get("roles", []):
         raise ControlError(f"unknown workflow role: {role}", 64)
     client = context.client()
-    deadline = time.monotonic() + max(timeout, 0)
     children = [child for child in client.children() if child.get("agent") == role]
     statuses = client.statuses()
     if force:
@@ -319,87 +292,45 @@ def _resume(context: Context, role: str, timeout: float = 15.0,
             if (isinstance(session_id, str)
                     and statuses.get(session_id, {}).get("type") == "busy"):
                 client.abort_session(session_id)
-        statuses = client.statuses()
-    running = [(child, _loop_state(context, client, role, child["id"]))
-               for child in children if isinstance(child.get("id"), str)
+    running = [child for child in children if isinstance(child.get("id"), str)
                and statuses.get(child["id"], {}).get("type") == "busy"]
-    running = [(child, state) for child, state in running if state is not None]
     if running and not force:
-        child, loop_state = running[-1]
+        child = running[-1]
         session_id = child["id"]
         return {
-            "schema": "labflow.role-resume/v2", "title": context.state["title"],
+            "schema": "labflow.role-resume/v3", "title": context.state["title"],
             "role": role, "action": "already_running", "session_id": session_id,
             "previous_runtime_state": statuses[session_id], "runtime_state": statuses[session_id],
-            "loop_observed": True, "loop_state": loop_state,
+            "managed_by": "supervisor",
         }
 
-    previous_ids = {child.get("id") for child in children if isinstance(child.get("id"), str)}
-    action = "resumed_existing"
+    action = "retained"
     previous_runtime: dict[str, Any] = {"type": "missing"}
     if children and not force and isinstance(children[-1].get("id"), str):
         session_id = children[-1]["id"]
         previous_runtime = statuses.get(session_id, {"type": "unknown"})
-        client.prompt_session(session_id, resume_prompt(role), agent=role)
+        current_runtime = previous_runtime
     else:
         action = "recreated"
         response = client.create_session(
             next_session_title(client, f"{context.state['execution_base']}.{role}",
                                context.state["lab_root"]),
             parent_id=context.state["session_id"],
+            agent=role,
         )
         session_id = response.get("id") if isinstance(response, dict) else None
         if not isinstance(session_id, str):
             raise ControlError(f"opencode did not create replacement session for {role}", 69)
-        client.prompt_session(session_id, resume_prompt(role), agent=role)
-
-    while True:
-        statuses = client.statuses()
-        current_children = [child for child in client.children() if child.get("agent") == role]
-        loop_state = (_loop_state(context, client, role, session_id)
-                      if isinstance(session_id, str) else None)
-        if (action == "resumed_existing"
-                and statuses.get(session_id, {}).get("type") == "busy"
-                and loop_state is not None):
-            current_runtime = statuses[session_id]
-            break
-        replacements = [child for child in current_children
-                        if isinstance(child.get("id"), str) and child["id"] not in previous_ids
-                        and statuses.get(child["id"], {}).get("type") == "busy"
-                        and _loop_state(context, client, role, child["id"]) is not None]
-        if replacements:
-            session_id = replacements[-1]["id"]
-            current_runtime = statuses[session_id]
-            loop_state = _loop_state(context, client, role, session_id)
-            action = "recreated"
-            break
-        if time.monotonic() >= deadline:
-            if action == "resumed_existing":
-                action = "recreated"
-                response = client.create_session(
-                    next_session_title(client, f"{context.state['execution_base']}.{role}",
-                                       context.state["lab_root"]),
-                    parent_id=context.state["session_id"],
-                )
-                session_id = response.get("id") if isinstance(response, dict) else None
-                if not isinstance(session_id, str):
-                    raise ControlError(f"opencode did not create replacement session for {role}", 69)
-                client.prompt_session(session_id, resume_prompt(role), agent=role)
-                previous_ids.update(child.get("id") for child in current_children)
-                deadline = time.monotonic() + max(timeout, 0)
-                continue
-            raise ControlError(f"timed out waiting for {role} to re-enter the pull loop", 75)
-        time.sleep(.1)
+        current_runtime = {"type": "idle"}
     return {
-        "schema": "labflow.role-resume/v2",
+        "schema": "labflow.role-resume/v3",
         "title": context.state["title"],
         "role": role,
         "session_id": session_id,
         "action": action,
         "previous_runtime_state": previous_runtime,
         "runtime_state": current_runtime,
-        "loop_observed": True,
-        "loop_state": loop_state,
+        "managed_by": "supervisor",
     }
 
 
@@ -521,7 +452,7 @@ def _metrics(context: Context) -> tuple[dict[str, Any], dict[str, Any]]:
         if role in active_by_role:
             workflow_state = "working"
         elif child:
-            workflow_state = "waiting_on_pull"
+            workflow_state = "idle"
         else:
             workflow_state = "not_started"
         agents.append({
@@ -773,7 +704,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow host") -> int:
         elif args.command == "submit":
             emit(_submit(context, args.artifacts, force=args.force))
         elif args.command == "resume":
-            emit(_resume(context, args.role, args.timeout, force=args.force))
+            emit(_resume(context, args.role, force=args.force))
         elif args.command == "abort-sessions":
             emit(_abort_sessions(context))
         return 0

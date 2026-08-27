@@ -11,7 +11,7 @@ from .task_cli import role_asset_permissions
 
 MODEL = "deepseek/deepseek-v4-flash"
 ENVIRONMENT = {"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "128000"}
-START_PROMPT = "请初始化实验角色。"
+START_PROMPT = "请启动实验。"
 
 
 def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
@@ -147,23 +147,17 @@ def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str
 
 
 def _coordinator(manifest: Manifest) -> str:
-    roles = list(manifest.roles)
-    task = {"*": "deny", **{role: "allow" for role in roles}}
     permission = {
         "read": "deny", "glob": "deny", "grep": "deny", "list": "deny",
-        "edit": "deny", "bash": "deny", "task": task, "webfetch": "deny",
+        "edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny",
         "websearch": "deny", "external_directory": "deny",
     }
-    labels = "、".join(role.upper() for role in roles)
-    launches = "、".join(roles)
     body = (
-        f"收到 `{START_PROMPT}` 时，同时启动 {labels} 各一次。向每个角色只发送：\n\n"
-        "`初始化你的角色，阅读角色说明后结束本次执行，等待 Supervisor 投递具体任务。`\n\n"
-        "全部启动调用完成后立即结束；本角色的职责范围是启动指定角色。\n\n"
-        f"收到 `恢复角色 <role>` 时，确认 role 属于 {launches}，只重新启动该角色一次，"
-        "并发送同一条初始化消息。"
+        f"本会话是 Artifact DAG 的根会话。收到 `{START_PROMPT}` 时完成根会话初始化并结束"
+        "当前 turn。Labflow Supervisor 负责创建角色 Session、投递任务和维持执行目标。"
     )
-    return _frontmatter("启动和恢复由 artifact DAG 驱动的长期角色。", "primary", permission) + body + "\n"
+    return _frontmatter("作为 Supervisor 管理的 Artifact DAG 根会话。",
+                        "primary", permission) + body + "\n"
 
 
 def generate(manifest: Manifest, workspace: Path,

@@ -8,7 +8,7 @@ from .config import ControlError
 from .context import Context
 from .observe import text_parts
 from .task_cli import task_records
-from .timeline_store import read as read_timeline
+from .timeline_store import read as read_timeline, schema_version as timeline_schema_version
 
 
 def _ms_from_ns(value: Any) -> int | None:
@@ -160,18 +160,20 @@ def project_events(context: Context, since_ms: int) -> list[dict[str, Any]]:
                 if isinstance(lab_root, str) and isinstance(title, str) else None)
     has_timeline = database is not None and database.is_file()
     workspace = Path(context.state["workspace"])
-    result = _task_events(workspace)
-    for value in context.state.get("artifact_events", []):
-        created = _ms_from_ns(value.get("mtime_ns"))
-        if created is not None:
-            result.append({
-                "id": f"artifact:{value.get('number')}",
-                "type": "artifact",
-                "created_at": created,
-                "at": created,
-                "artifact": value.get("artifact"),
-                "action": value.get("reason"),
-            })
+    persisted_workflow = has_timeline and (timeline_schema_version(database) or 0) >= 2
+    result = [] if persisted_workflow else _task_events(workspace)
+    if not persisted_workflow:
+        for value in context.state.get("artifact_events", []):
+            created = _ms_from_ns(value.get("mtime_ns"))
+            if created is not None:
+                result.append({
+                    "id": f"artifact:{value.get('number')}",
+                    "type": "artifact",
+                    "created_at": created,
+                    "at": created,
+                    "artifact": value.get("artifact"),
+                    "action": value.get("reason"),
+                })
     for value in context.state.get("host_interventions", []):
         created = _ms_from_ns(value.get("recorded_at_ns"))
         if created is not None:

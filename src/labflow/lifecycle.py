@@ -26,7 +26,9 @@ from .state import (
     SCHEMA, archive_root, atomic_json, atomic_write, bind_plan, execution_root, load_state,
     locked, now, save_state, validate_title, workspace_root,
 )
-from .task_cli import TaskError, evaluate, refresh_artifact, restore_artifacts
+from .task_cli import (
+    TaskError, evaluate, is_session_qualification, refresh_artifact, restore_artifacts,
+)
 
 
 def opencode_environment(state: dict[str, Any]) -> dict[str, str]:
@@ -339,7 +341,8 @@ def _inherit_from_workspace(source_id: str, source_state: dict[str, Any],
 
     candidates = {
         name for name, artifact in workflow["artifacts"].items()
-        if (name in source_status and source_status[name]["current"]
+        if (not is_session_qualification(name)
+            and name in source_status and source_status[name]["current"]
             and _inheritance_compatible(source_workflow["artifacts"].get(name), artifact,
                                         source_status[name], source_status))
     }
@@ -352,7 +355,8 @@ def _inherit_from_workspace(source_id: str, source_state: dict[str, Any],
             if name not in candidates or name in inherited_set:
                 continue
             dependencies_ready = all(
-                reference["optional"] and not source_status[reference["id"]]["stamp_mtime_ns"]
+                is_session_qualification(reference["id"])
+                or reference["optional"] and not source_status[reference["id"]]["stamp_mtime_ns"]
                 or reference["id"] in inherited_set
                 for reference in artifact["input"]
             )
