@@ -13,7 +13,7 @@ from labflow.state import SCHEMA, bind_plan, save_state
 from labflow.supervisor import (
     EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
 )
-from labflow.task_cli import assign_task, refresh_artifact, task_records, validate_workflow
+from labflow.task_cli import assign_task, refresh_artifact, submit, task_records, validate_workflow
 from labflow.timeline_projection import closed_message_events
 from labflow.timeline_store import TimelineWriter, read, statistics
 
@@ -728,7 +728,8 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 },
             })
             refresh_artifact(workspace, workflow, "input")
-            refresh_artifact(workspace, workflow, "learn.sess.a1", force=True)
+            assign_task(workspace, workflow, "a1", "learn.sess.a1")
+            submit(workspace, workflow, "a1", ["learn.sess.a1"])
             assign_task(workspace, workflow, "a1", "output.a1")
             self._state(root, "demo@1", workspace, workflow, {"kind": "dag-mode"})
             client = mock.Mock()
@@ -751,8 +752,11 @@ class SupervisorRuntimeTest(unittest.TestCase):
                 supervisor.close()
 
             self.assertFalse((desired / "learn.sess.a1").exists())
-            self.assertEqual(task_records(workspace)["history"][0]["reason"],
-                             "role Session was replaced")
+            stale = next(
+                item for item in task_records(workspace)["history"]
+                if item["status"] == "stale"
+            )
+            self.assertEqual(stale["reason"], "role Session was replaced")
             client.prompt_session.assert_called_once()
             self.assertIn("artifact `learn.sess.a1`",
                           client.prompt_session.call_args.args[1])

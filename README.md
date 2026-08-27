@@ -162,6 +162,8 @@ them because it preserves context.
 
 Session qualifications cannot be optional, restored, or inherited into another execution. This
 keeps migrated output Assets valid while requiring a fresh Session to complete its own onboarding.
+An explicit Host `submit --force` may restore a persistent role output while its Session
+qualification is absent, but cannot manufacture the qualification itself.
 
 An Asset path ending in `/` denotes a directory; every other path denotes a file. `level` defaults
 to `2` and controls retention only:

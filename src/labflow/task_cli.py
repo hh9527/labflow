@@ -463,10 +463,16 @@ def refresh_artifact(root: Path, workflow: dict[str, Any], name: str, *, force: 
         raise TaskError(f"unknown artifact: {name}", 64)
     if artifact["owner"] != "host" and not force:
         raise TaskError(f"role-owned artifact cannot be refreshed by Host: {name}", 64)
+    if force and is_session_qualification(name):
+        raise TaskError(f"Host cannot refresh a session qualification: {name}", 64)
     with _locked(root):
         value = evaluate(root, workflow)["artifacts"][name]
-        if value["blocked_by"]:
-            raise TaskError(f"artifact inputs are incomplete: {', '.join(value['blocked_by'])}", 75)
+        blocked_by = [
+            dependency for dependency in value["blocked_by"]
+            if not force or dependency not in value["missing_qualifications"]
+        ]
+        if blocked_by:
+            raise TaskError(f"artifact inputs are incomplete: {', '.join(blocked_by)}", 75)
         if not value["assets"]["ready"]:
             raise TaskError(f"artifact assets are incomplete: {name}", 75)
         stamp = _atomic_write(_artifact_path(root, name), b"", value["input_mtime_ns"])

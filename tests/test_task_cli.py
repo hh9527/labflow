@@ -262,6 +262,13 @@ class ArtifactWorkflowTest(unittest.TestCase):
             with self.assertRaisesRegex(TaskError, "cannot restore session qualifications"):
                 restore_artifacts(root, workflow, ["learn.sess.a1"])
 
+            remove_artifact(root, workflow, "work.a1", force=True)
+            self.assertTrue(refresh_artifact(
+                root, workflow, "work.a1", force=True,
+            )["host_forced"])
+            with self.assertRaisesRegex(TaskError, "cannot refresh a session qualification"):
+                refresh_artifact(root, workflow, "learn.sess.a1", force=True)
+
     def test_changed_inputs_supersede_active_task(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
