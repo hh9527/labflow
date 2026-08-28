@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import time
 import tempfile
@@ -228,6 +229,16 @@ def supervisor_lock(root: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def control_mtime(path: Path) -> int | None:
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(value.st_mode):
+        raise ControlError(f"Supervisor control marker is not a regular file: {path}")
+    return value.st_mtime_ns
 
 
 def _requested(state: SupervisorState, effect: Effect) -> bool:
@@ -470,13 +481,13 @@ class Supervisor:
             "session_id": get_state(desired, "root_session_id"),
             "workflow": manifest.workflow,
             "execution": manifest.execution,
-            "phase": "active" if (desired / "active").is_file() else "idle",
+            "phase": "active" if (desired / "ctrl" / "active").is_file() else "idle",
             "server_url": self.server_url,
             "lab_root": config["lab_root"],
         }
         workflow = value.get("workflow")
         roles = tuple(workflow.get("roles", ())) if isinstance(workflow, dict) else ()
-        active = ((desired / "active").is_file()
+        active = ((desired / "ctrl" / "active").is_file()
                   and value.get("phase") in {"ready", "active", "idle"})
         event = LifecycleEvent("execution_updated", title, {
             "workspace": value["workspace"],
@@ -494,7 +505,7 @@ class Supervisor:
 
     def _ensure_root_session(self) -> None:
         from .project import get_state, load_execution, set_state
-        if not (self.root / "active").is_file():
+        if not (self.root / "ctrl" / "active").is_file():
             return
         if get_state(self.root, "root_session_id") is not None:
             return
@@ -937,10 +948,13 @@ class Supervisor:
         self._write_host_tasks()
         atomic_json(self.root / "supervisor-status.json", self._status())
 
-    def run(self, *, once: bool = False) -> None:
-        while True:
+    def run(self, *, once: bool = False, control_marker: Path | None = None,
+            generation: int | None = None) -> None:
+        while control_marker is None or control_mtime(control_marker) == generation:
             self.step()
             if once:
+                return
+            if control_marker is not None and control_mtime(control_marker) != generation:
                 return
             time.sleep(self.poll_interval)
 
@@ -972,7 +986,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
             })
             home, manifest, config = prepare_execution(project, lab_root, args.port)
             print(
-                f"Prepared {home}; start OpenCode on port {args.port}, then touch {home / 'active'}",
+                f"Prepared {home}; start OpenCode on port {args.port}, then touch "
+                f"{home / 'ctrl' / 'supervisor'} and {home / 'ctrl' / 'active'}",
                 flush=True,
             )
         if args.port is not None and args.port != config["port"]:
@@ -981,8 +996,14 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
             )
         if args.poll_interval <= 0 or args.poll_interval > 60:
             raise ControlError("poll interval must be greater than 0 and at most 60 seconds", 64)
-        client = Client(f"http://127.0.0.1:{config['port']}", str(manifest.root), timeout=.5)
-        while True:
+        marker = home / "ctrl" / "supervisor"
+        generation = control_mtime(marker)
+        if generation is None:
+            return 0
+        client = Client(
+            f"http://127.0.0.1:{config['port']}", str(manifest.root), timeout=.5,
+        )
+        while control_mtime(marker) == generation:
             try:
                 client.health()
                 break
@@ -990,10 +1011,14 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
                 if exc.code != 69:
                     raise
                 time.sleep(.25)
+        if control_mtime(marker) != generation:
+            return 0
         with supervisor_lock(home):
             supervisor = Supervisor(home, config["port"], poll_interval=args.poll_interval)
             try:
-                supervisor.run(once=args.once)
+                supervisor.run(
+                    once=args.once, control_marker=marker, generation=generation,
+                )
             finally:
                 supervisor.close()
                 supervisor = None

@@ -31,13 +31,14 @@ labflow attach
 ```
 
 Host control operations are ordinary project file operations: copy or atomically replace Assets,
-touch `.labflow-exec/artifacts/<artifact>`, and remove or recreate `.labflow-exec/active`. Host never
-starts, stops, or calls OpenCode. Initialization does not create `active`; publish initial Host
-Artifacts and explicitly start reconciliation with:
+touch `.labflow-exec/artifacts/<artifact>`, and update markers under `.labflow-exec/ctrl`. Host never
+starts, stops, or calls OpenCode. Initialization does not create either control marker; publish
+initial Host Artifacts and explicitly start the Supervisor and reconciliation with:
 
 ```bash
 touch .labflow-exec/artifacts/<artifact>
-touch .labflow-exec/active
+touch .labflow-exec/ctrl/supervisor
+touch .labflow-exec/ctrl/active
 ```
 
 Once external processes are stopped, the temporary Lab service directory recorded in
@@ -58,13 +59,15 @@ prj-home/
   <project files and Assets>
   .labflow-exec/
     config.json
-    active
     lock
     runtime.json
     host-tasks.json
     supervisor-status.json
     states.sqlite
     events.sqlite
+    ctrl/
+      active
+      supervisor
     artifacts/
       <artifact>
     ws/
@@ -87,9 +90,25 @@ OPENCODE_CONFIG_DIR=<prj-home>/.labflow-exec/ws/.opencode
 `events.sqlite` stores the summarized event stream. Artifact facts remain empty timestamped files so
 the Host can publish one directly with `touch .labflow-exec/artifacts/<artifact>`.
 
-Removing `.labflow-exec/active` pauses new scheduling effects; recreating it resumes reconciliation.
-The Host affects execution only through project Assets and these control files. It never calls the
-OpenCode API.
+Removing `.labflow-exec/ctrl/active` pauses new scheduling effects; recreating it resumes
+reconciliation. One `labflow supervisor` invocation runs one generation: it records the mtime of
+`ctrl/supervisor`, then exits when that marker is touched or deleted. If the marker is absent, the
+command only prepares the execution and returns. A process-independent shell loop can keep it
+available:
+
+```bash
+# The first call prepares .labflow-exec and returns when no marker exists.
+labflow supervisor --port 4199
+while :; do
+  while [ ! -f .labflow-exec/ctrl/supervisor ]; do sleep 0.25; done
+  labflow supervisor --port 4199
+done
+```
+
+The launcher knows nothing about Supervisor state or OpenCode; it only waits for a regular file and
+starts a command. Touching `ctrl/supervisor` therefore restarts Supervisor through the next loop
+iteration, while deleting it stops Supervisor until Host recreates it. Host affects execution only
+through project Assets and these control files; it never calls the OpenCode API.
 
 ## Execution Identity
 

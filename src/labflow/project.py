@@ -263,6 +263,7 @@ def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, M
     if home.exists() and not home.is_dir():
         raise ControlError(f"execution home is not a directory: {home}")
     home.mkdir(exist_ok=True)
+    (home / "ctrl").mkdir(exist_ok=True)
     (home / "artifacts").mkdir(exist_ok=True)
     runtime = home / "ws"
     runtime.mkdir(exist_ok=True)

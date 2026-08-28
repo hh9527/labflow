@@ -229,12 +229,50 @@ assets = ["feedback.md"]
                     "OPENCODE_CONFIG": str(home / "ws/opencode.json"),
                     "OPENCODE_CONFIG_DIR": str(home / "ws/.opencode"),
                 })
-                self.assertFalse((home / "active").exists())
+                self.assertTrue((home / "ctrl").is_dir())
+                self.assertFalse((home / "ctrl/active").exists())
+                self.assertFalse((home / "ctrl/supervisor").exists())
+                self.assertFalse((home / "supervisor-status.json").exists())
+                (home / "ctrl/supervisor").touch()
+                with patch("labflow.supervisor.Client", HealthyBackend):
+                    self.assertEqual(supervisor_main(["--once"]), 0)
                 self.assertEqual(status()["executions"][0]["title"], execution_id(root))
                 self.assertEqual(pull(0)["tasks"], ["tool"])
             finally:
                 os.chdir(previous)
             remove_lab(Path(config["lab_root"]))
+
+    def test_supervisor_generation_exits_when_marker_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, _, _ = prepare_execution(root, lab, 4199)
+            marker = home / "ctrl/supervisor"
+
+            for action in ("touch", "delete"):
+                with self.subTest(action=action):
+                    marker.touch()
+                    generation = marker.stat().st_mtime_ns
+                    supervisor = Supervisor(home, 4199)
+                    calls = []
+
+                    def step():
+                        calls.append(action)
+                        if action == "touch":
+                            os.utime(marker, ns=(generation + 1, generation + 1))
+                        else:
+                            marker.unlink()
+
+                    try:
+                        with patch.object(supervisor, "step", side_effect=step):
+                            supervisor.run(
+                                control_marker=marker, generation=generation,
+                            )
+                    finally:
+                        supervisor.close()
+                    self.assertEqual(calls, [action])
 
     def test_supervisor_uses_project_databases_and_recovers_root_session(self):
         class FailingWriter:
@@ -275,7 +313,7 @@ assets = ["feedback.md"]
             lab = parent / "lab"
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
-            (home / "active").touch()
+            (home / "ctrl/active").touch()
             with patch("labflow.supervisor.Client", Backend):
                 supervisor = Supervisor(home, 4199)
                 try:
@@ -359,7 +397,7 @@ assets = ["feedback.md"]
                     paused.close()
                 self.assertEqual(Backend.sessions_by_id, {})
 
-                (home / "active").touch()
+                (home / "ctrl/active").touch()
                 first = Supervisor(home, 4199)
                 try:
                     first.step()
