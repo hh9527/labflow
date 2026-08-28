@@ -254,6 +254,22 @@ def role_asset_permissions(workflow: dict[str, Any], role: str) -> dict[str, lis
     return {"read": list(read), "write": list(write)}
 
 
+def artifact_asset_permissions(
+    workflow: dict[str, Any], name: str,
+) -> dict[str, list[str]]:
+    artifact = workflow["artifacts"].get(name)
+    if artifact is None:
+        raise TaskError(f"unknown artifact: {name}", 64)
+    read: dict[str, None] = {}
+    write: dict[str, None] = {}
+    for asset in artifact["assets"]:
+        write.setdefault(asset["path"], None)
+        read.setdefault(asset["path"], None)
+    for asset in artifact["inputs"]:
+        read.setdefault(asset["path"], None)
+    return {"read": list(read), "write": list(write)}
+
+
 def find_root(start: Path) -> Path:
     current = start.resolve()
     for candidate in (current, *current.parents):

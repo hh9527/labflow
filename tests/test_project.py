@@ -12,10 +12,12 @@ from pathlib import Path
 
 from labflow.cli_host import pull, status
 from labflow.cli_lab import remove as remove_lab
-from labflow.project import execution_id, load_plan, prepare_execution
+from labflow.project import activate_plan, execution_id, load_plan, prepare_execution
+from labflow.runtime_opencode import configure_task_role, dag_hash, reset_role
 from labflow.supervisor import Supervisor, main as supervisor_main
 from labflow.task_cli import (
-    assign_task, evaluate, refresh_artifact, role_asset_permissions, submit, task_records,
+    assign_task, evaluate, load_workflow, refresh_artifact, role_asset_permissions, submit,
+    task_records,
 )
 from labflow.state import atomic_json
 from unittest.mock import patch
@@ -140,6 +142,35 @@ assets = ["feedback.md"]
             self.assertFalse((root / "artifacts").exists())
             role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
             self.assertIn('".labflow-exec/**":"deny"', role)
+            self.assertIn("你是 Labflow 角色 a1。", role)
+            self.assertNotIn("唯一任务", role)
+            self.assertNotIn('"bin/tool":"allow"', role)
+            self.assertNotIn('"src/**":"allow"', role)
+            generation = home / "roles" / dag_hash(manifest.workflow)
+            idle = generation / ".idle.a1.md"
+            self.assertTrue(idle.is_file())
+            self.assertEqual(
+                idle.stat().st_ino,
+                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+            )
+            self.assertTrue((generation / "learn.sess.a1.md").is_file())
+            self.assertTrue((generation / "work.a1.md").is_file())
+            with patch("labflow.runtime_opencode.os.link") as link:
+                reset_role(manifest, "a1", home)
+            link.assert_not_called()
+
+            configure_task_role(manifest, "a1", "learn.sess.a1", home)
+            with patch("labflow.runtime_opencode.os.link") as link:
+                configure_task_role(manifest, "a1", "learn.sess.a1", home)
+            link.assert_not_called()
+            with patch("labflow.runtime_opencode.os.link") as link:
+                activate_plan(home, manifest)
+            link.assert_not_called()
+            self.assertEqual(
+                (generation / "learn.sess.a1.md").stat().st_ino,
+                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+            )
+            reset_role(manifest, "a1", home)
             self.assertFalse((root / "opencode.json").exists())
             self.assertFalse((root / ".opencode").exists())
 
@@ -274,6 +305,70 @@ assets = ["feedback.md"]
                         supervisor.close()
                     self.assertEqual(calls, [action])
 
+    def test_active_marker_is_the_plan_activation_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, _, _ = prepare_execution(root, lab, 4199)
+            supervisor = Supervisor(home, 4199)
+            plan = root / "labflow-plan.toml"
+            active = home / "ctrl/active"
+            try:
+                plan.write_text(PLAN + '''
+
+[artifacts.hot]
+assets = ["hot.txt"]
+''', encoding="utf-8")
+                supervisor._sync_active()
+                self.assertNotIn("hot", supervisor.manifest.workflow["artifacts"])
+
+                active.touch()
+                supervisor._sync_active()
+                self.assertTrue(supervisor.active)
+                self.assertIn("hot", supervisor.manifest.workflow["artifacts"])
+                self.assertIn("hot", load_workflow(root)["artifacts"])
+
+                plan.write_text(plan.read_text(encoding="utf-8") + '''
+
+[artifacts.later]
+assets = ["later.txt"]
+''', encoding="utf-8")
+                supervisor._sync_active()
+                self.assertNotIn("later", supervisor.manifest.workflow["artifacts"])
+
+                supervisor.close()
+                supervisor = Supervisor(home, 4199)
+                self.assertTrue(supervisor.active)
+                self.assertNotIn("later", supervisor.manifest.workflow["artifacts"])
+
+                generation = active.stat().st_mtime_ns
+                os.utime(active, ns=(generation + 1, generation + 1))
+                supervisor._sync_active()
+                self.assertIn("later", supervisor.manifest.workflow["artifacts"])
+
+                plan.write_text("invalid = true\n", encoding="utf-8")
+                generation = active.stat().st_mtime_ns
+                os.utime(active, ns=(generation + 1, generation + 1))
+                supervisor._sync_active()
+                self.assertFalse(supervisor.active)
+                self.assertIsNotNone(supervisor.plan_error)
+                self.assertIn("later", supervisor.manifest.workflow["artifacts"])
+
+                supervisor.close()
+                supervisor = Supervisor(home, 4199)
+                self.assertFalse(supervisor.active)
+                self.assertIsNotNone(supervisor.plan_error)
+                self.assertIn("later", supervisor.manifest.workflow["artifacts"])
+
+                active.unlink()
+                supervisor._sync_active()
+                self.assertFalse(supervisor.active)
+                self.assertIsNone(supervisor.plan_error)
+            finally:
+                supervisor.close()
+
     def test_supervisor_uses_project_databases_and_recovers_root_session(self):
         class FailingWriter:
             def check(self):
@@ -407,6 +502,17 @@ assets = ["feedback.md"]
                 self.assertEqual(len(Backend.prompts), 1)
                 self.assertIn("依赖 Artifact：tool (本轮更新)", Backend.prompts[0][2])
                 self.assertIn("输入资产：bin/tool (本轮更新)", Backend.prompts[0][2])
+                self.assertIn("Learn it.", Backend.prompts[0][2])
+                scoped_role = (home / "ws/.opencode/agents/a1.md").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn('"bin/tool":"allow"', scoped_role)
+                self.assertNotIn('"src/**":"allow"', scoped_role)
+                generation = home / "roles" / dag_hash(first.manifest.workflow)
+                self.assertEqual(
+                    (generation / "learn.sess.a1.md").stat().st_ino,
+                    (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+                )
 
                 restarted = Supervisor(home, 4199)
                 try:
@@ -425,6 +531,14 @@ assets = ["feedback.md"]
             self.assertTrue((home / "artifacts" / "learn.sess.a1").is_file())
             self.assertFalse((home / "working").exists())
             self.assertEqual(task_records(root)["active"][0]["artifacts"], ["work.a1"])
+            work_role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
+            self.assertIn('"docs/**":"allow"', work_role)
+            self.assertIn('"src/**":"allow"', work_role)
+            self.assertNotIn('"bin/tool":"allow"', work_role)
+            self.assertEqual(
+                (generation / "work.a1.md").stat().st_ino,
+                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+            )
             Backend.message_id = "message-2"
             with patch("labflow.supervisor.Client", Backend):
                 incomplete = Supervisor(home, 4199)
@@ -442,6 +556,13 @@ assets = ["feedback.md"]
                 finally:
                     completed.close()
             self.assertTrue((home / "artifacts" / "work.a1").is_file())
+            idle_role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
+            self.assertNotIn('"docs/**":"allow"', idle_role)
+            self.assertNotIn('"src/**":"allow"', idle_role)
+            self.assertEqual(
+                (generation / ".idle.a1.md").stat().st_ino,
+                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+            )
 
 
 if __name__ == "__main__":

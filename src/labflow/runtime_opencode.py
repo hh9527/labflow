@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .config import Manifest, sha256
 from .state import atomic_json, atomic_write
-from .task_cli import role_asset_permissions
+from .task_cli import TaskError, artifact_asset_permissions
 
 
 MODEL = "deepseek/deepseek-v4-flash"
@@ -91,15 +94,6 @@ def _role_permission(role: dict[str, Any], assets: dict[str, list[str]],
     }
 
 
-def _dag_role_protocol(role: str) -> str:
-    return (
-        "\n\n# Labflow Supervisor 协议\n\n"
-        "Supervisor 每次直接投递一个 Artifact 任务。一次只处理题面指定的任务，在角色权限"
-        "允许的资产内完成交付。完成工作或确信无法继续后直接结束本次执行。Supervisor 负责"
-        "校验资产、结算 Artifact，并在新任务可执行时再次投递。\n"
-    )
-
-
 def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str:
     return "\n".join([
         "---",
@@ -126,12 +120,107 @@ def _coordinator(manifest: Manifest) -> str:
                         "primary", permission) + body + "\n"
 
 
-def generate(manifest: Manifest, workspace: Path,
-             runtime_root: Path | None = None) -> dict[str, str]:
+def _task_commands(manifest: Manifest, artifact: dict[str, Any]) -> list[str]:
+    commands: list[str] = []
+    for item in artifact["inputs"]:
+        value = item["path"].rstrip("/")
+        candidate = manifest.root / value
+        if candidate.is_file() and candidate.stat().st_mode & 0o111:
+            for command in (value, f"./{value}"):
+                pattern = f"{command} *"
+                if pattern not in commands:
+                    commands.append(pattern)
+    return commands
+
+
+def dag_hash(workflow: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        workflow, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _role_content(
+    manifest: Manifest, name: str,
+    assets: dict[str, list[str]], commands: list[str],
+) -> bytes:
+    role = manifest.roles[name]
+    permission = _role_permission({**role, "commands": commands}, assets)
+    permission["bash"]["labflow agent *"] = "deny"
+    permission["bash"]["./labflow agent *"] = "deny"
+    return (_frontmatter(role["description"], "subagent", permission)
+            + str(role["prompt"]).rstrip() + "\n").encode()
+
+
+def _same_file(source: Path, target: Path) -> bool:
+    try:
+        source_stat = source.stat()
+        target_stat = target.stat()
+    except FileNotFoundError:
+        return False
+    return ((source_stat.st_dev, source_stat.st_ino)
+            == (target_stat.st_dev, target_stat.st_ino))
+
+
+def _write_snapshot(path: Path, content: bytes) -> Path:
+    try:
+        if path.read_bytes() == content:
+            return path
+    except FileNotFoundError:
+        pass
+    atomic_write(path, content, 0o444)
+    return path
+
+
+def _activate_role(source: Path, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if _same_file(source, target):
+        return target
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    os.close(fd)
+    os.unlink(temporary)
+    try:
+        os.link(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return target
+
+
+def _role_generation(manifest: Manifest, execution_home: Path) -> Path:
+    return execution_home / "roles" / dag_hash(manifest.workflow)
+
+
+def reset_role(manifest: Manifest, name: str, execution_home: Path) -> None:
+    if name not in manifest.roles:
+        return
+    generation = _role_generation(manifest, execution_home)
+    _activate_role(
+        generation / f".idle.{name}.md",
+        execution_home / "ws" / ".opencode" / "agents" / f"{name}.md",
+    )
+
+
+def configure_task_role(
+    manifest: Manifest, role: str, artifact_name: str, execution_home: Path,
+) -> None:
+    artifact = manifest.workflow["artifacts"].get(artifact_name)
+    if artifact is None or artifact["owner"] != role or role not in manifest.roles:
+        raise TaskError(f"artifact is not owned by {role}: {artifact_name}", 64)
+    _activate_role(
+        _role_generation(manifest, execution_home) / f"{artifact_name}.md",
+        execution_home / "ws" / ".opencode" / "agents" / f"{role}.md",
+    )
+
+
+def generate(manifest: Manifest, execution_home: Path) -> dict[str, str]:
     """Generate the complete OpenCode adapter from a runtime-neutral plan."""
-    runtime_root = workspace if runtime_root is None else runtime_root
+    runtime_root = execution_home / "ws"
     agents = runtime_root / ".opencode" / "agents"
     agents.mkdir(parents=True, exist_ok=True)
+    generation = _role_generation(manifest, execution_home)
+    generation.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
     config = runtime_root / "opencode.json"
     atomic_json(config, {
@@ -144,15 +233,28 @@ def generate(manifest: Manifest, workspace: Path,
     coordinator = agents / "coordinator.md"
     atomic_write(coordinator, _coordinator(manifest).encode(), 0o444)
     generated.append(coordinator)
-    for name, role in manifest.roles.items():
-        instructions = str(role["prompt"]) + _dag_role_protocol(name)
-        assets = role_asset_permissions(manifest.workflow, name)
-        permission = _role_permission(role, assets)
-        permission["bash"]["labflow agent *"] = "deny"
-        permission["bash"]["./labflow agent *"] = "deny"
-        text = (_frontmatter(role["description"], "subagent", permission)
-                + instructions.rstrip() + "\n")
-        path = agents / f"{name}.md"
-        atomic_write(path, text.encode(), 0o444)
-        generated.append(path)
-    return {str(path.relative_to(runtime_root)): sha256(path) for path in generated}
+    for name in manifest.roles:
+        idle = generation / f".idle.{name}.md"
+        _write_snapshot(
+            idle, _role_content(manifest, name, {"read": [], "write": []}, []),
+        )
+        snapshots = [idle]
+        for artifact_name, artifact in manifest.workflow["artifacts"].items():
+            if artifact["owner"] != name:
+                continue
+            snapshot = generation / f"{artifact_name}.md"
+            _write_snapshot(snapshot, _role_content(
+                manifest, name,
+                artifact_asset_permissions(manifest.workflow, artifact_name),
+                _task_commands(manifest, artifact),
+            ))
+            snapshots.append(snapshot)
+        target = agents / f"{name}.md"
+        if not any(_same_file(snapshot, target) for snapshot in snapshots):
+            _activate_role(idle, target)
+        generated.append(target)
+    expected = set(generated)
+    for path in agents.glob("*.md"):
+        if path not in expected and path.is_file() and not path.is_symlink():
+            path.unlink()
+    return {str(path.relative_to(execution_home)): sha256(path) for path in generated}

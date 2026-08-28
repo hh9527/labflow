@@ -201,8 +201,8 @@ def load_plan(path: Path | None = None) -> Manifest:
                         if pattern not in commands:
                             commands.append(pattern)
         role_configs[role] = {
-            "description": f"完成分配给 {role} 的 Artifact 任务。",
-            "prompt": f"你是 Labflow 角色 {role}。只处理 Supervisor 当前分配的唯一任务。",
+            "description": f"Labflow 角色 {role}。",
+            "prompt": f"你是 Labflow 角色 {role}。",
             "commands": commands,
             "preflight": [],
         }
@@ -255,6 +255,23 @@ def get_state(home: Path, key: str, default: Any = None) -> Any:
     return default if row is None else json.loads(row[0])
 
 
+def activate_plan(home: Path, manifest: Manifest) -> None:
+    runtime_workflow = json.loads(json.dumps(manifest.workflow))
+    for artifact in runtime_workflow["artifacts"].values():
+        artifact.pop("owner", None)
+        for field in ("inputs", "assets", "check"):
+            artifact[field] = [item["path"] for item in artifact[field]]
+    from .runtime_opencode import generate
+    generate(manifest, home)
+    atomic_json(home / "runtime.json", {
+        "schema": "labflow.project-runtime/v1",
+        "plan_id": manifest.plan_id,
+        "roles": manifest.roles,
+        "workflow": runtime_workflow,
+        "execution": manifest.execution,
+    })
+
+
 def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, Manifest, dict[str, Any]]:
     root = project.resolve(strict=True)
     manifest = load_plan(root / PLAN_NAME)
@@ -287,21 +304,16 @@ def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, M
             if existing.get(key) != config[key]:
                 raise ControlError(f"execution configuration disagrees on {key}")
     atomic_json(existing_path, config)
-    runtime_workflow = json.loads(json.dumps(manifest.workflow))
-    for artifact in runtime_workflow["artifacts"].values():
-        artifact.pop("owner", None)
-    atomic_json(home / "runtime.json", {
-        "schema": "labflow.project-runtime/v1",
-        "plan_id": manifest.plan_id,
-        "workflow": runtime_workflow,
-        "execution": manifest.execution,
-    })
-    from .runtime_opencode import generate
-    generate(manifest, root, runtime)
+    activate_plan(home, manifest)
     connection = sqlite3.connect(home / "states.sqlite")
     try:
         connection.execute(
             "INSERT OR IGNORE INTO state(key, value) VALUES ('root_session_id', 'null')"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO state(key, value) VALUES "
+            "('active_control', '{\"applied_mtime_ns\":null,\"error\":null,"
+            "\"observed_mtime_ns\":null}')"
         )
         connection.commit()
     finally:
@@ -322,4 +334,25 @@ def load_execution(project: Path | None = None) -> tuple[Path, Manifest, dict[st
             or config.get("project_home") != str(root)
             or config.get("execution_id") != execution_id(root)):
         raise ControlError("invalid project execution configuration")
-    return home, load_plan(root / PLAN_NAME), config
+    try:
+        runtime = json.loads((home / "runtime.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ControlError(f"missing activated project runtime: {home}", 75) from None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"invalid activated project runtime: {exc}") from None
+    if (not isinstance(runtime, dict)
+            or runtime.get("schema") != "labflow.project-runtime/v1"
+            or runtime.get("plan_id") != config["execution_id"]):
+        raise ControlError("invalid activated project runtime")
+    try:
+        workflow = validate_workflow(runtime.get("workflow"))
+    except TaskError as exc:
+        raise ControlError(f"invalid activated workflow: {exc}") from None
+    roles = runtime.get("roles")
+    execution = runtime.get("execution")
+    if (not isinstance(roles, dict) or set(roles) != set(workflow["roles"])
+            or not all(isinstance(value, dict) for value in roles.values())
+            or not isinstance(execution, dict)):
+        raise ControlError("invalid activated project runtime")
+    manifest = Manifest(config["execution_id"], root, roles, workflow, execution)
+    return home, manifest, config

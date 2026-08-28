@@ -90,8 +90,15 @@ OPENCODE_CONFIG_DIR=<prj-home>/.labflow-exec/ws/.opencode
 `events.sqlite` stores the summarized event stream. Artifact facts remain empty timestamped files so
 the Host can publish one directly with `touch .labflow-exec/artifacts/<artifact>`.
 
-Removing `.labflow-exec/ctrl/active` pauses new scheduling effects; recreating it resumes
-reconciliation. One `labflow supervisor` invocation runs one generation: it records the mtime of
+`ctrl/active` is also the Plan activation boundary. While it is absent, Supervisor observes and
+settles existing work but creates no new Session or prompt effects. Creating it or changing its mtime
+causes Supervisor to reread `labflow-plan.toml`, regenerate `runtime.json` and OpenCode Agent files,
+and atomically switch to the new DAG. Editing the Plan without touching `ctrl/active` has no effect.
+Deleting the marker stops new scheduling without discarding the last valid Plan. An invalid Plan
+leaves scheduling stopped and appears as `plan_error` in `supervisor-status.json` until the Plan is
+fixed and `ctrl/active` is touched again.
+
+One `labflow supervisor` invocation runs one generation: it records the mtime of
 `ctrl/supervisor`, then exits when that marker is touched or deleted. If the marker is absent, the
 command only prepares the execution and returns. A process-independent shell loop can keep it
 available:
@@ -161,6 +168,15 @@ The Supervisor maintains one long-lived Session per role. It creates a task reco
 and `check` after the turn, and refreshes the Artifact marker on success. Each task description lists
 its resolved `inputs`; `updated` means that the file or directory tree changed after that role's
 previous task ended. Input Asset changes never trigger a task by themselves.
+
+Generated role files contain only the stable role identity and contain no task instructions. On Plan
+activation, Supervisor writes immutable permission snapshots for every role-owned Artifact under
+`.labflow-exec/roles/<dag-hash>/`, plus a deny-all snapshot for each role. Immediately before each
+dispatch, it atomically replaces `.labflow-exec/ws/.opencode/agents/<role>.md` with a hard link to the
+selected snapshot: resolved `inputs` plus `assets` are readable, only `assets` are writable, and
+executable inputs provide that task's command allowlist. A settled task links the role back to its
+deny-all identity. Supervisor supplies the selected Artifact's complete `goal`, dependencies, and
+resolved input list in the task prompt.
 
 ## Development
 

@@ -18,11 +18,11 @@ from typing import Any, Iterator
 from .client import Client
 from .config import ControlError
 from .events import pending_optional_requests, pending_requests
-from .runtime_opencode import resume_prompt
+from .runtime_opencode import configure_task_role, reset_role, resume_prompt
 from .state import atomic_json
 from .task_cli import (
     TaskError, assign_task, clear_session_qualifications, submit, task_records,
-    workflow_status,
+    supersede_role_task, workflow_status,
 )
 from .timeline_projection import closed_message_events
 from .timeline_store import TimelineWriter
@@ -237,7 +237,7 @@ def control_mtime(path: Path) -> int | None:
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(value.st_mode):
-        raise ControlError(f"Supervisor control marker is not a regular file: {path}")
+        raise ControlError(f"control marker is not a regular file: {path}")
     return value.st_mtime_ns
 
 
@@ -438,7 +438,30 @@ class Supervisor:
             raise ControlError(f"invalid execution home: {self.root}", 64)
         self.server_url = f"http://127.0.0.1:{port}"
         self.poll_interval = poll_interval
-        from .project import get_state
+        from .project import get_state, load_execution
+        _, self.manifest, self.config = load_execution(self.root.parent)
+        if self.config["port"] != port:
+            raise ControlError(
+                f"execution is configured for port {self.config['port']}, not {port}", 64
+            )
+        control = get_state(self.root, "active_control", {})
+        if not isinstance(control, dict):
+            raise ControlError("invalid active control state")
+        observed = control.get("observed_mtime_ns")
+        applied = control.get("applied_mtime_ns")
+        error = control.get("error")
+        if ((observed is not None and not isinstance(observed, int))
+                or (applied is not None and not isinstance(applied, int))
+                or (error is not None and not isinstance(error, str))):
+            raise ControlError("invalid active control state")
+        self.active_mtime: int | None = observed
+        self.applied_active_mtime: int | None = applied
+        self.plan_error: str | None = error
+        current_active = control_mtime(self.root / "ctrl" / "active")
+        self.active = bool(
+            current_active is not None and current_active == observed == applied
+            and error is None
+        )
         self.state = _state_load(get_state(self.root, "supervisor_state"))
         self.event_error: str | None = None
         try:
@@ -465,30 +488,62 @@ class Supervisor:
             self.writer = None
 
     def _desired(self) -> dict[str, Path]:
+        return {self.manifest.plan_id: self.root}
+
+    def _store_active_control(self) -> None:
+        from .project import set_state
+        set_state(self.root, "active_control", {
+            "observed_mtime_ns": self.active_mtime,
+            "applied_mtime_ns": self.applied_active_mtime,
+            "error": self.plan_error,
+        })
+
+    def _sync_active(self) -> None:
+        marker = self.root / "ctrl" / "active"
+        current = control_mtime(marker)
+        if current == self.active_mtime:
+            return
+        self.active_mtime = current
+        self.active = False
+        if current is None:
+            self.plan_error = None
+            self._store_active_control()
+            return
         try:
-            from .project import load_execution
-            _, manifest, _ = load_execution(self.root.parent)
-        except ControlError:
-            return {}
-        return {manifest.plan_id: self.root}
+            from .project import activate_plan, load_plan
+            manifest = load_plan(self.manifest.root / "labflow-plan.toml")
+            activate_plan(self.root, manifest)
+        except (ControlError, OSError, ValueError) as exc:
+            self.plan_error = str(exc)
+            self._store_active_control()
+            return
+        previous_revision = _workflow_revision(self.manifest.workflow)
+        current_revision = _workflow_revision(manifest.workflow)
+        if current_revision != previous_revision:
+            for role in set(self.manifest.workflow["roles"]) | set(manifest.workflow["roles"]):
+                supersede_role_task(self.manifest.root, role, "Plan was reloaded")
+        self.manifest = manifest
+        self.applied_active_mtime = current
+        self.plan_error = None
+        self.active = True
+        self._store_active_control()
 
     def _execution_event(self, title: str, desired: Path) -> tuple[LifecycleEvent, dict[str, Any]]:
-        from .project import get_state, load_execution
-        _, manifest, config = load_execution(desired.parent)
+        from .project import get_state
+        manifest, config = self.manifest, self.config
         value = {
             "title": title,
             "workspace": str(manifest.root),
             "session_id": get_state(desired, "root_session_id"),
             "workflow": manifest.workflow,
             "execution": manifest.execution,
-            "phase": "active" if (desired / "ctrl" / "active").is_file() else "idle",
+            "phase": "active" if self.active else "idle",
             "server_url": self.server_url,
             "lab_root": config["lab_root"],
         }
         workflow = value.get("workflow")
         roles = tuple(workflow.get("roles", ())) if isinstance(workflow, dict) else ()
-        active = ((desired / "ctrl" / "active").is_file()
-                  and value.get("phase") in {"ready", "active", "idle"})
+        active = self.active and value.get("phase") in {"ready", "active", "idle"}
         event = LifecycleEvent("execution_updated", title, {
             "workspace": value["workspace"],
             "root_session_id": value.get("session_id"),
@@ -504,12 +559,12 @@ class Supervisor:
         return self.root
 
     def _ensure_root_session(self) -> None:
-        from .project import get_state, load_execution, set_state
-        if not (self.root / "ctrl" / "active").is_file():
+        from .project import get_state, set_state
+        if not self.active:
             return
         if get_state(self.root, "root_session_id") is not None:
             return
-        _, manifest, _ = load_execution(self.root.parent)
+        manifest = self.manifest
         client = Client(self.server_url, str(manifest.root))
         client.health()
         candidates = [
@@ -786,6 +841,8 @@ class Supervisor:
                                 self.state.executions[title].sessions.setdefault(
                                     role, SessionState(role, role)
                                 ).error = str(exc)
+                            else:
+                                reset_role(self.manifest, role, self.root)
                     effects.extend(reduce(self.state, LifecycleEvent(
                         "session_observed", title, {
                             "role": role, "title": session["title"],
@@ -817,6 +874,7 @@ class Supervisor:
                 backend_id = effect.backend_id
                 delivered = True
                 if effect.kind == "create_session":
+                    reset_role(self.manifest, effect.role, self.root)
                     if execution.workflow is not None:
                         clear_session_qualifications(
                             Path(execution.workspace), execution.workflow, effect.role,
@@ -837,6 +895,10 @@ class Supervisor:
                     )
                     delivered = task is not None
                     if task is not None:
+                        configure_task_role(
+                            self.manifest, effect.role, effect.artifact,
+                            self.root,
+                        )
                         session = execution.sessions.setdefault(
                             effect.role, SessionState(effect.role, effect.role)
                         )
@@ -875,6 +937,7 @@ class Supervisor:
             "schema": "labflow.supervisor-status/v1",
             "updated_at": int(time.time() * 1000),
             "event_error": self.event_error,
+            "plan_error": self.plan_error,
             "executions": [{
                 "title": execution.title,
                 "dag": execution.dag,
@@ -912,6 +975,7 @@ class Supervisor:
             atomic_json(path, value)
 
     def step(self) -> None:
+        self._sync_active()
         if self.writer is not None:
             try:
                 self.writer.check()
