@@ -615,6 +615,35 @@ assets = ["later.txt"]
             self.assertEqual(task_records(root)["active"], [])
             self.assertEqual(task_records(root)["history"][0]["status"], "stale")
 
+    def test_unchanged_plan_reload_preserves_active_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, manifest, _ = prepare_execution(root, lab, 4199)
+            refresh_artifact(root, manifest.workflow, "tool")
+            assign_task(root, manifest.workflow, "a1", "learn.sess.a1")
+            assigned_id = task_records(root)["active"][0]["task_id"]
+            previous = dag_hash(manifest)
+
+            active = home / "artifacts/_active"
+            active.touch()
+            supervisor = Supervisor(home, 4199)
+            try:
+                supervisor._sync_active()
+                generation = active.stat().st_mtime_ns
+                os.utime(active, ns=(generation + 1, generation + 1))
+                supervisor._sync_active()
+                execution = supervisor.state.executions[execution_id(root)]
+            finally:
+                supervisor.close()
+
+            self.assertEqual(execution.dag_revision, previous)
+            records = task_records(root)
+            self.assertEqual(records["history"], [])
+            self.assertEqual(records["active"][0]["task_id"], assigned_id)
+
     def test_supervisor_uses_project_databases_and_recovers_root_session(self):
         class FailingWriter:
             def check(self):

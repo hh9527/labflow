@@ -941,6 +941,8 @@ class Supervisor:
         manifest, config = self.manifest, self.config
         known = self.state.executions.get(title)
         current_workflow = known.workflow if known is not None else manifest.workflow
+        current_revision = (known.dag_revision if known is not None
+                            else dag_hash(manifest))
         value = {
             "title": title,
             "workspace": str(manifest.root),
@@ -962,7 +964,7 @@ class Supervisor:
             "dag": (desired / "artifacts").is_dir() and isinstance(workflow, dict),
             "roles": roles,
             "workflow": workflow,
-            "dag_revision": _workflow_revision(workflow),
+            "dag_revision": current_revision,
         })
         return event, value
 
@@ -979,6 +981,9 @@ class Supervisor:
                 )
         required = pending_requests(workflow, artifacts)
         optional = pending_optional_requests(workflow, artifacts)
+        execution = self.state.executions.get(title)
+        revision = (execution.dag_revision if execution is not None
+                    else _workflow_revision(workflow))
         return LifecycleEvent("workflow_observed", title, {
             "runnable": runnable,
             "requests": required,
@@ -987,7 +992,7 @@ class Supervisor:
                 name: int(artifacts["artifacts"][name]["input_mtime_ns"])
                 for name in (*required, *optional)
             },
-            "dag_revision": _workflow_revision(workflow),
+            "dag_revision": revision,
         })
 
     def _dag_revision_record(self, title: str, workflow: LifecycleEvent) -> dict[str, Any]:
