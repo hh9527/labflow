@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from .client import Client
+from .client import Client, OpenCodeNotFound
 from .config import ControlError
 from .events import pending_optional_requests, pending_requests
 from .runtime_opencode import dag_hash, resume_prompt
@@ -370,7 +370,8 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         role = str(event.data["role"])
         session = execution.sessions.setdefault(role, SessionState(role, role))
         # A successful create may precede visibility in the backend's child index.
-        if session.backend_id is not None and not session.observed:
+        if (session.backend_id is not None and not session.observed
+                and not event.data.get("confirmed")):
             return []
         if session.status not in ("missing", "failed"):
             session.missing_epoch += 1
@@ -414,7 +415,14 @@ def _session_tree(client: Client, root_id: str, root_title: str,
     seen = {root_id}
     while pending:
         parent = pending.pop()
-        for child in client.children(parent):
+        try:
+            children = client.children(parent)
+        except OpenCodeNotFound:
+            if parent == root_id:
+                raise
+            output = [session for session in output if session["id"] != parent]
+            continue
+        for child in children:
             session_id = child.get("id")
             if not isinstance(session_id, str) or session_id in seen:
                 continue
@@ -775,10 +783,17 @@ class Supervisor:
         effects: list[Effect] = []
         completed_turns: set[str] = set()
         stopped_at: dict[str, int] = {}
+        disappeared: set[str] = set()
         for session in sessions:
             session_id = session["id"]
             role = session["role"]
-            messages = client.session_messages(session_id)
+            try:
+                messages = client.session_messages(session_id)
+            except OpenCodeNotFound:
+                # A child can disappear after the tree snapshot. Exclude it
+                # from this observation so the role is reconciled as missing.
+                disappeared.add(session_id)
+                continue
             created = [
                 int(message.get("info", {}).get("time", {}).get("created"))
                 for message in messages
@@ -817,10 +832,17 @@ class Supervisor:
                 self.state.seen_messages.add(identity)
         if self.state.executions[title].dag:
             for role in self.state.executions[title].roles:
-                matches = [session for session in sessions if session["role"] == role]
+                matches = [session for session in sessions
+                           if session["role"] == role and session["id"] not in disappeared]
                 if not matches:
                     effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_missing", title, {"role": role},
+                        "session_missing", title, {
+                            "role": role,
+                            "confirmed": any(
+                                session["role"] == role and session["id"] in disappeared
+                                for session in sessions
+                            ),
+                        },
                     )))
                 elif len(matches) == 1:
                     session = matches[0]

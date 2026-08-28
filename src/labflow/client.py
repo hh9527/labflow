@@ -10,6 +10,10 @@ from typing import Any, Iterator
 from .config import ControlError
 
 
+class OpenCodeNotFound(ControlError):
+    """An OpenCode resource disappeared while it was being observed."""
+
+
 class Client:
     def __init__(self, server_url: str, workspace: str, session_id: str | None = None, timeout: float = 5):
         parsed = urllib.parse.urlsplit(server_url)
@@ -31,6 +35,13 @@ class Client:
                 with opener.open(request, timeout=timeout or self.timeout) as response:
                     raw = response.read()
                 break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    raise OpenCodeNotFound(
+                        f"opencode resource not found: {path.split('?', 1)[0]}", 69
+                    ) from None
+                error = exc
+                if attempt < 3: time.sleep(.15 * (attempt + 1))
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 error = exc
                 if attempt < 3: time.sleep(.15 * (attempt + 1))

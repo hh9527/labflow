@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from labflow.client import OpenCodeNotFound
 from labflow.cli_host import pull, status
 from labflow.cli_init import generate as generate_launcher
 from labflow.cli_lab import remove as remove_lab
@@ -614,6 +615,78 @@ assets = ["later.txt"]
             self.assertEqual(Backend.created, 2)
             projection = json.loads((home / "supervisor-status.json").read_text())
             self.assertIn("event store unavailable", projection["event_error"])
+
+    def test_disappearing_child_session_does_not_stop_supervisor(self):
+        class Backend:
+            sessions_by_id = {}
+            created = 0
+            disappear_id = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def health(self):
+                return {"healthy": True}
+
+            def sessions(self):
+                return list(Backend.sessions_by_id.values())
+
+            def create_session(self, title, parent_id=None, agent=None):
+                Backend.created += 1
+                identity = f"session-{Backend.created}"
+                value = {"id": identity, "title": title, "agent": agent}
+                if parent_id is not None:
+                    value["parentID"] = parent_id
+                Backend.sessions_by_id[identity] = value
+                return value
+
+            def children(self, session_id):
+                return [item for item in Backend.sessions_by_id.values()
+                        if item.get("parentID") == session_id]
+
+            def statuses(self):
+                return {identity: {"type": "idle"} for identity in Backend.sessions_by_id}
+
+            def session_messages(self, session_id):
+                if session_id == Backend.disappear_id:
+                    Backend.sessions_by_id.pop(session_id)
+                    Backend.disappear_id = None
+                    raise OpenCodeNotFound("session disappeared", 69)
+                return []
+
+            def prompt_session(self, session_id, text, agent=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, manifest, _ = prepare_execution(root, lab, 4199)
+            refresh_artifact(root, manifest.workflow, "tool")
+            (home / "ctrl/active").touch()
+
+            with patch("labflow.supervisor.Client", Backend):
+                supervisor = Supervisor(home, 4199)
+                try:
+                    supervisor.step()
+                    old_role = next(
+                        identity for identity, session in Backend.sessions_by_id.items()
+                        if session.get("agent") == "a1"
+                    )
+                    Backend.disappear_id = old_role
+                    supervisor.step()
+                    for _ in range(3):
+                        supervisor.step()
+                finally:
+                    supervisor.close()
+
+            role_sessions = [
+                identity for identity, session in Backend.sessions_by_id.items()
+                if session.get("agent") == "a1"
+            ]
+            self.assertEqual(len(role_sessions), 1)
+            self.assertNotEqual(role_sessions[0], old_role)
 
     def test_pause_and_restart_do_not_duplicate_sessions_or_prompts(self):
         class Backend:
