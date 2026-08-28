@@ -12,7 +12,7 @@ from typing import Any
 
 from .config import ControlError, Manifest
 from .state import atomic_json, atomic_write
-from .task_cli import TaskError, validate_workflow
+from .task_cli import TaskError, validate_role_permissions, validate_workflow
 
 
 PLAN_NAME = "labflow-plan.toml"
@@ -148,7 +148,7 @@ def load_plan(path: Path | None = None) -> Manifest:
     for name, raw in raw_artifacts.items():
         if not isinstance(raw, dict):
             raise ControlError(f"artifact {name} must be a table")
-        unknown = set(raw) - {"goal", "requires", "inputs", "assets", "check", "commands"}
+        unknown = set(raw) - {"goal", "requires", "inputs", "assets", "check"}
         if unknown:
             raise ControlError(
                 f"unknown artifact {name} key(s): {', '.join(sorted(unknown))}"
@@ -182,7 +182,6 @@ def load_plan(path: Path | None = None) -> Manifest:
             "requires": _strings(raw.get("requires"), f"artifact {name} requires"),
             "assets": assets,
             "check": checks,
-            "commands": _commands(raw.get("commands"), f"artifact {name} commands"),
         }
         if inputs is not None:
             artifacts[name]["inputs"] = inputs
@@ -203,12 +202,17 @@ def load_plan(path: Path | None = None) -> Manifest:
     if unknown_roles:
         raise ControlError(f"unknown role(s): {', '.join(sorted(unknown_roles))}")
     for role in roles:
-        raw_role = raw_roles.get(role, {})
+        raw_role = raw_roles.get(role)
         if not isinstance(raw_role, dict):
             raise ControlError(f"role {role} must be a table")
         unknown = set(raw_role) - {"read", "write", "commands"}
         if unknown:
             raise ControlError(f"unknown role {role} key(s): {', '.join(sorted(unknown))}")
+        missing = {"read", "write", "commands"} - set(raw_role)
+        if missing:
+            raise ControlError(
+                f"role {role} must explicitly define: {', '.join(sorted(missing))}"
+            )
         read = _strings(raw_role.get("read"), f"role {role} read")
         write = _strings(raw_role.get("write"), f"role {role} write")
         for value in (*read, *write):
@@ -220,6 +224,11 @@ def load_plan(path: Path | None = None) -> Manifest:
             "write": write,
             "commands": _commands(raw_role.get("commands"), f"role {role} commands"),
         }
+
+    try:
+        validate_role_permissions(workflow, role_configs)
+    except TaskError as exc:
+        raise ControlError(str(exc), exc.code) from None
 
     identifier = execution_id(root)
     return Manifest(identifier, root, role_configs, workflow, {"kind": "dag-mode"})

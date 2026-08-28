@@ -10,7 +10,6 @@ from typing import Any
 
 from .config import Manifest, sha256
 from .state import atomic_json, atomic_write
-from .task_cli import role_asset_permissions
 
 
 MODEL = "deepseek/deepseek-v4-flash"
@@ -151,15 +150,6 @@ def _observer() -> str:
                         "primary", permission) + body + "\n"
 
 
-def _role_commands(manifest: Manifest, name: str) -> list[str]:
-    commands: list[str] = []
-    for artifact in manifest.workflow["artifacts"].values():
-        if artifact["owner"] != name:
-            continue
-        commands.extend(artifact["commands"])
-    return list(dict.fromkeys(commands))
-
-
 def dag_hash(manifest: Manifest) -> str:
     encoded = json.dumps(
         {"roles": manifest.roles, "workflow": manifest.workflow},
@@ -170,19 +160,11 @@ def dag_hash(manifest: Manifest) -> str:
 
 def _role_content(manifest: Manifest, name: str) -> bytes:
     role = manifest.roles[name]
-    assets = role_asset_permissions(manifest.workflow, name)
-    combined_assets = {
-        "read": list(dict.fromkeys([
-            *assets["read"], *role["read"], *role["write"],
-        ])),
-        "write": list(dict.fromkeys([*assets["write"], *role["write"]])),
+    assets = {
+        "read": list(dict.fromkeys([*role["read"], *role["write"]])),
+        "write": role["write"],
     }
-    combined_commands = list(dict.fromkeys([
-        *_role_commands(manifest, name), *role["commands"],
-    ]))
-    permission = _role_permission(
-        {**role, "commands": combined_commands}, combined_assets,
-    )
+    permission = _role_permission(role, assets)
     permission["bash"]["labflow agent *"] = "deny"
     permission["bash"]["./labflow agent *"] = "deny"
     return (_frontmatter(role["description"], "subagent", permission)

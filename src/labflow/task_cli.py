@@ -256,22 +256,43 @@ def load_workflow(root: Path) -> dict[str, Any]:
     return validate_workflow(manifest.get("workflow"))
 
 
-def role_asset_permissions(workflow: dict[str, Any], role: str) -> dict[str, list[str]]:
-    if role not in workflow["roles"]:
-        raise TaskError(f"unknown workflow role: {role}", 64)
-    read: dict[str, None] = {}
-    write: dict[str, None] = {}
-    for artifact in workflow["artifacts"].values():
-        if artifact["owner"] != role:
+def _path_permission_covers(granted: str, required: str) -> bool:
+    return granted == required or (granted.endswith("/") and required.startswith(granted))
+
+
+def validate_role_permissions(
+    workflow: dict[str, Any], roles: dict[str, dict[str, Any]],
+) -> None:
+    """Ensure every task fits within its owner's explicitly configured permissions."""
+    for name, artifact in workflow["artifacts"].items():
+        role_name = artifact["owner"]
+        if role_name == "host":
             continue
-        if artifact["goal"] is not None:
-            read.setdefault(artifact["goal"], None)
-        for asset in artifact["assets"]:
-            write.setdefault(asset["path"], None)
-            read.setdefault(asset["path"], None)
-        for asset in artifact.get("inputs", []):
-            read.setdefault(asset["path"], None)
-    return {"read": list(read), "write": list(write)}
+        role = roles[role_name]
+        readable = list(dict.fromkeys([*role["read"], *role["write"]]))
+        required_read = [
+            *([artifact["goal"]] if artifact["goal"] is not None else []),
+            *(item["path"] for item in artifact["inputs"]),
+            *(item["path"] for item in artifact["assets"]),
+        ]
+        required_write = [item["path"] for item in artifact["assets"]]
+        missing_read = [
+            path for path in dict.fromkeys(required_read)
+            if not any(_path_permission_covers(granted, path) for granted in readable)
+        ]
+        missing_write = [
+            path for path in dict.fromkeys(required_write)
+            if not any(_path_permission_covers(granted, path) for granted in role["write"])
+        ]
+        missing = [
+            *(f"read {path!r}" for path in missing_read),
+            *(f"write {path!r}" for path in missing_write),
+        ]
+        if missing:
+            raise TaskError(
+                f"role {role_name} lacks permissions required by artifact {name}: "
+                + ", ".join(missing)
+            )
 
 
 def artifact_asset_permissions(

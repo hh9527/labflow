@@ -10,7 +10,7 @@ from pathlib import Path
 from labflow.task_cli import (
     TaskError, assign_task, clear_session_qualifications, evaluate, load_workflow,
     parser, refresh_artifact, remove_artifact, restore_artifacts,
-    role_asset_permissions, submit, task_records, validate_workflow,
+    submit, task_records, validate_workflow,
 )
 
 
@@ -139,36 +139,6 @@ class ArtifactWorkflowTest(unittest.TestCase):
             result = assign_task(root, workflow, "a1", "work.a1")
             assert result is not None
             self.assertEqual(result["inputs"], [{"path": "shared.txt", "updated": True}])
-
-    def test_role_permissions_are_derived_from_owned_and_input_assets(self):
-        workflow = validate_workflow({
-            "schema": "labflow.workflow/v1", "roles": ["a1", "a2"],
-            "artifacts": {
-                "input.a2": {"desc": "input", "assets": ["model/"],
-                             "goal": "goal.md"},
-                "output.a1": {"desc": "output", "requires": ["input.a2"],
-                              "assets": ["result.json"],
-                              "goal": "goal.md"},
-            },
-        })
-        self.assertEqual(role_asset_permissions(workflow, "a1"), {
-            "read": ["goal.md", "result.json", "model/"],
-            "write": ["result.json"],
-        })
-        self.assertEqual(role_asset_permissions(workflow, "a2"), {
-            "read": ["goal.md", "model/"], "write": ["model/"],
-        })
-
-        explicit_empty = json.loads(json.dumps(workflow))
-        for artifact in explicit_empty["artifacts"].values():
-            artifact.pop("owner")
-            for field in ("inputs", "assets", "check"):
-                artifact[field] = [item["path"] for item in artifact[field]]
-        explicit_empty["artifacts"]["output.a1"]["inputs"] = []
-        explicit_empty = validate_workflow(explicit_empty)
-        self.assertEqual(role_asset_permissions(explicit_empty, "a1"), {
-            "read": ["goal.md", "result.json"], "write": ["result.json"],
-        })
 
     def test_assignment_returns_none_when_target_is_not_runnable(self):
         with tempfile.TemporaryDirectory() as temporary:

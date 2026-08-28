@@ -163,9 +163,9 @@ to that role Session.
 
 ```toml
 [roles.builder]
-read = ["shared/"]
-write = ["scratch/builder/"]
-commands = ["telora --help", "telora -C *"]
+read = ["goals/", "bin/tool", "docs/", "shared/"]
+write = ["src/", "scratch/builder/"]
+commands = ["telora --help", "telora -C *", "project-tool verify *"]
 
 [artifacts.tool]
 assets = ["bin/tool"]
@@ -180,7 +180,6 @@ requires = ["learn.sess.builder", "feedback?"]
 inputs = ["docs/"]
 assets = ["src/"]
 check = ["src/result.txt"]
-commands = ["project-tool verify *"]
 
 [artifacts.feedback]
 assets = ["feedback.md"]
@@ -190,18 +189,19 @@ Fields have distinct meanings:
 
 - `requires` defines the Artifact DAG, task triggering, and freshness. A trailing `?` makes a
   dependency optional.
-- `assets` describes the current Artifact's output range and grants write access to its owner.
+- `assets` describes the current Artifact's output range.
 - `inputs` is the task's read list. When omitted, it is the deduplicated union of the direct
   `requires` Artifacts' `assets`; an explicit value, including `[]`, replaces that default.
 - `check` lists paths that must exist before the Artifact can settle.
 - `goal` is the task document used for a role-owned Artifact.
-- `commands` adds shell command patterns to the owning role. Executable inputs remain subject to the
-  role's explicitly declared command patterns.
 
-An optional `[roles.<role>]` table grants additional stable `read`, `write`, and `commands`
-permissions. Each role receives the union of the `goal`, `inputs`, `assets`, and commands from all
-Artifacts it owns; configured role permissions are appended to that union, and role `write` paths are
-also readable. A configured role must exist as an owner inferred from an Artifact suffix.
+Every inferred role must have a `[roles.<role>]` table that explicitly defines `read`, `write`, and
+`commands`, using `[]` for an empty permission set. These stable settings are the role's only
+permissions; Labflow never expands them from tasks. When loading the Plan, Labflow verifies that
+each owned Artifact's `goal`, resolved `inputs`, and `assets` are readable and its `assets` are
+writable by the role. A directory permission ending in `/` covers paths below it, and a `write` path
+is also readable. Commands come only from the role configuration and are not inferred or checked
+against individual tasks. A configured role must exist as an owner inferred from an Artifact suffix.
 
 The Supervisor maintains one long-lived Session per role. It creates a task record in
 `states.sqlite`, prompts an idle role only when one of its Artifacts is runnable, validates `assets`
@@ -221,9 +221,10 @@ and a fifteen-second maximum debounce. The committed SQLite row cursor is stored
 
 Generated role files contain only the stable role identity and contain no task instructions. On Plan
 activation, Supervisor writes one stable `.labflow-exec/ws/.opencode/agents/<role>.md` per role. Its
-permissions cover the role's complete DAG responsibility: Artifact Assets control writes; Inputs
-control `read`, `glob`, `grep`, and directory listing; Artifact and role commands extend the command
-allowlist. Task dispatch never replaces a role file. OpenCode must be restarted after a
+permissions come only from the role table: `read` controls `read`, `glob`, `grep`, and directory
+listing; `write` controls edits and is also readable; `commands` defines the command allowlist. Plan
+validation ensures those permissions cover the role's complete DAG responsibility. Task dispatch
+never replaces a role file. OpenCode must be restarted after a
 role permission change so it reloads the agent definition. Supervisor supplies a uniform task prompt
 that references the selected Artifact's `goal` path and lists dependency and input freshness; it does
 not embed the goal document's contents. Directory inputs ending in `/` are recursively expanded into

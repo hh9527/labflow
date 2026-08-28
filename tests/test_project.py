@@ -23,7 +23,7 @@ from labflow.project import (
 from labflow.runtime_opencode import dag_hash, resume_prompt
 from labflow.supervisor import Supervisor, main as supervisor_main
 from labflow.task_cli import (
-    assign_task, evaluate, load_workflow, refresh_artifact, role_asset_permissions, submit,
+    assign_task, evaluate, load_workflow, refresh_artifact, submit,
     task_records,
 )
 from labflow.state import atomic_json
@@ -51,6 +51,11 @@ assets = ["feedback.md"]
 requires = ["work.a1"]
 assets = ["src/result.txt"]
 check = ["src/result.txt"]
+
+[roles.a1]
+read = ["goals/", "bin/tool", "docs/"]
+write = ["src/"]
+commands = []
 '''
 
 
@@ -123,10 +128,33 @@ class ProjectPlanTest(unittest.TestCase):
             )
             self.assertEqual([item["path"] for item in work["inputs"]], ["docs/"])
             self.assertEqual(work["goal"], "goals/work.md")
-            self.assertEqual(role_asset_permissions(manifest.workflow, "a1"), {
-                "read": ["goals/learn.md", "bin/tool", "goals/work.md", "src/", "docs/"],
-                "write": ["src/"],
-            })
+            self.assertEqual(manifest.roles["a1"]["read"], [
+                "goals/", "bin/tool", "docs/",
+            ])
+
+    def test_plan_rejects_task_paths_outside_explicit_role_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.project(Path(temporary))
+            plan = PLAN.replace(
+                'read = ["goals/", "bin/tool", "docs/"]',
+                'read = ["goals/", "bin/tool"]',
+            )
+            (root / "labflow-plan.toml").write_text(plan, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ControlError,
+                r"role a1 lacks permissions required by artifact work\.a1: read 'docs/'",
+            ):
+                load_plan(root / "labflow-plan.toml")
+
+    def test_plan_requires_complete_explicit_role_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.project(Path(temporary))
+            plan = PLAN.replace("commands = []\n", "")
+            (root / "labflow-plan.toml").write_text(plan, encoding="utf-8")
+
+            with self.assertRaisesRegex(ControlError, "must explicitly define: commands"):
+                load_plan(root / "labflow-plan.toml")
 
     def test_init_generates_executable_project_control_scripts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -215,19 +243,18 @@ class ProjectPlanTest(unittest.TestCase):
             (root / "shared").mkdir()
             (root / "scratch").mkdir()
             plan = PLAN.replace(
-                'goal = "goals/work.md"',
-                'goal = "goals/work.md"\ncommands = ["project-tool verify *"]',
-            ) + '''
-
-[roles.a1]
-read = ["shared/"]
-write = ["scratch/"]
-commands = ["telora --help", "telora -C *"]
-'''
+                'read = ["goals/", "bin/tool", "docs/"]\n'
+                'write = ["src/"]\ncommands = []',
+                'read = ["goals/", "bin/tool", "docs/", "shared/"]\n'
+                'write = ["src/", "scratch/"]\n'
+                'commands = ["telora --help", "telora -C *"]',
+            )
             (root / "labflow-plan.toml").write_text(plan, encoding="utf-8")
             manifest = load_plan(root / "labflow-plan.toml")
-            self.assertEqual(manifest.roles["a1"]["read"], ["shared/"])
-            self.assertEqual(manifest.roles["a1"]["write"], ["scratch/"])
+            self.assertEqual(manifest.roles["a1"]["read"], [
+                "goals/", "bin/tool", "docs/", "shared/",
+            ])
+            self.assertEqual(manifest.roles["a1"]["write"], ["src/", "scratch/"])
 
             lab = parent / "lab"
             lab.mkdir()
@@ -241,7 +268,6 @@ commands = ["telora --help", "telora -C *"]
             self.assertIn('"telora --help":"allow"', role)
             self.assertIn('"telora -C *":"allow"', role)
             self.assertNotIn('"bin/tool *":"allow"', role)
-            self.assertIn('"project-tool verify *":"allow"', role)
             self.assertEqual(runtime_config["default_agent"], "lab-ob")
             self.assertIn("只读数据观察员", observer)
             self.assertIn("query *", observer)
@@ -257,7 +283,8 @@ commands = ["telora --help", "telora -C *"]
             self.assertFalse((home / "roles").exists())
 
             (root / "labflow-plan.toml").write_text(
-                plan + "\n[roles.unknown]\ncommands = ['true']\n", encoding="utf-8",
+                plan + "\n[roles.unknown]\nread = []\nwrite = []\ncommands = ['true']\n",
+                encoding="utf-8",
             )
             with self.assertRaisesRegex(Exception, "unknown role"):
                 load_plan(root / "labflow-plan.toml")
@@ -276,6 +303,11 @@ assets = ["feedback.md"]
 [artifacts.feedback]
 requires = ["review"]
 assets = ["feedback.md"]
+
+[roles.a1]
+read = ["goals/work.md", "feedback.md"]
+write = ["src/"]
+commands = []
 '''
         with tempfile.TemporaryDirectory() as temporary:
             root = self.project(Path(temporary))
@@ -539,8 +571,13 @@ assets = ["later.txt"]
             assign_task(root, manifest.workflow, "a1", "learn.sess.a1")
             previous = dag_hash(manifest)
 
-            with (root / "labflow-plan.toml").open("a", encoding="utf-8") as plan:
-                plan.write('\n[roles.a1]\ncommands = ["telora *"]\n')
+            plan = root / "labflow-plan.toml"
+            plan.write_text(
+                plan.read_text(encoding="utf-8").replace(
+                    'commands = []', 'commands = ["telora *"]',
+                ),
+                encoding="utf-8",
+            )
             (home / "ctrl/active").touch()
             supervisor = Supervisor(home, 4199)
             try:
