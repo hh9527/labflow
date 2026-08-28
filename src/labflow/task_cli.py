@@ -134,7 +134,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raise TaskError(f"artifact {name} must be an object")
         _keys(raw, {
-            "id", "desc", "requires", "inputs", "assets", "check", "instruction",
+            "id", "desc", "requires", "inputs", "assets", "check", "goal",
             "commands",
         },
               f"artifact {name}")
@@ -167,12 +167,14 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             raise TaskError(
                 f"session qualification {name} names unknown role: {qualification_role}"
             )
-        instruction = raw.get("instruction")
+        raw_goal = raw.get("goal")
+        goal = (_asset_path(raw_goal, f"artifact {name} goal")
+                if raw_goal is not None else None)
         commands = _commands(raw.get("commands", []), f"artifact {name} commands")
-        if owner != "host" and (not isinstance(instruction, str) or not instruction.strip()):
-            raise TaskError(f"role-owned artifact {name} instruction must be nonempty")
-        if owner == "host" and instruction is not None:
-            raise TaskError(f"Host-owned artifact {name} cannot have an instruction")
+        if owner != "host" and goal is None:
+            raise TaskError(f"role-owned artifact {name} goal must be nonempty")
+        if owner == "host" and goal is not None:
+            raise TaskError(f"Host-owned artifact {name} cannot have a goal")
         if owner == "host" and commands:
             raise TaskError(f"Host-owned artifact {name} cannot have commands")
         artifacts[name] = {
@@ -185,7 +187,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             "assets": _assets(raw.get("assets", []), f"artifact {name} assets"),
             "check": _assets(raw.get("check", []), f"artifact {name} check"),
             "commands": commands,
-            "instruction": instruction,
+            "goal": goal,
         }
 
     for artifact in artifacts.values():
@@ -262,6 +264,8 @@ def role_asset_permissions(workflow: dict[str, Any], role: str) -> dict[str, lis
     for artifact in workflow["artifacts"].values():
         if artifact["owner"] != role:
             continue
+        if artifact["goal"] is not None:
+            read.setdefault(artifact["goal"], None)
         for asset in artifact["assets"]:
             write.setdefault(asset["path"], None)
             read.setdefault(asset["path"], None)
@@ -463,6 +467,7 @@ def _task_response(root: Path, workflow: dict[str, Any], status: dict[str, Any],
     name = task["artifacts"][0]
     target_stamp = status["artifacts"][name]["stamp_mtime_ns"]
     previous_end = _last_task_end(root, task["role"])
+    artifact = workflow["artifacts"][name]
     inputs = []
     assets: dict[str, bool] = {}
     for reference in workflow["artifacts"][name]["requires"]:
@@ -470,11 +475,26 @@ def _task_response(root: Path, workflow: dict[str, Any], status: dict[str, Any],
         stamp = dependency["stamp_mtime_ns"]
         fresh = None if reference["optional"] and not stamp else stamp > target_stamp
         inputs.append({"name": reference["id"], "fresh": fresh})
-    for asset in workflow["artifacts"][name].get("inputs", []):
-        assets[asset["path"]] = _asset_mtime_ns(root, asset["path"]) > previous_end
+    for asset in artifact.get("inputs", []):
+        input_name = asset["path"]
+        if not input_name.endswith("/"):
+            assets[input_name] = _asset_mtime_ns(root, input_name) > previous_end
+            continue
+        directory = root / input_name
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            assets[relative] = _asset_mtime_ns(root, relative) > previous_end
 
     return {
-        "target": {"name": name, "instruction": workflow["artifacts"][name]["instruction"]},
+        "target": {
+            "name": name,
+            "goal": artifact["goal"],
+            "goal_updated": _asset_mtime_ns(root, artifact["goal"]) > previous_end,
+        },
         "requires": inputs,
         "inputs": [{"path": path, "updated": updated} for path, updated in assets.items()],
     }

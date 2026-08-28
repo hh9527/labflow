@@ -6,15 +6,25 @@ execution control plane; Host control is entirely file based.
 
 ## Run
 
-Put `labflow-plan.toml` in the project root and start the Supervisor first:
+Put `labflow-plan.toml` in the project root and generate its local launcher:
 
 ```bash
 cd /path/to/project
-labflow supervisor --port 4199
+labflow init --port 4199
+./.labflow-exec/bin/serve
 ```
 
-On first start, the Supervisor creates `.labflow-exec`, prints its location, and waits for OpenCode.
-Start OpenCode from `prj-home` in another terminal using the generated configuration:
+`init` creates `.labflow-exec/bin/serve` and `.labflow-exec/bin/attach`. The `serve` script first asks
+the Supervisor command to prepare `.labflow-exec`, starts OpenCode from `prj-home` with the generated
+configuration, and then waits for `ctrl/supervisor`. It invokes a real Supervisor generation only
+while that marker exists. Leave it running in its own terminal. To attach the TUI from another
+terminal, run:
+
+```bash
+./.labflow-exec/bin/attach
+```
+
+The equivalent manual OpenCode command is:
 
 ```bash
 OPENCODE_CONFIG="$PWD/.labflow-exec/ws/opencode.json" \
@@ -26,9 +36,24 @@ Host commands only read Supervisor file projections:
 
 ```bash
 labflow host status
+labflow query 'SELECT type, COUNT(*) FROM timeline GROUP BY type'
 labflow host pull
 labflow attach
 ```
+
+Optional ontology-backed queries are enabled only when both `TELORA_BIN` and
+`OM_LABFLOW_PATH` are set:
+
+```bash
+TELORA_BIN=/path/to/telora \
+OM_LABFLOW_PATH=/path/to/om-labflow \
+labflow query-om request.json
+```
+
+`query-om` invokes the OM-Labflow `query` entry with the JSON file as its named
+`input` source, validates the resulting `{sql, bindings}` object, and executes it through
+the same strictly read-only SQLite boundary as `labflow query`. Paths may be relative to the
+calling directory. Use `labflow query-om -` to read the request JSON from standard input.
 
 Host control operations are ordinary project file operations: copy or atomically replace Assets,
 touch `.labflow-exec/artifacts/<artifact>`, and update markers under `.labflow-exec/ctrl`. Host never
@@ -63,6 +88,7 @@ prj-home/
     runtime.json
     host-tasks.json
     supervisor-status.json
+    report-cursor
     states.sqlite
     events.sqlite
     ctrl/
@@ -70,14 +96,11 @@ prj-home/
       supervisor
     artifacts/
       <artifact>
-    roles/
-      <dag-hash>/
-        <artifact>.md
-        .idle.<role>.md
     ws/
       opencode.json
       .opencode/
         agents/
+          lab-ob.md
 ```
 
 `.labflow-exec` is the execution control plane. It must be ignored by version control and cannot be
@@ -172,12 +195,13 @@ Fields have distinct meanings:
   `requires` Artifacts' `assets`; an explicit value, including `[]`, replaces that default.
 - `check` lists paths that must exist before the Artifact can settle.
 - `goal` is the task document used for a role-owned Artifact.
-- `commands` grants Artifact-scoped shell command patterns. Executable files in `inputs` also grant
-  `<path> *` and `./<path> *` automatically.
+- `commands` adds shell command patterns to the owning role. Executable inputs remain subject to the
+  role's explicitly declared command patterns.
 
-An optional `[roles.<role>]` table grants stable `read`, `write`, and `commands` permissions. Role
-permissions are appended after the selected Artifact's permissions, and role `write` paths are also
-readable. A configured role must exist as an owner inferred from an Artifact suffix.
+An optional `[roles.<role>]` table grants additional stable `read`, `write`, and `commands`
+permissions. Each role receives the union of the `goal`, `inputs`, `assets`, and commands from all
+Artifacts it owns; configured role permissions are appended to that union, and role `write` paths are
+also readable. A configured role must exist as an owner inferred from an Artifact suffix.
 
 The Supervisor maintains one long-lived Session per role. It creates a task record in
 `states.sqlite`, prompts an idle role only when one of its Artifacts is runnable, validates `assets`
@@ -185,18 +209,28 @@ and `check` after the turn, and refreshes the Artifact marker on success. Each t
 its resolved `inputs`; `updated` means that the file or directory tree changed after that role's
 previous task ended. Input Asset changes never trigger a task by themselves.
 
-Generated role files contain only the stable role identity and contain no task instructions. On Plan
-activation, Supervisor writes immutable permission snapshots for every role-owned Artifact under
-`.labflow-exec/roles/<dag-hash>/`, plus a role-only idle snapshot for each role. Immediately before each
-dispatch, it atomically replaces `.labflow-exec/ws/.opencode/agents/<role>.md` with a hard link to the
-selected snapshot: resolved `inputs` plus `assets` are readable, only `assets` are writable, and
-Artifact commands and executable inputs provide that task's command allowlist. Stable role permissions
-are appended to every snapshot. A settled task links the role back to its role-only identity.
-Supervisor supplies the selected Artifact's complete `goal`, dependencies, and resolved input list in
-the task prompt.
+The root Session uses the `lab-ob` observer agent. It knows the execution database schemas and may use
+`labflow host status` or the read-only `labflow query '<SQL>'` interface to answer ad hoc status,
+statistics, and analysis questions. The query exposes `events.sqlite` as the main database and
+`states.sqlite` under the `states` schema, with a two-second execution limit and a 1000-row result
+limit. It grants no project or control-plane writes. Supervisor separately prints coarse
+`task_started`, `task_completed`, and Host-waiting Timeline batches to its standard output, so the
+`serve` terminal remains the continuous progress display. Batches use a five-second quiet debounce
+and a fifteen-second maximum debounce. The committed SQLite row cursor is stored in
+`.labflow-exec/report-cursor` so Supervisor restarts neither duplicate nor miss accepted reports.
 
-The generation hash covers both the normalized Artifact DAG and role permissions. Changing either
-creates a new snapshot generation and supersedes active tasks before they are dispatched again.
+Generated role files contain only the stable role identity and contain no task instructions. On Plan
+activation, Supervisor writes one stable `.labflow-exec/ws/.opencode/agents/<role>.md` per role. Its
+permissions cover the role's complete DAG responsibility: Artifact Assets control writes; Inputs
+control `read`, `glob`, `grep`, and directory listing; Artifact and role commands extend the command
+allowlist. Task dispatch never replaces a role file. OpenCode must be restarted after a
+role permission change so it reloads the agent definition. Supervisor supplies a uniform task prompt
+that references the selected Artifact's `goal` path and lists dependency and input freshness; it does
+not embed the goal document's contents. Directory inputs ending in `/` are recursively expanded into
+their concrete files in the prompt, with freshness computed for each file.
+
+The DAG revision covers both the normalized Artifact DAG and role permissions. Changing either
+supersedes active tasks before they are dispatched again.
 
 ## Development
 

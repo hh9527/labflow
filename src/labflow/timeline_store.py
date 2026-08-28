@@ -17,6 +17,10 @@ EVENT_TYPES = {
     "artifact_refreshed", "artifact_deleted",
     "host_request_opened", "host_request_resolved", "dag_revised",
 }
+REPORT_EVENT_TYPES = (
+    "task_started", "task_completed",
+    "host_request_opened", "host_request_resolved",
+)
 
 
 SCHEMA = """
@@ -253,6 +257,163 @@ def read(path: Path, execution: str, since: int = 0,
                 value["paths"] = paths
             result.append(value)
         return result
+
+
+def report_events(path: Path, execution: str,
+                  after_rowid: int = 0) -> tuple[int, list[dict[str, Any]]]:
+    """Read newly inserted coarse progress events using a database-local cursor."""
+    if not path.is_file():
+        return 0 if after_rowid else after_rowid, []
+    with _reader_connect(path) as connection:
+        maximum = int(connection.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM timeline WHERE execution = ?",
+            (execution,),
+        ).fetchone()[0])
+        cursor = 0 if after_rowid > maximum else after_rowid
+        placeholders = ", ".join("?" for _ in REPORT_EVENT_TYPES)
+        rows = connection.execute(
+            "SELECT rowid AS report_rowid, type, at, role, task_id, payload_json "
+            "FROM timeline WHERE execution = ? AND rowid > ? "
+            f"AND type IN ({placeholders}) ORDER BY rowid",
+            (execution, cursor, *REPORT_EVENT_TYPES),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            cursor = int(row["report_rowid"])
+            value: dict[str, Any] = {
+                "cursor": cursor, "type": row["type"], "at": int(row["at"]),
+                "task": row["task_id"],
+            }
+            if row["role"] is not None:
+                value["role"] = row["role"]
+            payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            if row["type"].startswith("host_request_"):
+                value["optional"] = bool(payload.get("optional", False))
+            elif row["type"] == "task_completed":
+                attempt = payload.get("attempt_id")
+                started_row = connection.execute(
+                    "SELECT at FROM timeline WHERE execution = ? "
+                    "AND type = 'task_started' "
+                    "AND json_extract(payload_json, '$.attempt_id') = ? LIMIT 1",
+                    (execution, attempt),
+                ).fetchone()
+                started = int(started_row[0]) if started_row is not None else int(row["at"])
+                metrics = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(input_tokens), 0),
+                           COALESCE(SUM(output_tokens), 0),
+                           COALESCE(SUM(reasoning_tokens), 0),
+                           COALESCE(MAX(CASE WHEN type = 'thinking' THEN duration END), 0)
+                    FROM timeline
+                    WHERE execution = ? AND task_kind = 'artifact' AND task_id = ?
+                          AND at >= ? AND at <= ?
+                    """,
+                    (execution, row["task_id"], started, row["at"]),
+                ).fetchone()
+                value.update({
+                    "status": payload.get("status"),
+                    "duration_ms": max(0, int(row["at"]) - started),
+                    "input_tokens": int(metrics[0]),
+                    "output_tokens": int(metrics[1]),
+                    "reasoning_tokens": int(metrics[2]),
+                    "longest_thinking_ms": int(metrics[3]),
+                })
+            result.append(value)
+        return cursor, result
+
+
+def task_statistics(path: Path, execution: str, role_tasks: list[str],
+                    host_tasks: list[str], now: int) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "role_tasks": {name: {"rounds": 0, "total": {
+            "duration_ms": 0, "tokens": 0, "longest_thinking_ms": 0,
+        }, "latest": None} for name in role_tasks},
+        "host_tasks": {name: {"approvals": 0, "last_approved_at": None}
+                       for name in host_tasks},
+    }
+    if not path.is_file():
+        return result
+    with _reader_connect(path) as connection:
+        completions = {
+            json.loads(row["payload_json"])["attempt_id"]: {
+                "at": int(row["at"]),
+                "status": json.loads(row["payload_json"]).get("status"),
+            }
+            for row in connection.execute(
+                "SELECT at, payload_json FROM timeline WHERE execution = ? "
+                "AND type = 'task_completed' AND payload_json IS NOT NULL",
+                (execution,),
+            )
+            if isinstance(json.loads(row["payload_json"]).get("attempt_id"), str)
+        }
+        starts: dict[str, list[dict[str, Any]]] = {name: [] for name in role_tasks}
+        for row in connection.execute(
+            "SELECT task_id, at, payload_json FROM timeline WHERE execution = ? "
+            "AND type = 'task_started' ORDER BY at, rowid",
+            (execution,),
+        ):
+            if row["task_id"] not in starts or row["payload_json"] is None:
+                continue
+            attempt = json.loads(row["payload_json"]).get("attempt_id")
+            if not isinstance(attempt, str):
+                continue
+            completion = completions.get(attempt)
+            starts[row["task_id"]].append({
+                "attempt_id": attempt,
+                "started_at": int(row["at"]),
+                "ended_at": completion["at"] if completion else None,
+                "status": completion["status"] if completion else "active",
+            })
+
+        def metrics(task: str, started: int | None = None,
+                    ended: int | None = None) -> dict[str, int]:
+            where = "execution = ? AND task_kind = 'artifact' AND task_id = ?"
+            parameters: list[Any] = [execution, task]
+            if started is not None:
+                where += " AND at >= ?"
+                parameters.append(started)
+            if ended is not None:
+                where += " AND at <= ?"
+                parameters.append(ended)
+            row = connection.execute(
+                "SELECT COALESCE(SUM(input_tokens), 0) + "
+                "COALESCE(SUM(output_tokens), 0) + "
+                "COALESCE(SUM(reasoning_tokens), 0), "
+                "COALESCE(MAX(CASE WHEN type = 'thinking' THEN duration END), 0) "
+                f"FROM timeline WHERE {where}", parameters,
+            ).fetchone()
+            return {"tokens": int(row[0]), "longest_thinking_ms": int(row[1])}
+
+        for task, rounds in starts.items():
+            total = metrics(task)
+            total["duration_ms"] = sum(
+                max(0, int(item["ended_at"] or now) - int(item["started_at"]))
+                for item in rounds
+            )
+            value = result["role_tasks"][task]
+            value.update({"rounds": len(rounds), "total": total})
+            if rounds:
+                latest = rounds[-1]
+                end = int(latest["ended_at"] or now)
+                latest_metrics = metrics(task, int(latest["started_at"]), end)
+                value["latest"] = {
+                    **latest,
+                    "duration_ms": max(0, end - int(latest["started_at"])),
+                    **latest_metrics,
+                }
+
+        for row in connection.execute(
+            "SELECT artifact, COUNT(*) AS approvals, MAX(at) AS last_approved_at "
+            "FROM timeline WHERE execution = ? AND type = 'artifact_refreshed' "
+            "GROUP BY artifact",
+            (execution,),
+        ):
+            if row["artifact"] in result["host_tasks"]:
+                result["host_tasks"][row["artifact"]] = {
+                    "approvals": int(row["approvals"]),
+                    "last_approved_at": int(row["last_approved_at"]),
+                }
+    return result
 
 
 def statistics(path: Path, execution: str) -> dict[str, Any] | None:

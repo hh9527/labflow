@@ -31,11 +31,11 @@ def artifact_workflow() -> dict:
                 "desc": "First output",
                 "requires": ["input-0", "input-optional?"],
                 "assets": ["result-1.txt"],
-                "instruction": "Create result-1.txt",
+                "goal": "guide/GOAL.md",
             },
             "output-2.a2": {
                 "desc": "Second output", "requires": ["output-1.a1"],
-                "assets": ["result-2.txt"], "instruction": "Create result-2.txt",
+                "assets": ["result-2.txt"], "goal": "guide/GOAL.md",
             },
             "output-3": {
                 "desc": "Final output", "requires": ["output-1.a1", "output-2.a2"],
@@ -66,20 +66,25 @@ class ArtifactWorkflowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = self.prepare(root)
+            (root / "guide" / "nested").mkdir()
+            (root / "guide" / "nested" / "DETAIL.md").write_text(
+                "detail", encoding="utf-8",
+            )
             self.assertEqual(load_workflow(root), value)
             refresh_artifact(root, value, "input-0")
 
             first = assign_task(root, value, "a1", "output-1.a1")
             assert first is not None
             self.assertEqual(first["target"], {
-                "name": "output-1.a1", "instruction": "Create result-1.txt",
+                "name": "output-1.a1", "goal": "guide/GOAL.md", "goal_updated": True,
             })
             self.assertEqual(first["requires"], [
                 {"name": "input-0", "fresh": True},
                 {"name": "input-optional", "fresh": None},
             ])
             self.assertEqual(first["inputs"], [
-                {"path": "guide/", "updated": True},
+                {"path": "guide/GOAL.md", "updated": True},
+                {"path": "guide/nested/DETAIL.md", "updated": True},
                 {"path": "notes.txt", "updated": False},
             ])
 
@@ -95,7 +100,8 @@ class ArtifactWorkflowTest(unittest.TestCase):
                 {"name": "input-optional", "fresh": True},
             ])
             self.assertEqual(second["inputs"], [
-                {"path": "guide/", "updated": False},
+                {"path": "guide/GOAL.md", "updated": False},
+                {"path": "guide/nested/DETAIL.md", "updated": False},
                 {"path": "notes.txt", "updated": True},
             ])
 
@@ -121,7 +127,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
                 "left": {"desc": "left", "assets": ["shared.txt"]},
                 "right": {"desc": "right", "assets": ["shared.txt"]},
                 "work.a1": {"desc": "work", "requires": ["left", "right"],
-                         "instruction": "work"},
+                         "goal": "goal.md"},
                 "done": {"desc": "done", "requires": ["work.a1"]},
             },
         })
@@ -139,18 +145,18 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "schema": "labflow.workflow/v1", "roles": ["a1", "a2"],
             "artifacts": {
                 "input.a2": {"desc": "input", "assets": ["model/"],
-                             "instruction": "produce input"},
+                             "goal": "goal.md"},
                 "output.a1": {"desc": "output", "requires": ["input.a2"],
                               "assets": ["result.json"],
-                              "instruction": "produce output"},
+                              "goal": "goal.md"},
             },
         })
         self.assertEqual(role_asset_permissions(workflow, "a1"), {
-            "read": ["result.json", "model/"],
+            "read": ["goal.md", "result.json", "model/"],
             "write": ["result.json"],
         })
         self.assertEqual(role_asset_permissions(workflow, "a2"), {
-            "read": ["model/"], "write": ["model/"],
+            "read": ["goal.md", "model/"], "write": ["model/"],
         })
 
         explicit_empty = json.loads(json.dumps(workflow))
@@ -161,7 +167,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
         explicit_empty["artifacts"]["output.a1"]["inputs"] = []
         explicit_empty = validate_workflow(explicit_empty)
         self.assertEqual(role_asset_permissions(explicit_empty, "a1"), {
-            "read": ["result.json"], "write": ["result.json"],
+            "read": ["goal.md", "result.json"], "write": ["result.json"],
         })
 
     def test_assignment_returns_none_when_target_is_not_runnable(self):
@@ -176,9 +182,9 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "input": {"desc": "input"},
                 "first.a1": {"desc": "first", "requires": ["input"],
-                          "assets": ["first.txt"], "instruction": "first"},
+                          "assets": ["first.txt"], "goal": "goal.md"},
                 "second.a1": {"desc": "second", "requires": ["input"],
-                           "assets": ["second.txt"], "instruction": "second"},
+                           "assets": ["second.txt"], "goal": "goal.md"},
                 "finish": {"desc": "finish", "requires": ["first.a1", "second.a1"]},
             },
         })
@@ -187,13 +193,15 @@ class ArtifactWorkflowTest(unittest.TestCase):
             refresh_artifact(root, workflow, "input")
             first = assign_task(root, workflow, "a1", "first.a1")
             assert first is not None
-            self.assertEqual(first["target"], {"name": "first.a1", "instruction": "first"})
+            self.assertEqual(first["target"], {
+                "name": "first.a1", "goal": "goal.md", "goal_updated": False,
+            })
             (root / "first.txt").write_text("first", encoding="utf-8")
             submit(root, workflow, "a1", ["first.a1"])
             second = assign_task(root, workflow, "a1", "second.a1")
             assert second is not None
             self.assertEqual(second["target"], {
-                "name": "second.a1", "instruction": "second",
+                "name": "second.a1", "goal": "goal.md", "goal_updated": False,
             })
 
     def test_assignment_reuses_active_task_when_another_target_is_preferred(self):
@@ -202,9 +210,9 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "input": {"desc": "input"},
                 "first.a1": {"desc": "first", "requires": ["input"],
-                             "instruction": "first"},
+                             "goal": "goal.md"},
                 "second.a1": {"desc": "second", "requires": ["input"],
-                              "instruction": "second"},
+                              "goal": "goal.md"},
             },
         })
         with tempfile.TemporaryDirectory() as temporary:
@@ -218,7 +226,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
 
             assert reused is not None
             self.assertEqual(reused["target"], {
-                "name": "first.a1", "instruction": "first",
+                "name": "first.a1", "goal": "goal.md", "goal_updated": False,
             })
             self.assertEqual(task_records(root)["active"][0]["task_id"], task_id)
 
@@ -263,11 +271,11 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "language": {"desc": "language"},
                 "learn.sess.a1": {
-                    "desc": "learn", "requires": ["language"], "instruction": "learn",
+                    "desc": "learn", "requires": ["language"], "goal": "goal.md",
                 },
                 "work.a1": {
                     "desc": "work", "requires": ["language", "learn.sess.a1"],
-                    "assets": ["work.txt"], "instruction": "work",
+                    "assets": ["work.txt"], "goal": "goal.md",
                 },
                 "done": {"desc": "done", "requires": ["work.a1"]},
             },
@@ -326,7 +334,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "start": {"desc": "start"},
                 "work.a1": {"desc": "work", "requires": ["missing?"],
-                         "instruction": "work"},
+                         "goal": "goal.md"},
                 "finish": {"desc": "finish", "requires": ["work.a1"]},
             },
         }
@@ -368,18 +376,18 @@ class ArtifactWorkflowTest(unittest.TestCase):
             validate_workflow({
                 "schema": "labflow.workflow/v1", "roles": ["a1", "a2"],
                 "artifacts": {
-                    "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
+                    "learn.sess.a1": {"desc": "learn", "goal": "goal.md"},
                     "work.a2": {"desc": "work", "requires": ["learn.sess.a1"],
-                                "instruction": "work"},
+                                "goal": "goal.md"},
                 },
             })
         with self.assertRaisesRegex(TaskError, "cannot be optional"):
             validate_workflow({
                 "schema": "labflow.workflow/v1", "roles": ["a1"],
                 "artifacts": {
-                    "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
+                    "learn.sess.a1": {"desc": "learn", "goal": "goal.md"},
                     "work.a1": {"desc": "work", "requires": ["learn.sess.a1?"],
-                                "instruction": "work"},
+                                "goal": "goal.md"},
                 },
             })
 

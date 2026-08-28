@@ -3,18 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
+import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
 from .config import Manifest, sha256
 from .state import atomic_json, atomic_write
-from .task_cli import TaskError, artifact_asset_permissions
+from .task_cli import role_asset_permissions
 
 
 MODEL = "deepseek/deepseek-v4-flash"
 ENVIRONMENT = {"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "128000"}
-START_PROMPT = "请启动实验。"
 
 
 def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
@@ -24,21 +24,31 @@ def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
             f"继续完成 Supervisor 已经分配给 {role} 的唯一任务。完成工作或确信无法继续后直接"
             "结束本次执行。Supervisor 负责结算任务并投递后续工作。"
         )
-    requires = ", ".join(
-        f"{item['name']} ({'本轮更新' if item['fresh'] else '可用'})"
-        for item in task["requires"] if item["fresh"] is not None
-    ) or "none"
-    inputs = ", ".join(
-        f"{item['path']} ({'本轮更新' if item['updated'] else '可用'})"
-        for item in task["inputs"]
-    ) or "none"
-    validation = f"\n交付校验要求：{error}\n" if error else ""
+    target = task["target"]
+    requires = "\n".join(
+        f"- `{item['name']}`（{('尚不存在' if item['fresh'] is None else '已刷新' if item['fresh'] else '未改变')}）"
+        for item in task["requires"]
+    ) or "- 无"
+    files = [
+        f"- `{target['goal']}`（{'已更新' if target['goal_updated'] else '未改变'}）",
+        *(
+            f"- `{item['path']}`（{'已更新' if item['updated'] else '未改变'}）"
+            for item in task["inputs"] if item["path"] != target["goal"]
+        ),
+    ]
+    file_list = "\n".join(files)
+    validation = f"\n\n## 上次交付校验\n\n{error}" if error else ""
     return (
-        f"请完成唯一任务 `{artifact['id']}`：{artifact['desc']}\n"
-        f"要求：{artifact['instruction']}\n"
-        f"依赖 Artifact：{requires}\n输入资产：{inputs}\n"
-        f"{validation}在角色权限允许的资产内完成交付。完成工作或确信无法继续后直接结束"
-        "本次执行。Supervisor 负责校验资产、结算 Artifact 并投递后续工作。"
+        f"# 任务：`{target['name']}`\n\n"
+        "## 目标\n\n"
+        f"按照 `{target['goal']}` 的要求完成任务，并简单回复：\n\n"
+        "- 如果完成，则回复必须以“已完成任务。”开头\n"
+        "- 如果无法完成任务，则回复必须以“无法完成任务。”开头\n\n"
+        "## 前序任务输出\n\n"
+        f"{requires}\n\n"
+        "## 你需要的详细文件清单\n\n"
+        f"{file_list}"
+        f"{validation}\n"
     )
 
 
@@ -106,31 +116,48 @@ def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str
     ])
 
 
-def _coordinator(manifest: Manifest) -> str:
+def _observer() -> str:
+    labflow = shlex.join([os.path.abspath(sys.executable), "-m", "labflow.cli"])
     permission = {
         "read": "deny", "glob": "deny", "grep": "deny", "list": "deny",
-        "edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny",
+        "edit": "deny", "bash": _rules([
+            f"{labflow} host status", f"{labflow} query *", f"{labflow} query-om *",
+        ]), "task": "deny", "webfetch": "deny",
         "websearch": "deny", "external_directory": "deny",
     }
     body = (
-        f"本会话是 Artifact DAG 的根会话。收到 `{START_PROMPT}` 时完成根会话初始化并结束"
-        "当前 turn。Labflow Supervisor 负责创建角色 Session、投递任务和维持执行目标。"
+        "本会话是 Labflow 实验的只读数据观察员。根据用户的问题，使用允许的 Host 命令"
+        "查询当前状态或执行只读 SQL，并解释统计结果；不要参与调度或修改项目。\n\n"
+        "`labflow host status` 返回当前调度快照。`labflow query '<SQL>'` 查询两个"
+        " SQLite 数据库：主库是 `events.sqlite`，附加库名为 `states`。查询最多运行 2 秒"
+        "并返回 1000 行。\n\n"
+        "主库 `timeline` 的核心列为：`id`, `execution`, `session`, `turn`, `role`, "
+        "`task_kind`, `task_id`, `artifact`, `dag_revision`, `type`, `at`, `duration`, "
+        "`tokens`, `action`, `success`, `command`, `exit_code`, `summary`, `input_tokens`, "
+        "`output_tokens`, `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens`, "
+        "`payload_json`。`at` 和 `duration` 单位均为毫秒。粗粒度类型包括 "
+        "`task_started`, `task_completed`, `artifact_refreshed`, `host_request_opened`, "
+        "`host_request_resolved`；思考、动作和回复分别是 `thinking`, `action`, `reply`。"
+        "`action_paths(event_id, path)` 记录写入路径。\n\n"
+        "状态库包含 `states.state(key, value)` 和 "
+        "`states.task_records(kind, identity, payload)`；其中 value 和 payload 是 JSON。"
+        "任务轮数通常统计 `task_started`，Token 取 input/output/reasoning 三列之和，"
+        "最长思考取 `thinking.duration` 最大值，Host 批准次数统计 Host Artifact 的 "
+        "`artifact_refreshed`。查询前先明确用户需要当前快照还是历史累计。若环境启用了 "
+        "OM-Labflow，也可用 `labflow query-om <file.json>` 将领域请求降低并执行；该命令"
+        "缺少 `TELORA_BIN` 或 `OM_LABFLOW_PATH` 时不可用。"
     )
-    return _frontmatter("作为 Supervisor 管理的 Artifact DAG 根会话。",
+    return _frontmatter("观察 Labflow 当前任务状态。",
                         "primary", permission) + body + "\n"
 
 
-def _task_commands(manifest: Manifest, artifact: dict[str, Any]) -> list[str]:
-    commands: list[str] = list(artifact["commands"])
-    for item in artifact["inputs"]:
-        value = item["path"].rstrip("/")
-        candidate = manifest.root / value
-        if candidate.is_file() and candidate.stat().st_mode & 0o111:
-            for command in (value, f"./{value}"):
-                pattern = f"{command} *"
-                if pattern not in commands:
-                    commands.append(pattern)
-    return commands
+def _role_commands(manifest: Manifest, name: str) -> list[str]:
+    commands: list[str] = []
+    for artifact in manifest.workflow["artifacts"].values():
+        if artifact["owner"] != name:
+            continue
+        commands.extend(artifact["commands"])
+    return list(dict.fromkeys(commands))
 
 
 def dag_hash(manifest: Manifest) -> str:
@@ -141,18 +168,18 @@ def dag_hash(manifest: Manifest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _role_content(
-    manifest: Manifest, name: str,
-    assets: dict[str, list[str]], commands: list[str],
-) -> bytes:
+def _role_content(manifest: Manifest, name: str) -> bytes:
     role = manifest.roles[name]
+    assets = role_asset_permissions(manifest.workflow, name)
     combined_assets = {
         "read": list(dict.fromkeys([
             *assets["read"], *role["read"], *role["write"],
         ])),
         "write": list(dict.fromkeys([*assets["write"], *role["write"]])),
     }
-    combined_commands = list(dict.fromkeys([*commands, *role["commands"]]))
+    combined_commands = list(dict.fromkeys([
+        *_role_commands(manifest, name), *role["commands"],
+    ]))
     permission = _role_permission(
         {**role, "commands": combined_commands}, combined_assets,
     )
@@ -160,16 +187,6 @@ def _role_content(
     permission["bash"]["./labflow agent *"] = "deny"
     return (_frontmatter(role["description"], "subagent", permission)
             + str(role["prompt"]).rstrip() + "\n").encode()
-
-
-def _same_file(source: Path, target: Path) -> bool:
-    try:
-        source_stat = source.stat()
-        target_stat = target.stat()
-    except FileNotFoundError:
-        return False
-    return ((source_stat.st_dev, source_stat.st_ino)
-            == (target_stat.st_dev, target_stat.st_ino))
 
 
 def _write_snapshot(path: Path, content: bytes) -> Path:
@@ -182,86 +199,29 @@ def _write_snapshot(path: Path, content: bytes) -> Path:
     return path
 
 
-def _activate_role(source: Path, target: Path) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if _same_file(source, target):
-        return target
-    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    os.close(fd)
-    os.unlink(temporary)
-    try:
-        os.link(source, temporary)
-        os.replace(temporary, target)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return target
-
-
-def _role_generation(manifest: Manifest, execution_home: Path) -> Path:
-    return execution_home / "roles" / dag_hash(manifest)
-
-
-def reset_role(manifest: Manifest, name: str, execution_home: Path) -> None:
-    if name not in manifest.roles:
-        return
-    generation = _role_generation(manifest, execution_home)
-    _activate_role(
-        generation / f".idle.{name}.md",
-        execution_home / "ws" / ".opencode" / "agents" / f"{name}.md",
-    )
-
-
-def configure_task_role(
-    manifest: Manifest, role: str, artifact_name: str, execution_home: Path,
-) -> None:
-    artifact = manifest.workflow["artifacts"].get(artifact_name)
-    if artifact is None or artifact["owner"] != role or role not in manifest.roles:
-        raise TaskError(f"artifact is not owned by {role}: {artifact_name}", 64)
-    _activate_role(
-        _role_generation(manifest, execution_home) / f"{artifact_name}.md",
-        execution_home / "ws" / ".opencode" / "agents" / f"{role}.md",
-    )
-
-
 def generate(manifest: Manifest, execution_home: Path) -> dict[str, str]:
     """Generate the complete OpenCode adapter from a runtime-neutral plan."""
     runtime_root = execution_home / "ws"
     agents = runtime_root / ".opencode" / "agents"
     agents.mkdir(parents=True, exist_ok=True)
-    generation = _role_generation(manifest, execution_home)
-    generation.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
     config = runtime_root / "opencode.json"
     atomic_json(config, {
         "$schema": "https://opencode.ai/config.json",
-        "default_agent": "coordinator",
+        "default_agent": "lab-ob",
         "model": MODEL,
         "permission": "deny",
     })
     generated.append(config)
-    coordinator = agents / "coordinator.md"
-    atomic_write(coordinator, _coordinator(manifest).encode(), 0o444)
-    generated.append(coordinator)
+    observer = agents / "lab-ob.md"
+    atomic_write(observer, _observer().encode(), 0o444)
+    generated.append(observer)
+    report = runtime_root / ".opencode" / "commands" / "ob.md"
+    if report.exists():
+        report.unlink()
     for name in manifest.roles:
-        idle = generation / f".idle.{name}.md"
-        _write_snapshot(
-            idle, _role_content(manifest, name, {"read": [], "write": []}, []),
-        )
-        snapshots = [idle]
-        for artifact_name, artifact in manifest.workflow["artifacts"].items():
-            if artifact["owner"] != name:
-                continue
-            snapshot = generation / f"{artifact_name}.md"
-            _write_snapshot(snapshot, _role_content(
-                manifest, name,
-                artifact_asset_permissions(manifest.workflow, artifact_name),
-                _task_commands(manifest, artifact),
-            ))
-            snapshots.append(snapshot)
         target = agents / f"{name}.md"
-        if not any(_same_file(snapshot, target) for snapshot in snapshots):
-            _activate_role(idle, target)
+        _write_snapshot(target, _role_content(manifest, name))
         generated.append(target)
     expected = set(generated)
     for path in agents.glob("*.md"):

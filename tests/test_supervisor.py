@@ -16,7 +16,8 @@ from labflow.task_cli import (
     workflow_status,
 )
 from labflow.timeline_projection import closed_message_events
-from labflow.timeline_store import TimelineWriter, read, statistics
+from labflow.timeline_report import TimelineReporter
+from labflow.timeline_store import TimelineWriter, read, statistics, task_statistics
 
 
 class ReducerTest(unittest.TestCase):
@@ -216,6 +217,27 @@ class ReducerTest(unittest.TestCase):
 
 
 class SupervisorOwnershipTest(unittest.TestCase):
+    def test_timeline_is_flushed_to_supervisor_stdout_before_commit(self):
+        class Reporter:
+            committed = False
+
+            def poll(self):
+                return "[26-08-28 22:16:02] query.a1 已完成"
+
+            def commit(self):
+                self.committed = True
+
+        supervisor = object.__new__(Supervisor)
+        supervisor.timeline_reporter = Reporter()
+        supervisor.timeline_error = None
+        with mock.patch("builtins.print") as output:
+            supervisor._display_timeline()
+
+        output.assert_called_once_with(
+            "[26-08-28 22:16:02] query.a1 已完成", flush=True,
+        )
+        self.assertTrue(supervisor.timeline_reporter.committed)
+
     def test_only_one_supervisor_can_own_a_laboratory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -332,6 +354,65 @@ class TimelineStoreTest(unittest.TestCase):
             self.assertEqual(value["commands"][0], {
                 "command": "just check", "count": 1, "duration": 20, "failures": 1,
             })
+
+    def test_reporter_debounces_coarse_events_and_persists_cursor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            writer = TimelineWriter(home / "events.sqlite", flush_seconds=.01)
+            writer.submit([
+                {"id": "start", "execution": "plan@1", "session": "a1", "role": "a1",
+                 "task_kind": "artifact", "task_id": "query.a1", "type": "task_started",
+                 "at": 1000, "duration": 0, "payload": {"attempt_id": "attempt-1"}},
+                {"id": "thinking", "execution": "plan@1", "session": "a1",
+                 "role": "a1", "task_kind": "artifact", "task_id": "query.a1",
+                 "type": "thinking", "at": 1100, "duration": 800},
+                {"id": "reply", "execution": "plan@1", "session": "a1", "role": "a1",
+                 "task_kind": "artifact", "task_id": "query.a1", "type": "reply",
+                 "at": 2000, "duration": 0, "input_tokens": 100,
+                 "output_tokens": 20, "reasoning_tokens": 5},
+                {"id": "complete", "execution": "plan@1", "session": "a1",
+                 "role": "a1", "task_kind": "artifact", "task_id": "query.a1",
+                 "type": "task_completed", "at": 3000, "duration": 0,
+                 "payload": {"attempt_id": "attempt-1", "status": "submitted"}},
+                {"id": "host", "execution": "plan@1", "task_kind": "artifact",
+                 "task_id": "query", "artifact": "query", "type": "host_request_opened",
+                 "at": 3001, "duration": 0, "payload": {"optional": False}},
+                {"id": "approved-1", "execution": "plan@1", "task_kind": "artifact",
+                 "task_id": "query", "artifact": "query", "type": "artifact_refreshed",
+                 "at": 3100, "duration": 0},
+                {"id": "approved-2", "execution": "plan@1", "task_kind": "artifact",
+                 "task_id": "query", "artifact": "query", "type": "artifact_refreshed",
+                 "at": 3200, "duration": 0},
+            ])
+            writer.close()
+            task_values = task_statistics(
+                home / "events.sqlite", "plan@1", ["query.a1"], ["query"], 4000,
+            )
+            now = [0.0]
+            reporter = TimelineReporter(home, "plan@1", clock=lambda: now[0])
+
+            self.assertIsNone(reporter.poll())
+            now[0] = 5.0
+            message = reporter.poll()
+
+            self.assertIn("query.a1 已开始", message)
+            self.assertIn("query.a1 已完成（耗时 2.0s，Token 125", message)
+            self.assertIn("最长思考 0.8s", message)
+            self.assertIn("query 等待 Host 处理", message)
+            self.assertRegex(message, r"\[70-01-01 \d\d:\d\d:\d\d\] query\.a1 已开始")
+            role = task_values["role_tasks"]["query.a1"]
+            self.assertEqual(role["rounds"], 1)
+            self.assertEqual(role["total"], {
+                "duration_ms": 2000, "tokens": 125, "longest_thinking_ms": 800,
+            })
+            self.assertEqual(role["latest"]["status"], "submitted")
+            self.assertEqual(task_values["host_tasks"]["query"], {
+                "approvals": 2, "last_approved_at": 3200,
+            })
+            reporter.commit()
+            self.assertGreater(int((home / "report-cursor").read_text()), 0)
+            restarted = TimelineReporter(home, "plan@1", clock=lambda: now[0])
+            self.assertIsNone(restarted.poll())
 
 
 if __name__ == "__main__":

@@ -5,22 +5,27 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from labflow.cli_host import pull, status
+from labflow.cli_init import generate as generate_launcher
 from labflow.cli_lab import remove as remove_lab
-from labflow.project import activate_plan, execution_id, load_plan, prepare_execution
-from labflow.runtime_opencode import configure_task_role, dag_hash, reset_role
+from labflow.config import ControlError
+from labflow.project import (
+    activate_plan, execution_id, load_execution, load_plan, prepare_execution,
+)
+from labflow.runtime_opencode import dag_hash, resume_prompt
 from labflow.supervisor import Supervisor, main as supervisor_main
 from labflow.task_cli import (
     assign_task, evaluate, load_workflow, refresh_artifact, role_asset_permissions, submit,
     task_records,
 )
 from labflow.state import atomic_json
-from unittest.mock import patch
 
 
 PLAN = '''
@@ -63,6 +68,43 @@ class ProjectPlanTest(unittest.TestCase):
         tool.chmod(0o755)
         return root
 
+    def test_task_prompt_uses_uniform_file_reference_template(self):
+        prompt = resume_prompt("a1", {}, {
+            "target": {
+                "name": "work.a1", "goal": "goals/work.md", "goal_updated": True,
+            },
+            "requires": [
+                {"name": "fresh", "fresh": True},
+                {"name": "same", "fresh": False},
+                {"name": "missing", "fresh": None},
+            ],
+            "inputs": [
+                {"path": "docs/A.md", "updated": True},
+                {"path": "docs/B.md", "updated": False},
+            ],
+        })
+        self.assertEqual(prompt, '''# 任务：`work.a1`
+
+## 目标
+
+按照 `goals/work.md` 的要求完成任务，并简单回复：
+
+- 如果完成，则回复必须以“已完成任务。”开头
+- 如果无法完成任务，则回复必须以“无法完成任务。”开头
+
+## 前序任务输出
+
+- `fresh`（已刷新）
+- `same`（未改变）
+- `missing`（尚不存在）
+
+## 你需要的详细文件清单
+
+- `goals/work.md`（已更新）
+- `docs/A.md`（已更新）
+- `docs/B.md`（未改变）
+''')
+
     def test_plan_identity_and_workflow_are_derived_from_project(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.project(Path(temporary))
@@ -79,13 +121,93 @@ class ProjectPlanTest(unittest.TestCase):
                  {"id": "feedback", "optional": True}],
             )
             self.assertEqual([item["path"] for item in work["inputs"]], ["docs/"])
-            self.assertIn("Build it.", work["instruction"])
+            self.assertEqual(work["goal"], "goals/work.md")
             self.assertEqual(role_asset_permissions(manifest.workflow, "a1"), {
-                "read": ["bin/tool", "src/", "docs/"],
+                "read": ["goals/learn.md", "bin/tool", "goals/work.md", "src/", "docs/"],
                 "write": ["src/"],
             })
 
-    def test_role_permissions_are_appended_to_artifact_permissions(self):
+    def test_init_generates_executable_project_control_scripts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.project(Path(temporary))
+            serve, attach = generate_launcher(root, 4199)
+            serve_content = serve.read_text(encoding="utf-8")
+            attach_content = attach.read_text(encoding="utf-8")
+
+            self.assertEqual(serve, root / ".labflow-exec/bin/serve")
+            self.assertEqual(attach, root / ".labflow-exec/bin/attach")
+            self.assertEqual(serve.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(attach.stat().st_mode & 0o777, 0o755)
+            self.assertIn("supervisor --port 4199 --prepare-only", serve_content)
+            self.assertIn(os.path.abspath(sys.executable), serve_content)
+            self.assertIn(
+                '"$@" serve --hostname 127.0.0.1 --port 4199 --pure',
+                serve_content,
+            )
+            self.assertIn("[ ! -f .labflow-exec/ctrl/supervisor ]", serve_content)
+            self.assertIn("labflow.cli attach", attach_content)
+            subprocess.run(["sh", "-n", str(serve)], check=True)
+            subprocess.run(["sh", "-n", str(attach)], check=True)
+
+            serve.write_text("local change\n", encoding="utf-8")
+            regenerated, _ = generate_launcher(root, 4199)
+            self.assertIn(
+                "supervisor --port 4199 --prepare-only",
+                regenerated.read_text(encoding="utf-8"),
+            )
+
+    def test_init_rejects_an_invalid_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.project(Path(temporary))
+            with self.assertRaisesRegex(ControlError, "port must be"):
+                generate_launcher(root, 0)
+
+    def test_load_execution_rebuilds_missing_state_database(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, _, _ = prepare_execution(root, lab, 4199)
+            (home / "states.sqlite").unlink()
+
+            loaded_home, _, _ = load_execution(root)
+
+            self.assertEqual(loaded_home, home)
+            with sqlite3.connect(home / "states.sqlite") as connection:
+                tables = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                states = dict(connection.execute("SELECT key, value FROM state"))
+            self.assertIn("state", tables)
+            self.assertIn("task_records", tables)
+            self.assertIsNone(json.loads(states["root_session_id"]))
+            self.assertEqual(json.loads(states["active_control"]), {
+                "applied_mtime_ns": None,
+                "error": None,
+                "observed_mtime_ns": None,
+            })
+
+    def test_supervisor_prepare_only_ignores_existing_control_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, _, _ = prepare_execution(root, lab, 4199)
+            (home / "ctrl/supervisor").touch()
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch("labflow.supervisor.Client", side_effect=AssertionError):
+                    result = supervisor_main(["--port", "4199", "--prepare-only"])
+            finally:
+                os.chdir(previous)
+            self.assertEqual(result, 0)
+
+    def test_role_permissions_are_stable_across_all_owned_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary)
             root = self.project(parent)
@@ -109,22 +231,29 @@ commands = ["telora --help", "telora -C *"]
             lab = parent / "lab"
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
-            generation = home / "roles" / dag_hash(manifest)
-            idle = (generation / ".idle.a1.md").read_text(encoding="utf-8")
-            learn = (generation / "learn.sess.a1.md").read_text(encoding="utf-8")
-            work = (generation / "work.a1.md").read_text(encoding="utf-8")
+            role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
+            observer = (home / "ws/.opencode/agents/lab-ob.md").read_text(encoding="utf-8")
+            runtime_config = json.loads((home / "ws/opencode.json").read_text())
 
-            self.assertIn('"shared/**":"allow"', idle)
-            self.assertIn('"scratch/**":"allow"', idle)
-            self.assertIn('"telora --help":"allow"', idle)
-            self.assertIn('"telora -C *":"allow"', idle)
-            self.assertIn('"bin/tool *":"allow"', learn)
-            self.assertNotIn('"project-tool verify *":"allow"', learn)
-            self.assertIn('"project-tool verify *":"allow"', work)
+            self.assertIn('"shared/**":"allow"', role)
+            self.assertIn('"scratch/**":"allow"', role)
+            self.assertIn('"telora --help":"allow"', role)
+            self.assertIn('"telora -C *":"allow"', role)
+            self.assertNotIn('"bin/tool *":"allow"', role)
+            self.assertIn('"project-tool verify *":"allow"', role)
+            self.assertEqual(runtime_config["default_agent"], "lab-ob")
+            self.assertIn("只读数据观察员", observer)
+            self.assertIn("query *", observer)
+            self.assertIn("query-om *", observer)
+            self.assertIn("`timeline`", observer)
+            self.assertIn("`states.task_records", observer)
+            self.assertFalse((home / "ws/.opencode/agents/coordinator.md").exists())
+            self.assertFalse((home / "ws/.opencode/commands/ob.md").exists())
             self.assertLess(
-                work.index('"src/**":"allow"'),
-                work.index('"scratch/**":"allow"'),
+                role.index('"src/**":"allow"'),
+                role.index('"scratch/**":"allow"'),
             )
+            self.assertFalse((home / "roles").exists())
 
             (root / "labflow-plan.toml").write_text(
                 plan + "\n[roles.unknown]\ncommands = ['true']\n", encoding="utf-8",
@@ -191,33 +320,14 @@ assets = ["feedback.md"]
             self.assertIn('".labflow-exec/**":"deny"', role)
             self.assertIn("你是 Labflow 角色 a1。", role)
             self.assertNotIn("唯一任务", role)
-            self.assertNotIn('"bin/tool":"allow"', role)
-            self.assertNotIn('"src/**":"allow"', role)
-            generation = home / "roles" / dag_hash(manifest)
-            idle = generation / ".idle.a1.md"
-            self.assertTrue(idle.is_file())
-            self.assertEqual(
-                idle.stat().st_ino,
-                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
-            )
-            self.assertTrue((generation / "learn.sess.a1.md").is_file())
-            self.assertTrue((generation / "work.a1.md").is_file())
-            with patch("labflow.runtime_opencode.os.link") as link:
-                reset_role(manifest, "a1", home)
-            link.assert_not_called()
-
-            configure_task_role(manifest, "a1", "learn.sess.a1", home)
-            with patch("labflow.runtime_opencode.os.link") as link:
-                configure_task_role(manifest, "a1", "learn.sess.a1", home)
-            link.assert_not_called()
-            with patch("labflow.runtime_opencode.os.link") as link:
-                activate_plan(home, manifest)
-            link.assert_not_called()
-            self.assertEqual(
-                (generation / "learn.sess.a1.md").stat().st_ino,
-                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
-            )
-            reset_role(manifest, "a1", home)
+            self.assertIn('"bin/tool":"allow"', role)
+            self.assertIn('"docs/**":"allow"', role)
+            self.assertIn('"src/**":"allow"', role)
+            role_path = home / "ws/.opencode/agents/a1.md"
+            inode = role_path.stat().st_ino
+            activate_plan(home, manifest)
+            self.assertEqual(inode, role_path.stat().st_ino)
+            self.assertFalse((home / "roles").exists())
             self.assertFalse((root / "opencode.json").exists())
             self.assertFalse((root / ".opencode").exists())
 
@@ -318,7 +428,8 @@ assets = ["feedback.md"]
                 self.assertEqual(pull(0)["tasks"], ["tool"])
             finally:
                 os.chdir(previous)
-            remove_lab(Path(config["lab_root"]))
+            with patch("labflow.cli_lab.socket.create_connection", side_effect=OSError):
+                remove_lab(Path(config["lab_root"]))
 
     def test_supervisor_generation_exits_when_marker_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -438,7 +549,9 @@ assets = ["later.txt"]
                 supervisor.close()
 
             self.assertNotEqual(previous, current)
-            self.assertTrue((home / "roles" / current).is_dir())
+            role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
+            self.assertIn('"telora *":"allow"', role)
+            self.assertFalse((home / "roles").exists())
             self.assertEqual(task_records(root)["active"], [])
             self.assertEqual(task_records(root)["history"][0]["status"], "stale")
 
@@ -573,19 +686,19 @@ assets = ["later.txt"]
                     first.close()
                 self.assertEqual(len(Backend.sessions_by_id), 2)
                 self.assertEqual(len(Backend.prompts), 1)
-                self.assertIn("依赖 Artifact：tool (本轮更新)", Backend.prompts[0][2])
-                self.assertIn("输入资产：bin/tool (本轮更新)", Backend.prompts[0][2])
-                self.assertIn("Learn it.", Backend.prompts[0][2])
+                self.assertIn("# 任务：`learn.sess.a1`", Backend.prompts[0][2])
+                self.assertIn("按照 `goals/learn.md` 的要求", Backend.prompts[0][2])
+                self.assertIn("- `tool`（已刷新）", Backend.prompts[0][2])
+                self.assertIn("- `goals/learn.md`（已更新）", Backend.prompts[0][2])
+                self.assertIn("- `bin/tool`（已更新）", Backend.prompts[0][2])
+                self.assertNotIn("Learn it.", Backend.prompts[0][2])
                 scoped_role = (home / "ws/.opencode/agents/a1.md").read_text(
                     encoding="utf-8"
                 )
                 self.assertIn('"bin/tool":"allow"', scoped_role)
-                self.assertNotIn('"src/**":"allow"', scoped_role)
-                generation = home / "roles" / dag_hash(first.manifest)
-                self.assertEqual(
-                    (generation / "learn.sess.a1.md").stat().st_ino,
-                    (home / "ws/.opencode/agents/a1.md").stat().st_ino,
-                )
+                self.assertIn('"docs/**":"allow"', scoped_role)
+                self.assertIn('"src/**":"allow"', scoped_role)
+                role_inode = (home / "ws/.opencode/agents/a1.md").stat().st_ino
 
                 restarted = Supervisor(home, 4199)
                 try:
@@ -607,10 +720,9 @@ assets = ["later.txt"]
             work_role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
             self.assertIn('"docs/**":"allow"', work_role)
             self.assertIn('"src/**":"allow"', work_role)
-            self.assertNotIn('"bin/tool":"allow"', work_role)
+            self.assertIn('"bin/tool":"allow"', work_role)
             self.assertEqual(
-                (generation / "work.a1.md").stat().st_ino,
-                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+                role_inode, (home / "ws/.opencode/agents/a1.md").stat().st_ino,
             )
             Backend.message_id = "message-2"
             with patch("labflow.supervisor.Client", Backend):
@@ -630,11 +742,10 @@ assets = ["later.txt"]
                     completed.close()
             self.assertTrue((home / "artifacts" / "work.a1").is_file())
             idle_role = (home / "ws/.opencode/agents/a1.md").read_text(encoding="utf-8")
-            self.assertNotIn('"docs/**":"allow"', idle_role)
-            self.assertNotIn('"src/**":"allow"', idle_role)
+            self.assertIn('"docs/**":"allow"', idle_role)
+            self.assertIn('"src/**":"allow"', idle_role)
             self.assertEqual(
-                (generation / ".idle.a1.md").stat().st_ino,
-                (home / "ws/.opencode/agents/a1.md").stat().st_ino,
+                role_inode, (home / "ws/.opencode/agents/a1.md").stat().st_ino,
             )
 
 

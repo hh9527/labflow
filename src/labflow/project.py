@@ -42,7 +42,7 @@ def exec_home(project: Path) -> Path:
     return project.resolve() / EXEC_NAME
 
 
-def _ignore_execution(root: Path) -> None:
+def ignore_execution(root: Path) -> None:
     repository = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], cwd=root,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -80,7 +80,7 @@ def _ignore_execution(root: Path) -> None:
         raise ControlError(f"cannot ignore {EXEC_NAME}: {exc}", 73) from None
 
 
-def _goal(path: Path, artifact: str) -> tuple[str, str]:
+def _goal(path: Path, artifact: str) -> str:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -91,7 +91,7 @@ def _goal(path: Path, artifact: str) -> tuple[str, str]:
         raise ControlError(f"empty goal for {artifact}: {path}")
     heading = next((line[2:].strip() for line in text.splitlines()
                     if line.startswith("# ") and line[2:].strip()), artifact)
-    return heading, text.strip()
+    return heading
 
 
 def _strings(value: Any, where: str) -> list[str]:
@@ -163,14 +163,14 @@ def load_plan(path: Path | None = None) -> Manifest:
             if role not in roles:
                 roles.append(role)
             goal_path = _project_path(root, goal, "goal")
-            goals[name] = _goal(goal_path, name)
+            goals[name] = (goal, _goal(goal_path, name))
         artifact_rows[name] = raw
     if not roles:
         raise ControlError("plan must contain at least one role-owned artifact with a goal")
 
     artifacts: dict[str, dict[str, Any]] = {}
     for name, raw in artifact_rows.items():
-        description, instruction = goals.get(name, (name, None))
+        goal, description = goals.get(name, (None, name))
         assets = _strings(raw.get("assets"), f"artifact {name} assets")
         checks = _strings(raw.get("check"), f"artifact {name} check")
         inputs = (_strings(raw.get("inputs"), f"artifact {name} inputs")
@@ -186,8 +186,8 @@ def load_plan(path: Path | None = None) -> Manifest:
         }
         if inputs is not None:
             artifacts[name]["inputs"] = inputs
-        if instruction is not None:
-            artifacts[name]["instruction"] = instruction
+        if goal is not None:
+            artifacts[name]["goal"] = goal
 
     try:
         workflow = validate_workflow({
@@ -247,6 +247,24 @@ def _initialize_states(path: Path) -> None:
         connection.close()
 
 
+def _initialize_execution_state(home: Path) -> None:
+    path = home / "states.sqlite"
+    _initialize_states(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT OR IGNORE INTO state(key, value) VALUES ('root_session_id', 'null')"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO state(key, value) VALUES "
+            "('active_control', '{\"applied_mtime_ns\":null,\"error\":null,"
+            "\"observed_mtime_ns\":null}')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def set_state(home: Path, key: str, value: Any) -> None:
     connection = sqlite3.connect(home / "states.sqlite")
     try:
@@ -289,7 +307,7 @@ def activate_plan(home: Path, manifest: Manifest) -> None:
 def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, Manifest, dict[str, Any]]:
     root = project.resolve(strict=True)
     manifest = load_plan(root / PLAN_NAME)
-    _ignore_execution(root)
+    ignore_execution(root)
     home = exec_home(root)
     if home.exists() and not home.is_dir():
         raise ControlError(f"execution home is not a directory: {home}")
@@ -299,7 +317,7 @@ def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, M
     runtime = home / "ws"
     runtime.mkdir(exist_ok=True)
     (runtime / ".opencode" / "agents").mkdir(parents=True, exist_ok=True)
-    _initialize_states(home / "states.sqlite")
+    _initialize_execution_state(home)
     config = {
         "schema": EXEC_SCHEMA,
         "execution_id": manifest.plan_id,
@@ -319,19 +337,6 @@ def prepare_execution(project: Path, lab_root: Path, port: int) -> tuple[Path, M
                 raise ControlError(f"execution configuration disagrees on {key}")
     atomic_json(existing_path, config)
     activate_plan(home, manifest)
-    connection = sqlite3.connect(home / "states.sqlite")
-    try:
-        connection.execute(
-            "INSERT OR IGNORE INTO state(key, value) VALUES ('root_session_id', 'null')"
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO state(key, value) VALUES "
-            "('active_control', '{\"applied_mtime_ns\":null,\"error\":null,"
-            "\"observed_mtime_ns\":null}')"
-        )
-        connection.commit()
-    finally:
-        connection.close()
     return home, manifest, config
 
 
@@ -368,5 +373,6 @@ def load_execution(project: Path | None = None) -> tuple[Path, Manifest, dict[st
             or not all(isinstance(value, dict) for value in roles.values())
             or not isinstance(execution, dict)):
         raise ControlError("invalid activated project runtime")
+    _initialize_execution_state(home)
     manifest = Manifest(config["execution_id"], root, roles, workflow, execution)
     return home, manifest, config

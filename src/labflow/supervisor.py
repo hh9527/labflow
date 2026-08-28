@@ -12,20 +12,22 @@ import time
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 from .client import Client
 from .config import ControlError
 from .events import pending_optional_requests, pending_requests
-from .runtime_opencode import configure_task_role, dag_hash, reset_role, resume_prompt
+from .runtime_opencode import dag_hash, resume_prompt
 from .state import atomic_json
 from .task_cli import (
     TaskError, assign_task, clear_session_qualifications, submit, task_records,
     supersede_role_task, workflow_status,
 )
 from .timeline_projection import closed_message_events
-from .timeline_store import TimelineWriter
+from .timeline_report import TimelineReporter
+from .timeline_store import TimelineWriter, task_statistics
 
 
 @dataclass(frozen=True)
@@ -464,6 +466,8 @@ class Supervisor:
         )
         self.state = _state_load(get_state(self.root, "supervisor_state"))
         self.event_error: str | None = None
+        self.timeline_error: str | None = None
+        self.timeline_reporter = TimelineReporter(self.root, self.manifest.plan_id)
         try:
             self.writer: TimelineWriter | None = TimelineWriter(self.root / "events.sqlite")
         except (OSError, RuntimeError, sqlite3.Error) as exc:
@@ -577,7 +581,7 @@ class Supervisor:
             return
         if len(candidates) > 1:
             raise ControlError("multiple OpenCode root Sessions match this execution", 75)
-        response = client.create_session(manifest.plan_id, agent="coordinator")
+        response = client.create_session(manifest.plan_id, agent="lab-ob")
         session_id = response.get("id") if isinstance(response, dict) else None
         if not isinstance(session_id, str):
             raise ControlError("OpenCode returned an invalid root Session identity", 69)
@@ -756,7 +760,7 @@ class Supervisor:
         root_id = value.get("session_id")
         if not isinstance(root_id, str):
             return []
-        root_role = "coordinator"
+        root_role = "lab-ob"
         client = Client(self.server_url, value["workspace"], root_id)
         statuses = client.statuses()
         sessions = _observed_sessions(client, root_id, title, root_role)
@@ -841,8 +845,6 @@ class Supervisor:
                                 self.state.executions[title].sessions.setdefault(
                                     role, SessionState(role, role)
                                 ).error = str(exc)
-                            else:
-                                reset_role(self.manifest, role, self.root)
                     effects.extend(reduce(self.state, LifecycleEvent(
                         "session_observed", title, {
                             "role": role, "title": session["title"],
@@ -874,7 +876,6 @@ class Supervisor:
                 backend_id = effect.backend_id
                 delivered = True
                 if effect.kind == "create_session":
-                    reset_role(self.manifest, effect.role, self.root)
                     if execution.workflow is not None:
                         clear_session_qualifications(
                             Path(execution.workspace), execution.workflow, effect.role,
@@ -895,10 +896,6 @@ class Supervisor:
                     )
                     delivered = task is not None
                     if task is not None:
-                        configure_task_role(
-                            self.manifest, effect.role, effect.artifact,
-                            self.root,
-                        )
                         session = execution.sessions.setdefault(
                             effect.role, SessionState(effect.role, effect.role)
                         )
@@ -943,6 +940,7 @@ class Supervisor:
                 "dag": execution.dag,
                 "requests": list(execution.requests),
                 "optional_requests": list(execution.optional_requests),
+                "tasks": self._current_tasks(execution),
                 "errors": [{
                     "role": session.role,
                     "error": session.error,
@@ -955,7 +953,76 @@ class Supervisor:
                     "status": session.status,
                 } for session in execution.observed_sessions.values()],
             } for execution in self.state.executions.values()],
+            "timeline_error": self.timeline_error,
         }
+
+    def _current_tasks(self, execution: ExecutionState) -> dict[str, Any]:
+        records = task_records(Path(execution.workspace))["active"]
+        active = [{
+            "artifact": task["artifacts"][0],
+            "role": task.get("role"),
+            "started_at_ns": task.get("started_at_ns"),
+        } for task in records
+            if isinstance(task.get("artifacts"), list) and len(task["artifacts"]) == 1]
+        active_names = {item["artifact"] for item in active}
+        runnable = [{"artifact": artifact, "role": role}
+                    for role, values in sorted(execution.runnable.items())
+                    for artifact, _ in values if artifact not in active_names]
+        workflow = execution.workflow if isinstance(execution.workflow, dict) else None
+        role_names = ([name for name, artifact in workflow["artifacts"].items()
+                       if artifact["owner"] != "host"
+                       and name.endswith(f".{artifact['owner']}")]
+                      if workflow is not None else [])
+        host_names = ([name for name, artifact in workflow["artifacts"].items()
+                       if artifact["owner"] == "host"] if workflow is not None else [])
+        statistics = task_statistics(
+            self.root / "events.sqlite", execution.title,
+            role_names, host_names, int(time.time() * 1000),
+        )
+        status = (workflow_status(Path(execution.workspace), workflow)["artifacts"]
+                  if workflow is not None else {})
+        role = [{
+            "artifact": name,
+            "role": workflow["artifacts"][name]["owner"],
+            "completed": bool(status[name]["current"]),
+            **statistics["role_tasks"][name],
+        } for name in role_names]
+        required = set(execution.requests)
+        optional = set(execution.optional_requests)
+        host = []
+        for name in host_names:
+            approval = statistics["host_tasks"][name]
+            approved_at = approval["last_approved_at"]
+            host.append({
+                "artifact": name,
+                "waiting": name in required or name in optional,
+                "optional": name in optional,
+                "approvals": approval["approvals"],
+                "last_approved_at": (
+                    datetime.fromtimestamp(approved_at / 1000).astimezone().isoformat(
+                        timespec="seconds"
+                    ) if isinstance(approved_at, int) else None
+                ),
+            })
+        return {
+            "active": active,
+            "runnable": runnable,
+            "waiting_host": list(execution.requests),
+            "optional_host": list(execution.optional_requests),
+            "role": role,
+            "host": host,
+        }
+
+    def _display_timeline(self) -> None:
+        message = self.timeline_reporter.poll()
+        if message is None:
+            return
+        try:
+            print(message, flush=True)
+            self.timeline_reporter.commit()
+            self.timeline_error = None
+        except (OSError, ValueError) as exc:
+            self.timeline_error = str(exc)
 
     def _write_host_tasks(self) -> None:
         path = self.root / "host-tasks.json"
@@ -1010,6 +1077,7 @@ class Supervisor:
         from .project import set_state
         set_state(self.root, "supervisor_state", _state_dump(self.state))
         self._write_host_tasks()
+        self._display_timeline()
         atomic_json(self.root / "supervisor-status.json", self._status())
 
     def run(self, *, once: bool = False, control_marker: Path | None = None,
@@ -1028,6 +1096,10 @@ def parser(prog: str = "labflow supervisor") -> argparse.ArgumentParser:
     value.add_argument("--port", type=int, help="OpenCode port; required on first start")
     value.add_argument("--poll-interval", type=float, default=.25)
     value.add_argument("--once", action="store_true", help="observe and reconcile one snapshot")
+    value.add_argument(
+        "--prepare-only", action="store_true",
+        help="prepare or validate the execution without starting the supervisor",
+    )
     return value
 
 
@@ -1060,6 +1132,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
             )
         if args.poll_interval <= 0 or args.poll_interval > 60:
             raise ControlError("poll interval must be greater than 0 and at most 60 seconds", 64)
+        if args.prepare_only:
+            return 0
         marker = home / "ctrl" / "supervisor"
         generation = control_mtime(marker)
         if generation is None:
