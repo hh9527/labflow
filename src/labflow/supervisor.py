@@ -646,7 +646,12 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         return []
     if event.kind == "system_blocked_observed":
         present = bool(event.data.get("present"))
-        if present:
+        blocked_mtime = event.data.get("mtime_ns")
+        pending = bool(
+            present and isinstance(blocked_mtime, int)
+            and (state.active_mtime is None or blocked_mtime >= state.active_mtime)
+        )
+        if pending:
             if execution.blocked_reason is None:
                 execution.blocked_reason = "system-blocked marker exists"
             return []
@@ -715,12 +720,23 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
                     "reply must start with 已完成任务。 or 无法完成任务。", completed_at,
                 )
             return []
-        if unseen:
-            return _record_task_failure(
-                state, execution, role, "turn_aborted",
-                f"Agent turn ended without stop: {event.data.get('finish')}", completed_at,
-            )
         return []
+    if event.kind == "turn_aborted":
+        role = str(event.data["role"])
+        title = str(event.data["title"])
+        message_id = str(event.data["message_id"])
+        completed_at = int(event.data["completed_at"])
+        task = execution.active_tasks.get(role)
+        if task is None or completed_at < task.started_at_ns // 1_000_000:
+            return []
+        identity = (execution.title, title, f"aborted:{message_id}")
+        if identity in state.seen_messages:
+            return []
+        state.seen_messages.add(identity)
+        return _record_task_failure(
+            state, execution, role, "turn_aborted",
+            f"Agent turn ended without stop: {event.data.get('finish')}", completed_at,
+        )
     if event.kind == "task_validation_failed":
         role = str(event.data["role"])
         task = execution.active_tasks.get(role)
@@ -1210,6 +1226,7 @@ class Supervisor:
                 "payload": {"backend_id": session_id},
             })
             value = {"workspace": execution.workspace}
+            completed_messages: list[tuple[int, str, Any]] = []
             for message in messages:
                 info = message.get("info", {})
                 message_id = info.get("id")
@@ -1227,6 +1244,16 @@ class Supervisor:
                     "message_id": message_id, "completed_at": int(completed),
                     "finish": info.get("finish"), "reply": _message_reply(message),
                 }))
+                completed_messages.append((int(completed), message_id, info.get("finish")))
+            status = statuses.get(session_id, {"type": "idle"}).get("type", "idle")
+            if status == "idle" and completed_messages:
+                completed, message_id, finish = max(completed_messages)
+                if finish != "stop":
+                    events.append(LifecycleEvent("turn_aborted", title, {
+                        "role": role, "title": session["title"],
+                        "message_id": message_id, "completed_at": completed,
+                        "finish": finish,
+                    }))
         self._events(timeline)
         visible = [session for session in sessions if session["id"] not in disappeared]
         events.insert(0, LifecycleEvent("observed_sessions_updated", title, {

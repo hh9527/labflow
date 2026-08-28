@@ -48,12 +48,15 @@ Optional ontology-backed queries are enabled only when both `TELORA_BIN` and
 TELORA_BIN=/path/to/telora \
 OM_LABFLOW_PATH=/path/to/om-labflow \
 labflow query-om request.json
+labflow query-om --explain request.json
 ```
 
 `query-om` invokes the OM-Labflow `query` entry with the JSON file as its named
 `input` source, validates the resulting `{sql, bindings}` object, and executes it through
 the same strictly read-only SQLite boundary as `labflow query`. Paths may be relative to the
 calling directory. Use `labflow query-om -` to read the request JSON from standard input.
+Use `--explain` to print the generated parameterized SQL and bindings without executing
+the query or opening the execution databases.
 
 Host control operations are ordinary project file operations: copy or atomically replace Assets,
 touch `.labflow-exec/artifacts/<artifact>`, and update the reserved markers in that directory. Host never

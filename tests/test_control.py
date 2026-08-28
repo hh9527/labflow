@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +15,7 @@ from labflow.cli_host import parser as host_parser
 from labflow.cli_init import parser as init_parser
 from labflow.cli_lab import attach_parser, parser as lab_parser, remove
 from labflow.cli_query import (
-    lower_om, om_parser, parser as query_parser, query, query_om,
+    lower_om, om_main, om_parser, parser as query_parser, query, query_om,
 )
 from labflow.config import ControlError
 from labflow.project import LAB_SCHEMA
@@ -39,6 +42,9 @@ class CommandSurfaceTest(unittest.TestCase):
         self.assertEqual(query_parser().parse_args(["SELECT 1"]).sql, "SELECT 1")
         self.assertEqual(om_parser().parse_args(["request.json"]).input, Path("request.json"))
         self.assertEqual(om_parser().parse_args(["-"]).input, Path("-"))
+        explain = om_parser().parse_args(["--explain", "request.json"])
+        self.assertTrue(explain.explain)
+        self.assertEqual(explain.input, Path("request.json"))
         self.assertEqual(host_parser().parse_args(["pull", "--timeout", "1"]).timeout, 1)
         with self.assertRaises(SystemExit):
             host_parser().parse_args(["start", "old-lab"])
@@ -131,6 +137,26 @@ class CommandSurfaceTest(unittest.TestCase):
             ])
             self.assertNotIn("stdin", run.call_args.kwargs)
             self.assertNotIn("stderr", run.call_args.kwargs)
+
+    def test_query_om_explain_prints_lowering_without_loading_execution(self):
+        output = io.StringIO()
+        lowered = (
+            "SELECT id FROM timeline WHERE type = ? LIMIT ?",
+            ["task_started", 3],
+        )
+        with (
+            patch("labflow.cli_query.lower_om", return_value=lowered) as lower,
+            patch("labflow.cli_query.load_execution") as load,
+            redirect_stdout(output),
+        ):
+            status = om_main(["--explain", "-"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "sql": lowered[0], "bindings": lowered[1],
+        })
+        lower.assert_called_once_with(Path("-"))
+        load.assert_not_called()
 
     def test_query_om_rejects_non_query_output(self):
         with tempfile.TemporaryDirectory() as temporary:

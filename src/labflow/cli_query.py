@@ -28,6 +28,10 @@ def om_parser(prog: str = "labflow query-om") -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog=prog, description="Lower an OM-Labflow request and query execution data read-only."
     )
+    value.add_argument(
+        "--explain", action="store_true",
+        help="print the generated parameterized SQL and bindings without executing it",
+    )
     value.add_argument("input", type=Path)
     return value
 
@@ -165,10 +169,13 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow query") -> int:
 def om_main(argv: list[str] | None = None, *, prog: str = "labflow query-om") -> int:
     args = om_parser(prog).parse_args(argv)
     try:
-        home, _, _ = load_execution()
-        print(json.dumps(
-            query_om(home, args.input), ensure_ascii=False, indent=2, sort_keys=True,
-        ))
+        if args.explain:
+            sql, bindings = lower_om(args.input)
+            result = {"sql": sql, "bindings": bindings}
+        else:
+            home, _, _ = load_execution()
+            result = query_om(home, args.input)
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except ControlError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)

@@ -178,11 +178,14 @@ class ProjectPlanTest(unittest.TestCase):
             serve, attach = generate_launcher(root, 4199)
             serve_content = serve.read_text(encoding="utf-8")
             attach_content = attach.read_text(encoding="utf-8")
+            control = root / ".labflow-exec/bin/control"
+            control_content = control.read_text(encoding="utf-8")
 
             self.assertEqual(serve, root / ".labflow-exec/bin/serve")
             self.assertEqual(attach, root / ".labflow-exec/bin/attach")
             self.assertEqual(serve.stat().st_mode & 0o777, 0o755)
             self.assertEqual(attach.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(control.stat().st_mode & 0o777, 0o755)
             self.assertIn("supervisor --port 4199 --prepare-only", serve_content)
             self.assertIn(os.path.abspath(sys.executable), serve_content)
             self.assertIn(
@@ -191,8 +194,16 @@ class ProjectPlanTest(unittest.TestCase):
             )
             self.assertIn("[ ! -f .labflow-exec/artifacts/_supervisor ]", serve_content)
             self.assertIn("labflow.cli attach", attach_content)
+            self.assertIn('artifacts="$project_home/.labflow-exec/artifacts"', control_content)
+            self.assertIn('touch "$artifacts/_active"', control_content)
+            self.assertIn('touch "$artifacts/_supervisor"', control_content)
+            self.assertIn('system-blocked=%s', control_content)
+            self.assertIn('blocked=acknowledged', control_content)
+            self.assertNotIn('system-blocked-clear', control_content)
+            self.assertNotIn('.labflow-exec/ctrl', control_content)
             subprocess.run(["sh", "-n", str(serve)], check=True)
             subprocess.run(["sh", "-n", str(attach)], check=True)
+            subprocess.run(["sh", "-n", str(control)], check=True)
 
             serve.write_text("local change\n", encoding="utf-8")
             regenerated, _ = generate_launcher(root, 4199)
@@ -645,7 +656,11 @@ assets = ["later.txt"]
             (home / "artifacts/_active").touch()
             supervisor = Supervisor(home, 4199)
             try:
-                supervisor._sync_active()
+                with patch(
+                    "labflow.supervisor.Client.health",
+                    side_effect=ControlError("offline test backend", 69),
+                ):
+                    supervisor._sync_active()
                 current = supervisor.state.executions[execution_id(root)].dag_revision
             finally:
                 supervisor.close()
@@ -673,10 +688,14 @@ assets = ["later.txt"]
             active.touch()
             supervisor = Supervisor(home, 4199)
             try:
-                supervisor._sync_active()
-                generation = active.stat().st_mtime_ns
-                os.utime(active, ns=(generation + 1, generation + 1))
-                supervisor._sync_active()
+                with patch(
+                    "labflow.supervisor.Client.health",
+                    side_effect=ControlError("offline test backend", 69),
+                ):
+                    supervisor._sync_active()
+                    generation = active.stat().st_mtime_ns
+                    os.utime(active, ns=(generation + 1, generation + 1))
+                    supervisor._sync_active()
                 execution = supervisor.state.executions[execution_id(root)]
             finally:
                 supervisor.close()

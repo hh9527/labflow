@@ -16,6 +16,7 @@ from .state import atomic_write
 
 SERVE_NAME = "serve"
 ATTACH_NAME = "attach"
+CONTROL_NAME = "control"
 
 
 def parser(prog: str = "labflow init") -> argparse.ArgumentParser:
@@ -104,6 +105,50 @@ exec {labflow} attach
 '''.encode()
 
 
+def control_content() -> bytes:
+    return b'''#!/bin/sh
+set -eu
+
+project_home=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
+artifacts="$project_home/.labflow-exec/artifacts"
+mkdir -p "$artifacts"
+
+case "${1:-status}" in
+  active-on)
+    touch "$artifacts/_active"
+    ;;
+  active-off)
+    rm -f "$artifacts/_active"
+    ;;
+  supervisor-on)
+    touch "$artifacts/_supervisor"
+    ;;
+  supervisor-off)
+    rm -f "$artifacts/_supervisor"
+    ;;
+  status)
+    [ -f "$artifacts/_active" ] && active=on || active=off
+    [ -f "$artifacts/_supervisor" ] && supervisor=on || supervisor=off
+    if [ -f "$artifacts/_system-blocked" ]; then
+      if [ -f "$artifacts/_active" ] && [ "$artifacts/_active" -nt "$artifacts/_system-blocked" ]; then
+        blocked=acknowledged
+      else
+        blocked=on
+      fi
+    else
+      blocked=off
+    fi
+    printf 'active=%s supervisor=%s system-blocked=%s\n' \
+      "$active" "$supervisor" "$blocked"
+    ;;
+  *)
+    echo "usage: $0 {status|active-on|active-off|supervisor-on|supervisor-off}" >&2
+    exit 64
+    ;;
+esac
+'''
+
+
 def generate(root: Path, port: int) -> tuple[Path, Path]:
     if isinstance(port, bool) or not 1 <= port <= 65535:
         raise ControlError("port must be from 1 through 65535", 64)
@@ -132,6 +177,7 @@ def generate(root: Path, port: int) -> tuple[Path, Path]:
     scripts = (
         (control / "bin" / SERVE_NAME, serve_content(port)),
         (control / "bin" / ATTACH_NAME, attach_content()),
+        (control / "bin" / CONTROL_NAME, control_content()),
     )
     for target, content in scripts:
         try:
@@ -145,7 +191,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow init") -> int:
     args = parser(prog).parse_args(argv)
     try:
         serve, attach = generate(project_home(), args.port)
-        print(f"Generated {serve} and {attach}")
+        print(f"Generated {serve}, {attach}, and {serve.parent / CONTROL_NAME}")
         return 0
     except ControlError as exc:
         print(f"{prog}: {exc}", file=sys.stderr)

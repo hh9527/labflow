@@ -252,6 +252,38 @@ class ReducerTest(unittest.TestCase):
         self.assertEqual([effect.kind for effect in reduce(state, turn)], ["settle_task"])
         self.assertEqual(reduce(state, turn), [])
 
+    def test_tool_call_turn_is_an_intermediate_message(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+
+        effects = reduce(state, LifecycleEvent("turn_completed", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_tool",
+            "completed_at": 2000, "finish": "tool-calls", "reply": "",
+        }))
+
+        self.assertEqual(effects, [])
+        self.assertIsNone(execution.blocked_reason)
+        self.assertNotIn("a1", execution.failures)
+        self.assertIn("a1", execution.active_tasks)
+
+    def test_idle_session_with_non_stop_last_message_is_aborted(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+
+        effects = reduce(state, LifecycleEvent("turn_aborted", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_tool",
+            "completed_at": 2000, "finish": "tool-calls",
+        }))
+
+        self.assertEqual(effects, [])
+        self.assertEqual(execution.failures["a1"].kind, "turn_aborted")
+        self.assertEqual(execution.sessions["a1"].error_kind, "turn_aborted")
+        self.assertEqual(reduce(state, LifecycleEvent("turn_aborted", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_tool",
+            "completed_at": 2000, "finish": "tool-calls",
+        })), [])
+        self.assertEqual(execution.failures["a1"].count, 1)
+
     def test_validation_failure_event_requests_one_repair_prompt(self):
         state = self._active_task_state()
         reduce(state, LifecycleEvent("session_observed", "plan@1", {
@@ -328,6 +360,24 @@ class ReducerTest(unittest.TestCase):
         self.assertEqual(restored_execution.blocked_reason,
                          "artifact assets are incomplete")
         self.assertEqual(restored_execution.failures["a1"].count, 1)
+
+    def test_newer_active_marker_acknowledges_retained_system_block(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+        execution.blocked_reason = "host intervention required"
+        state.active_mtime = 2000
+
+        reduce(state, LifecycleEvent("system_blocked_observed", "plan@1", {
+            "present": True, "mtime_ns": 1000,
+        }))
+
+        self.assertIsNone(execution.blocked_reason)
+        self.assertEqual(execution.failures, {})
+
+        reduce(state, LifecycleEvent("system_blocked_observed", "plan@1", {
+            "present": True, "mtime_ns": 3000,
+        }))
+        self.assertEqual(execution.blocked_reason, "system-blocked marker exists")
 
 
 class SupervisorOwnershipTest(unittest.TestCase):
