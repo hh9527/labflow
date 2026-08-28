@@ -125,12 +125,31 @@ def _frontmatter(description: str, mode: str, permission: dict[str, Any]) -> str
     ])
 
 
-def _observer() -> str:
+def _observer_docs(manifest: Manifest) -> str | None:
+    configured = os.environ.get("OM_LABFLOW_PATH")
+    if not configured:
+        return None
+    path = Path(configured)
+    candidate = path if path.is_absolute() else manifest.root / path
+    try:
+        relative = candidate.resolve().relative_to(manifest.root.resolve())
+    except ValueError:
+        return None
+    return (relative / "docs").as_posix().strip("/")
+
+
+def _observer(manifest: Manifest) -> str:
     labflow = shlex.join([os.path.abspath(sys.executable), "-m", "labflow.cli"])
+    docs = _observer_docs(manifest)
+    doc_commands = [
+        shlex.join(["cat", "--", f"{docs}/{name}"])
+        for name in ("DOMAIN.md", "QUERY-DESIGN-GUIDE.md")
+    ] if docs else []
     permission = {
         "read": "deny", "glob": "deny", "grep": "deny", "list": "deny",
         "edit": "deny", "bash": _rules([
             f"{labflow} host status", f"{labflow} query *", f"{labflow} query-om *",
+            *doc_commands,
         ]), "task": "deny", "webfetch": "deny",
         "websearch": "deny", "external_directory": "deny",
     }
@@ -155,6 +174,12 @@ def _observer() -> str:
         "`artifact_refreshed`。查询前先明确用户需要当前快照还是历史累计。若环境启用了 "
         "OM-Labflow，也可用 `labflow query-om <file.json>` 将领域请求降低并执行；该命令"
         "缺少 `TELORA_BIN` 或 `OM_LABFLOW_PATH` 时不可用。"
+        + (
+            "构造 OM-Labflow 请求前，先通过 Bash 分别执行 "
+            f"`{doc_commands[0]}` 和 `{doc_commands[1]}`，完整阅读领域文档；以其中的"
+            "业务词汇、组合约束和能力边界为准，不要仅根据数据库列名猜测业务语义。"
+            if docs else ""
+        )
     )
     return _frontmatter("观察 Labflow 当前任务状态。",
                         "primary", permission) + body + "\n"
@@ -206,7 +231,7 @@ def generate(manifest: Manifest, execution_home: Path) -> dict[str, str]:
     })
     generated.append(config)
     observer = agents / "lab-ob.md"
-    atomic_write(observer, _observer().encode(), 0o444)
+    atomic_write(observer, _observer(manifest).encode(), 0o444)
     generated.append(observer)
     report = runtime_root / ".opencode" / "commands" / "ob.md"
     if report.exists():

@@ -305,6 +305,48 @@ class ProjectPlanTest(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "unknown role"):
                 load_plan(root / "labflow-plan.toml")
 
+    def test_observer_can_read_ontology_docs_through_exact_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            (root / "om-labflow/docs").mkdir(parents=True)
+            lab = parent / "lab"
+            lab.mkdir()
+
+            with patch.dict(os.environ, {"OM_LABFLOW_PATH": "om-labflow"}):
+                home, _, _ = prepare_execution(root, lab, 4199)
+
+            observer = (home / "ws/.opencode/agents/lab-ob.md").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn('"read":"deny"', observer)
+            self.assertIn(
+                '"cat -- om-labflow/docs/DOMAIN.md":"allow"', observer,
+            )
+            self.assertIn(
+                '"cat -- om-labflow/docs/QUERY-DESIGN-GUIDE.md":"allow"', observer,
+            )
+            self.assertIn("`cat -- om-labflow/docs/DOMAIN.md`", observer)
+            self.assertIn("不要仅根据数据库列名猜测业务语义", observer)
+
+    def test_observer_cannot_read_external_ontology_docs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            external = parent / "external-om"
+            (external / "docs").mkdir(parents=True)
+            lab = parent / "lab"
+            lab.mkdir()
+
+            with patch.dict(os.environ, {"OM_LABFLOW_PATH": str(external)}):
+                home, _, _ = prepare_execution(root, lab, 4199)
+
+            observer = (home / "ws/.opencode/agents/lab-ob.md").read_text(
+                encoding="utf-8",
+            )
+            self.assertIn('"read":"deny"', observer)
+            self.assertNotIn("external-om", observer)
+
     def test_optional_feedback_edge_can_close_an_iteration_loop(self):
         plan = '''
 [artifacts."draft.a1"]
