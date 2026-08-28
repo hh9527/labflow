@@ -121,7 +121,7 @@ def _coordinator(manifest: Manifest) -> str:
 
 
 def _task_commands(manifest: Manifest, artifact: dict[str, Any]) -> list[str]:
-    commands: list[str] = []
+    commands: list[str] = list(artifact["commands"])
     for item in artifact["inputs"]:
         value = item["path"].rstrip("/")
         candidate = manifest.root / value
@@ -133,9 +133,10 @@ def _task_commands(manifest: Manifest, artifact: dict[str, Any]) -> list[str]:
     return commands
 
 
-def dag_hash(workflow: dict[str, Any]) -> str:
+def dag_hash(manifest: Manifest) -> str:
     encoded = json.dumps(
-        workflow, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        {"roles": manifest.roles, "workflow": manifest.workflow},
+        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -145,7 +146,16 @@ def _role_content(
     assets: dict[str, list[str]], commands: list[str],
 ) -> bytes:
     role = manifest.roles[name]
-    permission = _role_permission({**role, "commands": commands}, assets)
+    combined_assets = {
+        "read": list(dict.fromkeys([
+            *assets["read"], *role["read"], *role["write"],
+        ])),
+        "write": list(dict.fromkeys([*assets["write"], *role["write"]])),
+    }
+    combined_commands = list(dict.fromkeys([*commands, *role["commands"]]))
+    permission = _role_permission(
+        {**role, "commands": combined_commands}, combined_assets,
+    )
     permission["bash"]["labflow agent *"] = "deny"
     permission["bash"]["./labflow agent *"] = "deny"
     return (_frontmatter(role["description"], "subagent", permission)
@@ -189,7 +199,7 @@ def _activate_role(source: Path, target: Path) -> Path:
 
 
 def _role_generation(manifest: Manifest, execution_home: Path) -> Path:
-    return execution_home / "roles" / dag_hash(manifest.workflow)
+    return execution_home / "roles" / dag_hash(manifest)
 
 
 def reset_role(manifest: Manifest, name: str, execution_home: Path) -> None:

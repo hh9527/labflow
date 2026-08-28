@@ -18,7 +18,7 @@ from typing import Any, Iterator
 from .client import Client
 from .config import ControlError
 from .events import pending_optional_requests, pending_requests
-from .runtime_opencode import configure_task_role, reset_role, resume_prompt
+from .runtime_opencode import configure_task_role, dag_hash, reset_role, resume_prompt
 from .state import atomic_json
 from .task_cli import (
     TaskError, assign_task, clear_session_qualifications, submit, task_records,
@@ -517,8 +517,8 @@ class Supervisor:
             self.plan_error = str(exc)
             self._store_active_control()
             return
-        previous_revision = _workflow_revision(self.manifest.workflow)
-        current_revision = _workflow_revision(manifest.workflow)
+        previous_revision = dag_hash(self.manifest)
+        current_revision = dag_hash(manifest)
         if current_revision != previous_revision:
             for role in set(self.manifest.workflow["roles"]) | set(manifest.workflow["roles"]):
                 supersede_role_task(self.manifest.root, role, "Plan was reloaded")

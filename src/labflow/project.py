@@ -102,6 +102,14 @@ def _strings(value: Any, where: str) -> list[str]:
     return list(value)
 
 
+def _commands(value: Any, where: str) -> list[str]:
+    commands = _strings(value, where)
+    if any(command.strip() != command or "\n" in command or "\r" in command
+           for command in commands):
+        raise ControlError(f"{where} must contain command patterns")
+    return list(dict.fromkeys(commands))
+
+
 def _project_path(root: Path, value: str, where: str) -> Path:
     normalized = value.rstrip("/")
     candidate = root / normalized
@@ -125,11 +133,14 @@ def load_plan(path: Path | None = None) -> Manifest:
         raise ControlError(f"missing plan: {plan_path}", 66) from None
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ControlError(f"invalid {PLAN_NAME}: {exc}") from None
-    if not isinstance(data, dict) or set(data) != {"artifacts"}:
-        raise ControlError(f"{PLAN_NAME} may only contain artifacts")
+    if not isinstance(data, dict) or "artifacts" not in data or set(data) - {"artifacts", "roles"}:
+        raise ControlError(f"{PLAN_NAME} may only contain artifacts and roles")
     raw_artifacts = data.get("artifacts")
     if not isinstance(raw_artifacts, dict) or not raw_artifacts:
         raise ControlError("artifacts must be a non-empty table")
+    raw_roles = data.get("roles", {})
+    if not isinstance(raw_roles, dict):
+        raise ControlError("roles must be a table")
 
     roles: list[str] = []
     artifact_rows: dict[str, dict[str, Any]] = {}
@@ -137,7 +148,7 @@ def load_plan(path: Path | None = None) -> Manifest:
     for name, raw in raw_artifacts.items():
         if not isinstance(raw, dict):
             raise ControlError(f"artifact {name} must be a table")
-        unknown = set(raw) - {"goal", "requires", "inputs", "assets", "check"}
+        unknown = set(raw) - {"goal", "requires", "inputs", "assets", "check", "commands"}
         if unknown:
             raise ControlError(
                 f"unknown artifact {name} key(s): {', '.join(sorted(unknown))}"
@@ -171,6 +182,7 @@ def load_plan(path: Path | None = None) -> Manifest:
             "requires": _strings(raw.get("requires"), f"artifact {name} requires"),
             "assets": assets,
             "check": checks,
+            "commands": _commands(raw.get("commands"), f"artifact {name} commands"),
         }
         if inputs is not None:
             artifacts[name]["inputs"] = inputs
@@ -187,24 +199,26 @@ def load_plan(path: Path | None = None) -> Manifest:
         raise ControlError(str(exc), exc.code) from None
 
     role_configs: dict[str, dict[str, Any]] = {}
+    unknown_roles = set(raw_roles) - set(roles)
+    if unknown_roles:
+        raise ControlError(f"unknown role(s): {', '.join(sorted(unknown_roles))}")
     for role in roles:
-        commands: list[str] = []
-        for artifact in workflow["artifacts"].values():
-            if artifact["owner"] != role:
-                continue
-            for item in artifact["inputs"]:
-                value = item["path"].rstrip("/")
-                candidate = root / value
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    for command in (value, f"./{value}"):
-                        pattern = f"{command} *"
-                        if pattern not in commands:
-                            commands.append(pattern)
+        raw_role = raw_roles.get(role, {})
+        if not isinstance(raw_role, dict):
+            raise ControlError(f"role {role} must be a table")
+        unknown = set(raw_role) - {"read", "write", "commands"}
+        if unknown:
+            raise ControlError(f"unknown role {role} key(s): {', '.join(sorted(unknown))}")
+        read = _strings(raw_role.get("read"), f"role {role} read")
+        write = _strings(raw_role.get("write"), f"role {role} write")
+        for value in (*read, *write):
+            _project_path(root, value, f"role {role}")
         role_configs[role] = {
             "description": f"Labflow 角色 {role}。",
             "prompt": f"你是 Labflow 角色 {role}。",
-            "commands": commands,
-            "preflight": [],
+            "read": read,
+            "write": write,
+            "commands": _commands(raw_role.get("commands"), f"role {role} commands"),
         }
 
     identifier = execution_id(root)

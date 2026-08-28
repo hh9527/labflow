@@ -340,6 +340,10 @@ class ArtifactWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(TaskError, "must contain paths"):
             validate_workflow(base)
         base["artifacts"]["work.a1"]["assets"] = []
+        base["artifacts"]["start"]["commands"] = ["true"]
+        with self.assertRaisesRegex(TaskError, "Host-owned artifact start cannot have commands"):
+            validate_workflow(base)
+        base["artifacts"]["start"].pop("commands")
         base["artifacts"]["start"]["owner"] = "host"
         with self.assertRaisesRegex(TaskError, "unknown artifact start key.*owner"):
             validate_workflow(base)

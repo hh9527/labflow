@@ -78,6 +78,15 @@ def _assets(value: Any, where: str) -> list[dict[str, Any]]:
     return result
 
 
+def _commands(value: Any, where: str) -> list[str]:
+    if (not isinstance(value, list)
+            or not all(isinstance(item, str) and item.strip() == item
+                       and item and "\n" not in item and "\r" not in item
+                       for item in value)):
+        raise TaskError(f"{where} must be a command pattern array")
+    return list(dict.fromkeys(value))
+
+
 def _keys(value: dict[str, Any], allowed: set[str], where: str) -> None:
     unknown = set(value) - allowed
     if unknown:
@@ -124,7 +133,10 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         name = _name(raw_name, "artifact id")
         if not isinstance(raw, dict):
             raise TaskError(f"artifact {name} must be an object")
-        _keys(raw, {"id", "desc", "requires", "inputs", "assets", "check", "instruction"},
+        _keys(raw, {
+            "id", "desc", "requires", "inputs", "assets", "check", "instruction",
+            "commands",
+        },
               f"artifact {name}")
         if raw.get("id", name) != name:
             raise TaskError(f"artifact id does not match its key: {name}")
@@ -156,10 +168,13 @@ def validate_workflow(value: Any) -> dict[str, Any]:
                 f"session qualification {name} names unknown role: {qualification_role}"
             )
         instruction = raw.get("instruction")
+        commands = _commands(raw.get("commands", []), f"artifact {name} commands")
         if owner != "host" and (not isinstance(instruction, str) or not instruction.strip()):
             raise TaskError(f"role-owned artifact {name} instruction must be nonempty")
         if owner == "host" and instruction is not None:
             raise TaskError(f"Host-owned artifact {name} cannot have an instruction")
+        if owner == "host" and commands:
+            raise TaskError(f"Host-owned artifact {name} cannot have commands")
         artifacts[name] = {
             "id": name,
             "desc": description,
@@ -169,6 +184,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
                        if "inputs" in raw else None),
             "assets": _assets(raw.get("assets", []), f"artifact {name} assets"),
             "check": _assets(raw.get("check", []), f"artifact {name} check"),
+            "commands": commands,
             "instruction": instruction,
         }
 

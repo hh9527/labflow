@@ -70,6 +70,10 @@ prj-home/
       supervisor
     artifacts/
       <artifact>
+    roles/
+      <dag-hash>/
+        <artifact>.md
+        .idle.<role>.md
     ws/
       opencode.json
       .opencode/
@@ -135,6 +139,11 @@ have a `goal`; all others are Host-owned. A name containing `.sess.<role>` repre
 to that role Session.
 
 ```toml
+[roles.builder]
+read = ["shared/"]
+write = ["scratch/builder/"]
+commands = ["telora --help", "telora -C *"]
+
 [artifacts.tool]
 assets = ["bin/tool"]
 
@@ -148,6 +157,7 @@ requires = ["learn.sess.builder", "feedback?"]
 inputs = ["docs/"]
 assets = ["src/"]
 check = ["src/result.txt"]
+commands = ["project-tool verify *"]
 
 [artifacts.feedback]
 assets = ["feedback.md"]
@@ -162,6 +172,12 @@ Fields have distinct meanings:
   `requires` Artifacts' `assets`; an explicit value, including `[]`, replaces that default.
 - `check` lists paths that must exist before the Artifact can settle.
 - `goal` is the task document used for a role-owned Artifact.
+- `commands` grants Artifact-scoped shell command patterns. Executable files in `inputs` also grant
+  `<path> *` and `./<path> *` automatically.
+
+An optional `[roles.<role>]` table grants stable `read`, `write`, and `commands` permissions. Role
+permissions are appended after the selected Artifact's permissions, and role `write` paths are also
+readable. A configured role must exist as an owner inferred from an Artifact suffix.
 
 The Supervisor maintains one long-lived Session per role. It creates a task record in
 `states.sqlite`, prompts an idle role only when one of its Artifacts is runnable, validates `assets`
@@ -171,12 +187,16 @@ previous task ended. Input Asset changes never trigger a task by themselves.
 
 Generated role files contain only the stable role identity and contain no task instructions. On Plan
 activation, Supervisor writes immutable permission snapshots for every role-owned Artifact under
-`.labflow-exec/roles/<dag-hash>/`, plus a deny-all snapshot for each role. Immediately before each
+`.labflow-exec/roles/<dag-hash>/`, plus a role-only idle snapshot for each role. Immediately before each
 dispatch, it atomically replaces `.labflow-exec/ws/.opencode/agents/<role>.md` with a hard link to the
 selected snapshot: resolved `inputs` plus `assets` are readable, only `assets` are writable, and
-executable inputs provide that task's command allowlist. A settled task links the role back to its
-deny-all identity. Supervisor supplies the selected Artifact's complete `goal`, dependencies, and
-resolved input list in the task prompt.
+Artifact commands and executable inputs provide that task's command allowlist. Stable role permissions
+are appended to every snapshot. A settled task links the role back to its role-only identity.
+Supervisor supplies the selected Artifact's complete `goal`, dependencies, and resolved input list in
+the task prompt.
+
+The generation hash covers both the normalized Artifact DAG and role permissions. Changing either
+creates a new snapshot generation and supersedes active tasks before they are dispatched again.
 
 ## Development
 

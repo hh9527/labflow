@@ -85,6 +85,53 @@ class ProjectPlanTest(unittest.TestCase):
                 "write": ["src/"],
             })
 
+    def test_role_permissions_are_appended_to_artifact_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            (root / "shared").mkdir()
+            (root / "scratch").mkdir()
+            plan = PLAN.replace(
+                'goal = "goals/work.md"',
+                'goal = "goals/work.md"\ncommands = ["project-tool verify *"]',
+            ) + '''
+
+[roles.a1]
+read = ["shared/"]
+write = ["scratch/"]
+commands = ["telora --help", "telora -C *"]
+'''
+            (root / "labflow-plan.toml").write_text(plan, encoding="utf-8")
+            manifest = load_plan(root / "labflow-plan.toml")
+            self.assertEqual(manifest.roles["a1"]["read"], ["shared/"])
+            self.assertEqual(manifest.roles["a1"]["write"], ["scratch/"])
+
+            lab = parent / "lab"
+            lab.mkdir()
+            home, _, _ = prepare_execution(root, lab, 4199)
+            generation = home / "roles" / dag_hash(manifest)
+            idle = (generation / ".idle.a1.md").read_text(encoding="utf-8")
+            learn = (generation / "learn.sess.a1.md").read_text(encoding="utf-8")
+            work = (generation / "work.a1.md").read_text(encoding="utf-8")
+
+            self.assertIn('"shared/**":"allow"', idle)
+            self.assertIn('"scratch/**":"allow"', idle)
+            self.assertIn('"telora --help":"allow"', idle)
+            self.assertIn('"telora -C *":"allow"', idle)
+            self.assertIn('"bin/tool *":"allow"', learn)
+            self.assertNotIn('"project-tool verify *":"allow"', learn)
+            self.assertIn('"project-tool verify *":"allow"', work)
+            self.assertLess(
+                work.index('"src/**":"allow"'),
+                work.index('"scratch/**":"allow"'),
+            )
+
+            (root / "labflow-plan.toml").write_text(
+                plan + "\n[roles.unknown]\ncommands = ['true']\n", encoding="utf-8",
+            )
+            with self.assertRaisesRegex(Exception, "unknown role"):
+                load_plan(root / "labflow-plan.toml")
+
     def test_optional_feedback_edge_can_close_an_iteration_loop(self):
         plan = '''
 [artifacts."draft.a1"]
@@ -146,7 +193,7 @@ assets = ["feedback.md"]
             self.assertNotIn("唯一任务", role)
             self.assertNotIn('"bin/tool":"allow"', role)
             self.assertNotIn('"src/**":"allow"', role)
-            generation = home / "roles" / dag_hash(manifest.workflow)
+            generation = home / "roles" / dag_hash(manifest)
             idle = generation / ".idle.a1.md"
             self.assertTrue(idle.is_file())
             self.assertEqual(
@@ -369,6 +416,32 @@ assets = ["later.txt"]
             finally:
                 supervisor.close()
 
+    def test_role_permission_change_supersedes_active_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = self.project(parent)
+            lab = parent / "lab"
+            lab.mkdir()
+            home, manifest, _ = prepare_execution(root, lab, 4199)
+            refresh_artifact(root, manifest.workflow, "tool")
+            assign_task(root, manifest.workflow, "a1", "learn.sess.a1")
+            previous = dag_hash(manifest)
+
+            with (root / "labflow-plan.toml").open("a", encoding="utf-8") as plan:
+                plan.write('\n[roles.a1]\ncommands = ["telora *"]\n')
+            (home / "ctrl/active").touch()
+            supervisor = Supervisor(home, 4199)
+            try:
+                supervisor._sync_active()
+                current = dag_hash(supervisor.manifest)
+            finally:
+                supervisor.close()
+
+            self.assertNotEqual(previous, current)
+            self.assertTrue((home / "roles" / current).is_dir())
+            self.assertEqual(task_records(root)["active"], [])
+            self.assertEqual(task_records(root)["history"][0]["status"], "stale")
+
     def test_supervisor_uses_project_databases_and_recovers_root_session(self):
         class FailingWriter:
             def check(self):
@@ -508,7 +581,7 @@ assets = ["later.txt"]
                 )
                 self.assertIn('"bin/tool":"allow"', scoped_role)
                 self.assertNotIn('"src/**":"allow"', scoped_role)
-                generation = home / "roles" / dag_hash(first.manifest.workflow)
+                generation = home / "roles" / dag_hash(first.manifest)
                 self.assertEqual(
                     (generation / "learn.sess.a1.md").stat().st_ino,
                     (home / "ws/.opencode/agents/a1.md").stat().st_ino,
