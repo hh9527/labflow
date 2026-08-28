@@ -21,24 +21,24 @@ def artifact_workflow() -> dict:
         "artifacts": {
             "input-0": {
                 "desc": "Initial input",
-                "assets": [{"path": "guide/", "level": 0}],
+                "assets": ["guide/"],
             },
             "input-optional": {
                 "desc": "Optional input",
-                "assets": [{"path": "notes.txt", "level": 1}],
+                "assets": ["notes.txt"],
             },
             "output-1.a1": {
                 "desc": "First output",
-                "input": ["input-0", "input-optional?"],
-                "assets": [{"path": "result-1.txt", "level": 2}],
+                "requires": ["input-0", "input-optional?"],
+                "assets": ["result-1.txt"],
                 "instruction": "Create result-1.txt",
             },
             "output-2.a2": {
-                "desc": "Second output", "input": ["output-1.a1"],
+                "desc": "Second output", "requires": ["output-1.a1"],
                 "assets": ["result-2.txt"], "instruction": "Create result-2.txt",
             },
             "output-3": {
-                "desc": "Final output", "input": ["output-1.a1", "output-2.a2"],
+                "desc": "Final output", "requires": ["output-1.a1", "output-2.a2"],
             },
         },
     })
@@ -52,7 +52,14 @@ class ArtifactWorkflowTest(unittest.TestCase):
         raw = json.loads(json.dumps(value))
         for artifact in raw["artifacts"].values():
             artifact.pop("owner")
-        (root / "experiment.json").write_text(json.dumps({"workflow": raw}), encoding="utf-8")
+            for field in ("inputs", "assets", "check"):
+                artifact[field] = [item["path"] for item in artifact[field]]
+        control = root / ".labflow-exec"
+        control.mkdir()
+        (control / "runtime.json").write_text(
+            json.dumps({"schema": "labflow.project-runtime/v1", "workflow": raw}),
+            encoding="utf-8",
+        )
         return value
 
     def test_assignment_lists_complete_inputs_and_assets_with_change_flags(self):
@@ -67,11 +74,14 @@ class ArtifactWorkflowTest(unittest.TestCase):
             self.assertEqual(first["target"], {
                 "name": "output-1.a1", "instruction": "Create result-1.txt",
             })
-            self.assertEqual(first["inputs"], [
+            self.assertEqual(first["requires"], [
                 {"name": "input-0", "fresh": True},
                 {"name": "input-optional", "fresh": None},
             ])
-            self.assertEqual(first["assets"], [{"path": "guide/", "updated": True}])
+            self.assertEqual(first["inputs"], [
+                {"path": "guide/", "updated": True},
+                {"path": "notes.txt", "updated": False},
+            ])
 
             (root / "result-1.txt").write_text("one", encoding="utf-8")
             submit(root, value, "a1", ["output-1.a1"])
@@ -80,14 +90,29 @@ class ArtifactWorkflowTest(unittest.TestCase):
 
             second = assign_task(root, value, "a1", "output-1.a1")
             assert second is not None
-            self.assertEqual(second["inputs"], [
+            self.assertEqual(second["requires"], [
                 {"name": "input-0", "fresh": False},
                 {"name": "input-optional", "fresh": True},
             ])
-            self.assertEqual(second["assets"], [
+            self.assertEqual(second["inputs"], [
                 {"path": "guide/", "updated": False},
                 {"path": "notes.txt", "updated": True},
             ])
+
+    def test_asset_changes_do_not_trigger_a_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = self.prepare(root)
+            refresh_artifact(root, value, "input-0")
+            task = assign_task(root, value, "a1", "output-1.a1")
+            assert task is not None
+            (root / "result-1.txt").write_text("one", encoding="utf-8")
+            submit(root, value, "a1", ["output-1.a1"])
+
+            (root / "guide" / "GOAL.md").write_text("changed", encoding="utf-8")
+
+            self.assertIsNone(assign_task(root, value, "a1", "output-1.a1"))
+            self.assertEqual(len(task_records(root)["history"]), 1)
 
     def test_shared_asset_is_deduplicated(self):
         workflow = validate_workflow({
@@ -95,9 +120,9 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "left": {"desc": "left", "assets": ["shared.txt"]},
                 "right": {"desc": "right", "assets": ["shared.txt"]},
-                "work.a1": {"desc": "work", "input": ["left", "right"],
+                "work.a1": {"desc": "work", "requires": ["left", "right"],
                          "instruction": "work"},
-                "done": {"desc": "done", "input": ["work.a1"]},
+                "done": {"desc": "done", "requires": ["work.a1"]},
             },
         })
         with tempfile.TemporaryDirectory() as temporary:
@@ -107,7 +132,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
             refresh_artifact(root, workflow, "right")
             result = assign_task(root, workflow, "a1", "work.a1")
             assert result is not None
-            self.assertEqual(result["assets"], [{"path": "shared.txt", "updated": True}])
+            self.assertEqual(result["inputs"], [{"path": "shared.txt", "updated": True}])
 
     def test_role_permissions_are_derived_from_owned_and_input_assets(self):
         workflow = validate_workflow({
@@ -115,8 +140,9 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "input.a2": {"desc": "input", "assets": ["model/"],
                              "instruction": "produce input"},
-                "output.a1": {"desc": "output", "input": ["input.a2"],
-                              "assets": ["result.json"], "instruction": "produce output"},
+                "output.a1": {"desc": "output", "requires": ["input.a2"],
+                              "assets": ["result.json"],
+                              "instruction": "produce output"},
             },
         })
         self.assertEqual(role_asset_permissions(workflow, "a1"), {
@@ -125,6 +151,17 @@ class ArtifactWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(role_asset_permissions(workflow, "a2"), {
             "read": ["model/"], "write": ["model/"],
+        })
+
+        explicit_empty = json.loads(json.dumps(workflow))
+        for artifact in explicit_empty["artifacts"].values():
+            artifact.pop("owner")
+            for field in ("inputs", "assets", "check"):
+                artifact[field] = [item["path"] for item in artifact[field]]
+        explicit_empty["artifacts"]["output.a1"]["inputs"] = []
+        explicit_empty = validate_workflow(explicit_empty)
+        self.assertEqual(role_asset_permissions(explicit_empty, "a1"), {
+            "read": ["result.json"], "write": ["result.json"],
         })
 
     def test_assignment_returns_none_when_target_is_not_runnable(self):
@@ -138,11 +175,11 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "schema": "labflow.workflow/v1", "roles": ["a1"],
             "artifacts": {
                 "input": {"desc": "input"},
-                "first.a1": {"desc": "first", "input": ["input"],
+                "first.a1": {"desc": "first", "requires": ["input"],
                           "assets": ["first.txt"], "instruction": "first"},
-                "second.a1": {"desc": "second", "input": ["input"],
+                "second.a1": {"desc": "second", "requires": ["input"],
                            "assets": ["second.txt"], "instruction": "second"},
-                "finish": {"desc": "finish", "input": ["first.a1", "second.a1"]},
+                "finish": {"desc": "finish", "requires": ["first.a1", "second.a1"]},
             },
         })
         with tempfile.TemporaryDirectory() as temporary:
@@ -164,9 +201,9 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "schema": "labflow.workflow/v1", "roles": ["a1"],
             "artifacts": {
                 "input": {"desc": "input"},
-                "first.a1": {"desc": "first", "input": ["input"],
+                "first.a1": {"desc": "first", "requires": ["input"],
                              "instruction": "first"},
-                "second.a1": {"desc": "second", "input": ["input"],
+                "second.a1": {"desc": "second", "requires": ["input"],
                               "instruction": "second"},
             },
         })
@@ -226,13 +263,13 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "artifacts": {
                 "language": {"desc": "language"},
                 "learn.sess.a1": {
-                    "desc": "learn", "input": ["language"], "instruction": "learn",
+                    "desc": "learn", "requires": ["language"], "instruction": "learn",
                 },
                 "work.a1": {
-                    "desc": "work", "input": ["language", "learn.sess.a1"],
+                    "desc": "work", "requires": ["language", "learn.sess.a1"],
                     "assets": ["work.txt"], "instruction": "work",
                 },
-                "done": {"desc": "done", "input": ["work.a1"]},
+                "done": {"desc": "done", "requires": ["work.a1"]},
             },
         })
         with tempfile.TemporaryDirectory() as temporary:
@@ -288,19 +325,19 @@ class ArtifactWorkflowTest(unittest.TestCase):
             "schema": "labflow.workflow/v1", "roles": ["a1"],
             "artifacts": {
                 "start": {"desc": "start"},
-                "work.a1": {"desc": "work", "input": ["missing?"],
+                "work.a1": {"desc": "work", "requires": ["missing?"],
                          "instruction": "work"},
-                "finish": {"desc": "finish", "input": ["work.a1"]},
+                "finish": {"desc": "finish", "requires": ["work.a1"]},
             },
         }
-        with self.assertRaisesRegex(TaskError, "unknown input"):
+        with self.assertRaisesRegex(TaskError, "unknown requirement"):
             validate_workflow(base)
-        base["artifacts"]["work.a1"]["input"] = ["finish"]
+        base["artifacts"]["work.a1"]["requires"] = ["finish"]
         with self.assertRaisesRegex(TaskError, "dependency cycle"):
             validate_workflow(base)
-        base["artifacts"]["work.a1"]["input"] = ["start"]
-        base["artifacts"]["work.a1"]["assets"] = [{"path": "out/", "level": 3}]
-        with self.assertRaisesRegex(TaskError, "level must be 0, 1, or 2"):
+        base["artifacts"]["work.a1"]["requires"] = ["start"]
+        base["artifacts"]["work.a1"]["assets"] = [{"path": "out/"}]
+        with self.assertRaisesRegex(TaskError, "must contain paths"):
             validate_workflow(base)
         base["artifacts"]["work.a1"]["assets"] = []
         base["artifacts"]["start"]["owner"] = "host"
@@ -328,7 +365,7 @@ class ArtifactWorkflowTest(unittest.TestCase):
                 "schema": "labflow.workflow/v1", "roles": ["a1", "a2"],
                 "artifacts": {
                     "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
-                    "work.a2": {"desc": "work", "input": ["learn.sess.a1"],
+                    "work.a2": {"desc": "work", "requires": ["learn.sess.a1"],
                                 "instruction": "work"},
                 },
             })
@@ -337,15 +374,15 @@ class ArtifactWorkflowTest(unittest.TestCase):
                 "schema": "labflow.workflow/v1", "roles": ["a1"],
                 "artifacts": {
                     "learn.sess.a1": {"desc": "learn", "instruction": "learn"},
-                    "work.a1": {"desc": "work", "input": ["learn.sess.a1?"],
+                    "work.a1": {"desc": "work", "requires": ["learn.sess.a1?"],
                                 "instruction": "work"},
                 },
             })
 
-    def test_cli_exposes_status_and_benchmark_agent_commands(self):
+    def test_cli_only_exposes_project_status(self):
         self.assertEqual(parser().parse_args(["status"]).command, "status")
-        self.assertEqual(parser().parse_args(["start-problem", "0001"]).problem, "0001")
-        self.assertEqual(parser().parse_args(["end-problem", "error"]).outcome, "error")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser().parse_args(["start-problem", "0001"])
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parser().parse_args(["mark-done", "a1", "output-1"])
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):

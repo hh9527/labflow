@@ -12,11 +12,11 @@ def parser() -> argparse.ArgumentParser:
         description="Run reproducible agent laboratories and artifact workflows.",
     )
     commands = root.add_subparsers(dest="group", required=True)
-    commands.add_parser("lab", add_help=False, help="run laboratory servers")
-    commands.add_parser("attach", add_help=False, help="attach a TUI to a laboratory")
-    commands.add_parser("host", add_help=False, help="control and observe experiment sessions")
-    commands.add_parser("agent", add_help=False, help="operate inside an agent workspace")
-    commands.add_parser("supervisor", add_help=False, help="maintain Sessions and Timeline")
+    commands.add_parser("lab", add_help=False, help="manage laboratory service data")
+    commands.add_parser("attach", add_help=False, help="attach the OpenCode TUI")
+    commands.add_parser("host", add_help=False, help="read Host-facing file projections")
+    commands.add_parser("agent", add_help=False, help="inspect the project Artifact graph")
+    commands.add_parser("supervisor", add_help=False, help="maintain Sessions and execution state")
     return root
 
 

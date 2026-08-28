@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -67,20 +68,13 @@ def _assets(value: Any, where: str) -> list[dict[str, Any]]:
     result = []
     seen = set()
     for item in value:
-        if isinstance(item, str):
-            path, level = _asset_path(item, where), 2
-        elif isinstance(item, dict):
-            _keys(item, {"path", "level"}, where)
-            path = _asset_path(item.get("path"), where)
-            level = item.get("level", 2)
-            if isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 2):
-                raise TaskError(f"{where} level must be 0, 1, or 2")
-        else:
-            raise TaskError(f"{where} must contain paths or asset objects")
+        if not isinstance(item, str):
+            raise TaskError(f"{where} must contain paths")
+        path = _asset_path(item, where)
         if path in seen:
             raise TaskError(f"duplicate asset path: {path}")
         seen.add(path)
-        result.append({"path": path, "level": level})
+        result.append({"path": path})
     return result
 
 
@@ -130,30 +124,31 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         name = _name(raw_name, "artifact id")
         if not isinstance(raw, dict):
             raise TaskError(f"artifact {name} must be an object")
-        _keys(raw, {"id", "desc", "input", "assets", "instruction"}, f"artifact {name}")
+        _keys(raw, {"id", "desc", "requires", "inputs", "assets", "check", "instruction"},
+              f"artifact {name}")
         if raw.get("id", name) != name:
             raise TaskError(f"artifact id does not match its key: {name}")
         description = raw.get("desc")
         if not isinstance(description, str) or not description.strip():
             raise TaskError(f"artifact {name} desc must be nonempty")
-        raw_inputs = raw.get("input", [])
-        if not isinstance(raw_inputs, list):
-            raise TaskError(f"artifact {name} input must be an artifact id array")
-        inputs = []
+        raw_requires = raw.get("requires", [])
+        if not isinstance(raw_requires, list):
+            raise TaskError(f"artifact {name} requires must be an artifact id array")
+        requires = []
         seen = set()
-        for item in raw_inputs:
+        for item in raw_requires:
             if isinstance(item, dict):
-                _keys(item, {"id", "optional"}, f"artifact {name} input")
-                dependency = _name(item.get("id"), f"artifact {name} input")
+                _keys(item, {"id", "optional"}, f"artifact {name} requires")
+                dependency = _name(item.get("id"), f"artifact {name} requires")
                 optional = item.get("optional")
                 if not isinstance(optional, bool):
-                    raise TaskError(f"artifact {name} input optional must be boolean")
+                    raise TaskError(f"artifact {name} requires optional must be boolean")
             else:
-                dependency, optional = _artifact_ref(item, f"artifact {name} input")
+                dependency, optional = _artifact_ref(item, f"artifact {name} requires")
             if dependency in seen:
-                raise TaskError(f"artifact {name} has duplicate input: {dependency}")
+                raise TaskError(f"artifact {name} has duplicate requirement: {dependency}")
             seen.add(dependency)
-            inputs.append({"id": dependency, "optional": optional})
+            requires.append({"id": dependency, "optional": optional})
         owner = _artifact_owner(name, roles)
         qualification_role = session_qualification_role(name)
         if qualification_role is not None and qualification_role not in roles:
@@ -169,26 +164,40 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             "id": name,
             "desc": description,
             "owner": owner,
-            "input": inputs,
+            "requires": requires,
+            "inputs": (_assets(raw["inputs"], f"artifact {name} inputs")
+                       if "inputs" in raw else None),
             "assets": _assets(raw.get("assets", []), f"artifact {name} assets"),
+            "check": _assets(raw.get("check", []), f"artifact {name} check"),
             "instruction": instruction,
         }
 
     for artifact in artifacts.values():
-        for dependency in artifact["input"]:
+        for dependency in artifact["requires"]:
             if dependency["id"] not in artifacts:
-                raise TaskError(f"artifact {artifact['id']} has unknown input: {dependency['id']}")
+                raise TaskError(
+                    f"artifact {artifact['id']} has unknown requirement: {dependency['id']}"
+                )
             qualification_role = session_qualification_role(dependency["id"])
             if qualification_role is not None:
                 if dependency["optional"]:
                     raise TaskError(
-                        f"session qualification input cannot be optional: {dependency['id']}"
+                        f"session qualification requirement cannot be optional: {dependency['id']}"
                     )
                 if artifact["owner"] != qualification_role:
                     raise TaskError(
                         f"session qualification {dependency['id']} can only gate "
                         f"artifacts owned by {qualification_role}"
                     )
+
+    for artifact in artifacts.values():
+        if artifact["inputs"] is not None:
+            continue
+        inferred: dict[str, dict[str, Any]] = {}
+        for dependency in artifact["requires"]:
+            for asset in artifacts[dependency["id"]]["assets"]:
+                inferred.setdefault(asset["path"], dict(asset))
+        artifact["inputs"] = list(inferred.values())
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -199,20 +208,15 @@ def validate_workflow(value: Any) -> dict[str, Any]:
         if name in visited:
             return
         visiting.add(name)
-        for dependency in artifacts[name]["input"]:
-            visit(dependency["id"])
+        for dependency in artifacts[name]["requires"]:
+            if not dependency["optional"]:
+                visit(dependency["id"])
         visiting.remove(name)
         visited.add(name)
 
     for name in artifacts:
         visit(name)
 
-    asset_levels: dict[str, int] = {}
-    for artifact in artifacts.values():
-        for asset in artifact["assets"]:
-            previous = asset_levels.setdefault(asset["path"], asset["level"])
-            if previous != asset["level"]:
-                raise TaskError(f"asset level differs across artifacts: {asset['path']}")
     return {
         "schema": SCHEMA,
         "roles": roles,
@@ -221,13 +225,16 @@ def validate_workflow(value: Any) -> dict[str, Any]:
 
 
 def load_workflow(root: Path) -> dict[str, Any]:
-    runtime = root.parent if root.name == "ws" else root
     try:
-        manifest = json.loads((runtime / "experiment.json").read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (root / ".labflow-exec" / "runtime.json").read_text(encoding="utf-8")
+        )
     except FileNotFoundError:
-        raise TaskError(f"missing experiment.json under {root}", 66) from None
+        raise TaskError(f"missing .labflow-exec/runtime.json under {root}", 66) from None
     except (OSError, json.JSONDecodeError) as exc:
-        raise TaskError(f"invalid experiment.json: {exc}") from None
+        raise TaskError(f"invalid execution runtime: {exc}") from None
+    if not isinstance(manifest, dict) or manifest.get("schema") != "labflow.project-runtime/v1":
+        raise TaskError("invalid project runtime schema")
     return validate_workflow(manifest.get("workflow"))
 
 
@@ -242,19 +249,18 @@ def role_asset_permissions(workflow: dict[str, Any], role: str) -> dict[str, lis
         for asset in artifact["assets"]:
             write.setdefault(asset["path"], None)
             read.setdefault(asset["path"], None)
-        for reference in artifact["input"]:
-            for asset in workflow["artifacts"][reference["id"]]["assets"]:
-                read.setdefault(asset["path"], None)
+        for asset in artifact.get("inputs", []):
+            read.setdefault(asset["path"], None)
     return {"read": list(read), "write": list(write)}
 
 
 def find_root(start: Path) -> Path:
     current = start.resolve()
     for candidate in (current, *current.parents):
-        if (candidate / "experiment.json").is_file():
-            workspace = candidate / "ws"
-            return workspace if workspace.is_dir() and current.is_relative_to(workspace) else candidate
-    raise TaskError("cannot find experiment.json from current directory", 66)
+        if (candidate / "labflow-plan.toml").is_file() \
+                and (candidate / ".labflow-exec" / "runtime.json").is_file():
+            return candidate
+    raise TaskError("cannot find a prepared Labflow project from current directory", 66)
 
 
 def _atomic_write(path: Path, content: bytes, minimum_ns: int = 0) -> int:
@@ -279,6 +285,9 @@ def _atomic_write(path: Path, content: bytes, minimum_ns: int = 0) -> int:
 def _locked(root: Path) -> Iterator[None]:
     state = _task_root(root)
     state.mkdir(exist_ok=True)
+    if state.name == ".labflow-exec":
+        yield
+        return
     with (state / "lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -302,77 +311,150 @@ def _asset_state(root: Path, assets: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _artifact_path(root: Path, name: str) -> Path:
-    execution = root.parent
-    if root.name == "ws" and (execution / ".labflow-plan").is_file():
-        return execution / "artifacts" / name
+    project_control = root / ".labflow-exec"
+    if project_control.is_dir():
+        return project_control / "artifacts" / name
     # Standalone workflow evaluation keeps the same timestamp semantics without
     # pretending that the workspace belongs to a laboratory execution.
     return root / "artifacts" / name
 
 
 def _task_root(root: Path) -> Path:
-    execution = root.parent
-    if root.name == "ws" and (execution / ".labflow-plan").is_file():
-        return execution / "tasks"
+    project_control = root / ".labflow-exec"
+    if project_control.is_dir():
+        return project_control
     return root / "tasks"
 
 
-def _active_task_path(root: Path, role: str) -> Path:
-    return _task_root(root) / "active" / f"{role}.json"
+def _task_database(root: Path) -> Path:
+    return _task_root(root) / "states.sqlite"
 
 
-def _task_history_path(root: Path, task_id: str) -> Path:
-    return _task_root(root) / "history" / f"{task_id}.json"
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
+@contextmanager
+def _task_connection(root: Path) -> Iterator[sqlite3.Connection]:
+    path = _task_database(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=5)
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS task_records (
+            kind TEXT NOT NULL CHECK (kind IN ('active', 'history')),
+            identity TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (kind, identity)
+        )
+    """)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        yield connection
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _read_active(root: Path, role: str) -> dict[str, Any] | None:
+    with _task_connection(root) as connection:
+        row = connection.execute(
+            "SELECT payload FROM task_records WHERE kind = 'active' AND identity = ?",
+            (role,),
+        ).fetchone()
+    if row is None:
         return None
-    except (OSError, json.JSONDecodeError) as exc:
-        raise TaskError(f"invalid task record {path}: {exc}") from None
+    try:
+        value = json.loads(row[0])
+    except json.JSONDecodeError as exc:
+        raise TaskError(f"invalid active task record for {role}: {exc}") from None
     if not isinstance(value, dict):
-        raise TaskError(f"invalid task record {path}")
+        raise TaskError(f"invalid active task record for {role}")
     return value
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    _atomic_write(path, (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+def _write_task(root: Path, kind: str, identity: str, value: dict[str, Any]) -> None:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    with _task_connection(root) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO task_records(kind, identity, payload) VALUES (?, ?, ?)",
+            (kind, identity, payload),
+        )
 
 
-def _task_response(workflow: dict[str, Any], status: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+def _delete_active(root: Path, role: str) -> None:
+    with _task_connection(root) as connection:
+        connection.execute(
+            "DELETE FROM task_records WHERE kind = 'active' AND identity = ?", (role,),
+        )
+
+
+def _last_task_end(root: Path, role: str) -> int:
+    with _task_connection(root) as connection:
+        rows = connection.execute(
+            "SELECT payload FROM task_records WHERE kind = 'history'"
+        ).fetchall()
+    ended = 0
+    for (payload,) in rows:
+        try:
+            task = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(task, dict) or task.get("role") != role:
+            continue
+        value = task.get("submitted_at_ns") or task.get("ended_at_ns")
+        if isinstance(value, int):
+            ended = max(ended, value)
+    return ended
+
+
+def _asset_mtime_ns(root: Path, name: str) -> int:
+    path = root / name.rstrip("/")
+    try:
+        latest = path.stat().st_mtime_ns
+    except OSError:
+        return 0
+    if not path.is_dir():
+        return latest
+    try:
+        for item in path.rglob("*"):
+            try:
+                latest = max(latest, item.stat().st_mtime_ns)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return latest
+
+
+def _task_response(root: Path, workflow: dict[str, Any], status: dict[str, Any],
+                   task: dict[str, Any]) -> dict[str, Any]:
     name = task["artifacts"][0]
     target_stamp = status["artifacts"][name]["stamp_mtime_ns"]
+    previous_end = _last_task_end(root, task["role"])
     inputs = []
     assets: dict[str, bool] = {}
-    for reference in workflow["artifacts"][name]["input"]:
+    for reference in workflow["artifacts"][name]["requires"]:
         dependency = status["artifacts"][reference["id"]]
         stamp = dependency["stamp_mtime_ns"]
         fresh = None if reference["optional"] and not stamp else stamp > target_stamp
         inputs.append({"name": reference["id"], "fresh": fresh})
-        if stamp:
-            for asset in workflow["artifacts"][reference["id"]]["assets"]:
-                assets[asset["path"]] = assets.get(asset["path"], False) or bool(fresh)
+    for asset in workflow["artifacts"][name].get("inputs", []):
+        assets[asset["path"]] = _asset_mtime_ns(root, asset["path"]) > previous_end
 
     return {
         "target": {"name": name, "instruction": workflow["artifacts"][name]["instruction"]},
-        "inputs": inputs,
-        "assets": [{"path": path, "updated": updated} for path, updated in assets.items()],
+        "requires": inputs,
+        "inputs": [{"path": path, "updated": updated} for path, updated in assets.items()],
     }
 
 
 def task_records(root: Path) -> dict[str, list[dict[str, Any]]]:
-    active = []
-    history = []
-    for path in sorted((_task_root(root) / "active").glob("*.json")):
-        value = _read_json(path)
-        if value is not None:
-            active.append(value)
-    for path in sorted((_task_root(root) / "history").glob("*.json")):
-        value = _read_json(path)
-        if value is not None:
-            history.append(value)
+    with _task_connection(root) as connection:
+        rows = connection.execute(
+            "SELECT kind, payload FROM task_records ORDER BY identity"
+        ).fetchall()
+    active = [json.loads(payload) for kind, payload in rows if kind == "active"]
+    history = [json.loads(payload) for kind, payload in rows if kind == "history"]
     history.sort(key=lambda item: (item.get("started_at_ns", 0), item.get("task_id", "")))
     return {"active": active, "history": history}
 
@@ -387,7 +469,7 @@ def _task_inputs_current(status: dict[str, Any], task: dict[str, Any]) -> bool:
     ))
 
 
-def _archive_active(root: Path, path: Path, task: dict[str, Any], status: str,
+def _archive_active(root: Path, task: dict[str, Any], status: str,
                     reason: str, ended_at_ns: int | None = None) -> dict[str, Any]:
     archived = dict(task)
     archived.update({
@@ -395,18 +477,17 @@ def _archive_active(root: Path, path: Path, task: dict[str, Any], status: str,
         "ended_at_ns": time.time_ns() if ended_at_ns is None else ended_at_ns,
         "reason": reason,
     })
-    _write_json(_task_history_path(root, task["task_id"]), archived)
-    path.unlink(missing_ok=True)
+    _write_task(root, "history", task["task_id"], archived)
+    _delete_active(root, task["role"])
     return archived
 
 
 def supersede_role_task(root: Path, role: str, reason: str) -> dict[str, Any] | None:
     with _locked(root):
-        path = _active_task_path(root, role)
-        task = _read_json(path)
+        task = _read_active(root, role)
         if task is None:
             return None
-        return _archive_active(root, path, task, "stale", reason)
+        return _archive_active(root, task, "stale", reason)
 
 
 def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
@@ -417,8 +498,17 @@ def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
         if name in values:
             return values[name]
         artifact = artifacts[name]
-        dependencies = [(reference, evaluate_one(reference["id"])) for reference in artifact["input"]]
+        dependencies = []
+        for reference in artifact["requires"]:
+            if reference["optional"]:
+                marker = _artifact_path(root, reference["id"])
+                stamp = marker.stat().st_mtime_ns if marker.is_file() else 0
+                dependency = {"stamp_mtime_ns": stamp, "current": bool(stamp)}
+            else:
+                dependency = evaluate_one(reference["id"])
+            dependencies.append((reference, dependency))
         assets = _asset_state(root, artifact["assets"])
+        checks = _asset_state(root, artifact.get("check", []))
         path = _artifact_path(root, name)
         stamp = path.stat().st_mtime_ns if path.is_file() else 0
         data_dependencies = [
@@ -434,11 +524,10 @@ def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
             if not reference["optional"] or dependency["stamp_mtime_ns"]
         ), default=0)
         data_blocked_by = [reference["id"] for reference, dependency in data_dependencies
-                           if (not reference["optional"] and not dependency["current"])
-                           or (reference["optional"] and dependency["stamp_mtime_ns"]
-                               and not dependency["current"])]
+                           if not reference["optional"] and not dependency["current"]]
         current = bool(
-            stamp and assets["ready"] and not data_blocked_by and stamp > input_mtime
+            stamp and assets["ready"] and checks["ready"]
+            and not data_blocked_by and stamp > input_mtime
         )
         missing_qualifications = [
             reference["id"] for reference, dependency in qualification_dependencies
@@ -452,12 +541,14 @@ def evaluate(root: Path, workflow: dict[str, Any]) -> dict[str, Any]:
             "description": artifact["desc"],
             "current": current,
             "runnable": bool(artifact["owner"] != "host" and ready and not current),
-            "submittable": bool(artifact["owner"] == "host" and ready and assets["ready"] and not current),
+            "submittable": bool(artifact["owner"] == "host" and ready and assets["ready"]
+                               and checks["ready"] and not current),
             "stamp_mtime_ns": stamp,
             "input_mtime_ns": input_mtime,
             "blocked_by": blocked_by,
             "missing_qualifications": missing_qualifications,
             "assets": assets,
+            "checks": checks,
         }
         return values[name]
 
@@ -487,14 +578,13 @@ def refresh_artifact(root: Path, workflow: dict[str, Any], name: str, *, force: 
         ]
         if blocked_by:
             raise TaskError(f"artifact inputs are incomplete: {', '.join(blocked_by)}", 75)
-        if not value["assets"]["ready"]:
+        if not value["assets"]["ready"] or not value["checks"]["ready"]:
             raise TaskError(f"artifact assets are incomplete: {name}", 75)
         stamp = _atomic_write(_artifact_path(root, name), b"", value["input_mtime_ns"])
         if force and artifact["owner"] != "host":
-            active_path = _active_task_path(root, artifact["owner"])
-            active = _read_json(active_path)
+            active = _read_active(root, artifact["owner"])
             if active is not None:
-                _archive_active(root, active_path, active, "stale",
+                _archive_active(root, active, "stale",
                                 f"Host force-refreshed {name}")
     return {"schema": "labflow.artifact/v1", "artifact": name, "mtime_ns": stamp,
             "host_forced": force}
@@ -511,10 +601,9 @@ def remove_artifact(root: Path, workflow: dict[str, Any], name: str, *, force: b
         existed = path.is_file()
         path.unlink(missing_ok=True)
         if force and artifact["owner"] != "host":
-            active_path = _active_task_path(root, artifact["owner"])
-            active = _read_json(active_path)
+            active = _read_active(root, artifact["owner"])
             if active is not None:
-                _archive_active(root, active_path, active, "stale",
+                _archive_active(root, active, "stale",
                                 f"Host force-removed {name}")
     return {"schema": "labflow.artifact/v1", "artifact": name,
             "removed": True, "existed": existed, "host_forced": force}
@@ -547,7 +636,7 @@ def restore_artifacts(root: Path, workflow: dict[str, Any], names: list[str]) ->
                 ]
                 if data_blocked_by:
                     continue
-                if not value["assets"]["ready"]:
+                if not value["assets"]["ready"] or not value["checks"]["ready"]:
                     raise TaskError(f"cannot restore {name}; assets are incomplete", 75)
                 stamp = _atomic_write(_artifact_path(root, name), b"", value["input_mtime_ns"])
                 restored.append({"artifact": name, "mtime_ns": stamp})
@@ -582,12 +671,9 @@ def clear_session_qualifications(
             if path.is_file():
                 path.unlink()
                 removed.append(name)
-        active_path = _active_task_path(root, role)
-        active = _read_json(active_path)
+        active = _read_active(root, role)
         if active is not None:
-            _archive_active(
-                root, active_path, active, "stale", "role Session was replaced"
-            )
+            _archive_active(root, active, "stale", "role Session was replaced")
     return removed
 
 
@@ -603,12 +689,11 @@ def assign_task(root: Path, workflow: dict[str, Any], role: str,
         raise TaskError(f"artifact is not owned by {role}: {preferred}", 64)
     with _locked(root):
         status = evaluate(root, workflow)
-        active_path = _active_task_path(root, role)
-        active = _read_json(active_path)
+        active = _read_active(root, role)
         if active is not None:
             if _task_inputs_current(status, active):
-                return _task_response(workflow, status, active)
-            _archive_active(root, active_path, active, "stale",
+                return _task_response(root, workflow, status, active)
+            _archive_active(root, active, "stale",
                             "artifact inputs changed before task delivery")
         if not status["artifacts"][preferred]["runnable"]:
             return None
@@ -622,8 +707,8 @@ def assign_task(root: Path, workflow: dict[str, Any], role: str,
             "started_at_ns": started,
             "status": "active",
         }
-        _write_json(active_path, task)
-        return _task_response(workflow, status, task)
+        _write_task(root, "active", role, task)
+        return _task_response(root, workflow, status, task)
 
 
 def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) -> dict[str, Any]:
@@ -632,8 +717,7 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
     if not names or len(set(names)) != len(names):
         raise TaskError("submit requires unique artifact ids", 64)
     with _locked(root):
-        active_path = _active_task_path(root, role)
-        task = _read_json(active_path)
+        task = _read_active(root, role)
         if task is None:
             raise TaskError(f"role has no active assigned task: {role}", 75)
         expected = task.get("artifacts")
@@ -641,7 +725,7 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
             raise TaskError(f"submit must contain the complete assigned task: {', '.join(expected or [])}", 64)
         status = evaluate(root, workflow)
         if not _task_inputs_current(status, task):
-            _archive_active(root, active_path, task, "stale",
+            _archive_active(root, task, "stale",
                             "artifact inputs changed after task assignment")
             raise TaskError("artifact inputs changed after task assignment", 75)
         values = []
@@ -654,7 +738,7 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
             value = status["artifacts"][name]
             if not value["runnable"]:
                 raise TaskError(f"artifact is not runnable: {name}", 75)
-            if not value["assets"]["ready"]:
+            if not value["assets"]["ready"] or not value["checks"]["ready"]:
                 raise TaskError(f"artifact assets are incomplete: {name}", 75)
             values.append((name, value))
         refreshed = [{"artifact": name, "mtime_ns": _atomic_write(
@@ -663,8 +747,8 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
         completed = dict(task)
         completed.update({"status": "submitted", "submitted_at_ns": time.time_ns(),
                           "artifacts_refreshed": refreshed})
-        _write_json(_task_history_path(root, task["task_id"]), completed)
-        active_path.unlink(missing_ok=True)
+        _write_task(root, "history", task["task_id"], completed)
+        _delete_active(root, role)
     return {"schema": "labflow.agent-submit/v1", "role": role,
             "task_id": task["task_id"], "artifacts": refreshed}
 
@@ -674,14 +758,6 @@ def parser(prog: str = "labflow agent") -> argparse.ArgumentParser:
     value.add_argument("--root", type=Path)
     commands = value.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
-    start_command = commands.add_parser(
-        "start-problem", help="copy one prepared Benchmark problem into the active channel"
-    )
-    start_command.add_argument("problem")
-    end_command = commands.add_parser(
-        "end-problem", help="archive and clear the active Benchmark problem channel"
-    )
-    end_command.add_argument("outcome", choices=("ok", "error", "cancel"))
     return value
 
 
@@ -689,15 +765,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow agent") -> int:
     args = parser(prog).parse_args(argv)
     try:
         root = args.root.resolve() if args.root else find_root(Path.cwd())
-        if args.command == "status":
-            workflow = load_workflow(root)
-            result = workflow_status(root, workflow)
-        elif args.command == "start-problem":
-            from .benchmark_mode import start_problem
-            result = start_problem(root, args.problem)
-        else:
-            from .benchmark_mode import end_problem
-            result = end_problem(root, args.outcome)
+        workflow = load_workflow(root)
+        result = workflow_status(root, workflow)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except (TaskError, ControlError) as exc:
