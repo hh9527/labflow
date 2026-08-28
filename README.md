@@ -16,7 +16,7 @@ labflow init --port 4199
 
 `init` creates `.labflow-exec/bin/serve` and `.labflow-exec/bin/attach`. The `serve` script first asks
 the Supervisor command to prepare `.labflow-exec`, starts OpenCode from `prj-home` with the generated
-configuration, and then waits for `ctrl/supervisor`. It invokes a real Supervisor generation only
+configuration, and then waits for `artifacts/_supervisor`. It invokes a real Supervisor generation only
 while that marker exists. Leave it running in its own terminal. To attach the TUI from another
 terminal, run:
 
@@ -56,14 +56,14 @@ the same strictly read-only SQLite boundary as `labflow query`. Paths may be rel
 calling directory. Use `labflow query-om -` to read the request JSON from standard input.
 
 Host control operations are ordinary project file operations: copy or atomically replace Assets,
-touch `.labflow-exec/artifacts/<artifact>`, and update markers under `.labflow-exec/ctrl`. Host never
+touch `.labflow-exec/artifacts/<artifact>`, and update the reserved markers in that directory. Host never
 starts, stops, or calls OpenCode. Initialization does not create either control marker; publish
 initial Host Artifacts and explicitly start the Supervisor and reconciliation with:
 
 ```bash
 touch .labflow-exec/artifacts/<artifact>
-touch .labflow-exec/ctrl/supervisor
-touch .labflow-exec/ctrl/active
+touch .labflow-exec/artifacts/_supervisor
+touch .labflow-exec/artifacts/_active
 ```
 
 Once external processes are stopped, the temporary Lab service directory recorded in
@@ -91,10 +91,9 @@ prj-home/
     report-cursor
     states.sqlite
     events.sqlite
-    ctrl/
-      active
-      supervisor
     artifacts/
+      _active
+      _supervisor
       <artifact>
     ws/
       opencode.json
@@ -117,16 +116,16 @@ OPENCODE_CONFIG_DIR=<prj-home>/.labflow-exec/ws/.opencode
 `events.sqlite` stores the summarized event stream. Artifact facts remain empty timestamped files so
 the Host can publish one directly with `touch .labflow-exec/artifacts/<artifact>`.
 
-`ctrl/active` is also the Plan activation boundary. While it is absent, Supervisor observes and
-settles existing work but creates no new Session or prompt effects. Creating it or changing its mtime
+`artifacts/_active` is also the Plan activation boundary. While it is absent, Supervisor observes
+existing Sessions but creates no Session, settlement, or prompt effects. Creating it or changing its mtime
 causes Supervisor to reread `labflow-plan.toml`, regenerate `runtime.json` and OpenCode Agent files,
-and atomically switch to the new DAG. Editing the Plan without touching `ctrl/active` has no effect.
+and atomically switch to the new DAG. Editing the Plan without touching `artifacts/_active` has no effect.
 Deleting the marker stops new scheduling without discarding the last valid Plan. An invalid Plan
 leaves scheduling stopped and appears as `plan_error` in `supervisor-status.json` until the Plan is
-fixed and `ctrl/active` is touched again.
+fixed and `artifacts/_active` is touched again.
 
 One `labflow supervisor` invocation runs one generation: it records the mtime of
-`ctrl/supervisor`, then exits when that marker is touched or deleted. If the marker is absent, the
+`artifacts/_supervisor`, then exits when that marker is touched or deleted. If the marker is absent, the
 command only prepares the execution and returns. A process-independent shell loop can keep it
 available:
 
@@ -134,15 +133,20 @@ available:
 # The first call prepares .labflow-exec and returns when no marker exists.
 labflow supervisor --port 4199
 while :; do
-  while [ ! -f .labflow-exec/ctrl/supervisor ]; do sleep 0.25; done
+  while [ ! -f .labflow-exec/artifacts/_supervisor ]; do sleep 0.25; done
   labflow supervisor --port 4199
 done
 ```
 
 The launcher knows nothing about Supervisor state or OpenCode; it only waits for a regular file and
-starts a command. Touching `ctrl/supervisor` therefore restarts Supervisor through the next loop
+starts a command. Touching `artifacts/_supervisor` therefore restarts Supervisor through the next loop
 iteration, while deleting it stops Supervisor until Host recreates it. Host affects execution only
 through project Assets and these control files; it never calls the OpenCode API.
+
+`artifacts/_system-blocked` is written by a Supervisor effect when an Agent explicitly cannot
+complete a Task, or when the same Task fails protocol or mechanical validation three times within
+two minutes. While it exists, the reducer emits no scheduling effects. Host resolves the underlying
+problem and deletes this marker to resume reconciliation.
 
 ## Execution Identity
 

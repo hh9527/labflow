@@ -489,6 +489,7 @@ def _task_response(root: Path, workflow: dict[str, Any], status: dict[str, Any],
     target_stamp = status["artifacts"][name]["stamp_mtime_ns"]
     previous_end = _last_task_end(root, task["role"])
     artifact = workflow["artifacts"][name]
+    check_state = status["artifacts"][name]["checks"]
     inputs = []
     assets: dict[str, bool] = {}
     for reference in workflow["artifacts"][name]["requires"]:
@@ -518,6 +519,12 @@ def _task_response(root: Path, workflow: dict[str, Any], status: dict[str, Any],
         },
         "requires": inputs,
         "inputs": [{"path": path, "updated": updated} for path, updated in assets.items()],
+        "checks": [{
+            "path": item["path"],
+            "status": ("missing" if item["path"] in check_state["missing"]
+                       else "invalid" if item["path"] in check_state["invalid"]
+                       else "ready"),
+        } for item in artifact.get("check", [])],
     }
 
 

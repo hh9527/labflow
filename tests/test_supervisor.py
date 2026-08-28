@@ -9,7 +9,8 @@ from unittest import mock
 
 from labflow.config import ControlError
 from labflow.supervisor import (
-    EffectState, LifecycleEvent, Supervisor, SupervisorState, reduce, supervisor_lock,
+    EffectState, LifecycleEvent, Supervisor, SupervisorState, _state_dump, _state_load,
+    reduce, supervisor_lock,
 )
 from labflow.task_cli import (
     assign_task, refresh_artifact, submit, task_records, validate_workflow,
@@ -68,6 +69,10 @@ class ReducerTest(unittest.TestCase):
             "role": "a1",
             "title": "a1",
             "backend_id": "ses_a1",
+            "task": {
+                "task_id": "a1-1000000000", "artifact": "output.a1",
+                "started_at_ns": 1000000000,
+            },
         }))
         # OpenCode can briefly remain idle after accepting prompt_async.
         repeated = reduce(state, LifecycleEvent("session_observed", "plan@1", {
@@ -182,7 +187,7 @@ class ReducerTest(unittest.TestCase):
         self.assertEqual(state.executions["plan@1"].sessions["a1"].backend_id,
                          "ses_a1")
 
-    def test_completed_turn_recovers_when_busy_transition_was_missed(self):
+    def _active_task_state(self) -> SupervisorState:
         state = SupervisorState()
         reduce(state, self.execution())
         reduce(state, LifecycleEvent("observed_sessions_updated", "plan@1", {
@@ -201,19 +206,128 @@ class ReducerTest(unittest.TestCase):
         reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
             "key": prompted.key, "effect_kind": "prompt_session", "role": "a1",
             "title": "a1", "backend_id": "ses_a1",
+            "task": {
+                "task_id": "a1-1000000000", "artifact": "output.a1",
+                "started_at_ns": 1000000000,
+            },
+        }))
+        return state
+
+    def test_turn_then_idle_and_idle_then_turn_converge_to_settlement(self):
+        turn = LifecycleEvent("turn_completed", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_done",
+            "completed_at": 2000, "finish": "stop", "reply": "已完成任务。done",
+        })
+        busy = LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "busy",
+        })
+        idle = LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "idle",
+        })
+
+        turn_first = self._active_task_state()
+        reduce(turn_first, busy)
+        self.assertEqual(reduce(turn_first, turn), [])
+        first = reduce(turn_first, idle)
+
+        idle_first = self._active_task_state()
+        reduce(idle_first, busy)
+        self.assertEqual(reduce(idle_first, idle), [])
+        second = reduce(idle_first, turn)
+
+        self.assertEqual([effect.kind for effect in first], ["settle_task"])
+        self.assertEqual([effect.kind for effect in second], ["settle_task"])
+        self.assertEqual(first[0].data, second[0].data)
+
+    def test_duplicate_completed_turn_does_not_duplicate_settlement(self):
+        state = self._active_task_state()
+        reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "idle",
+        }))
+        turn = LifecycleEvent("turn_completed", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_done",
+            "completed_at": 2000, "finish": "stop", "reply": "已完成任务。done",
+        })
+
+        self.assertEqual([effect.kind for effect in reduce(state, turn)], ["settle_task"])
+        self.assertEqual(reduce(state, turn), [])
+
+    def test_validation_failure_event_requests_one_repair_prompt(self):
+        state = self._active_task_state()
+        reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "idle",
+        }))
+        event = LifecycleEvent("task_validation_failed", "plan@1", {
+            "role": "a1", "task_id": "a1-1000000000",
+            "turn_id": "msg_done", "error": "artifact assets are incomplete", "at": 2000,
+        })
+
+        effects = reduce(state, event)
+
+        self.assertEqual([effect.kind for effect in effects], ["prompt_session"])
+        self.assertEqual(effects[0].data["error"], "artifact assets are incomplete")
+        self.assertTrue(effects[0].data["include_checks"])
+
+    def test_unclassified_reply_is_retried_without_mechanical_checks(self):
+        state = self._active_task_state()
+        reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "busy",
+        }))
+        effects = reduce(state, LifecycleEvent("turn_completed", "plan@1", {
+            "role": "a1", "title": "a1", "message_id": "msg_bad",
+            "completed_at": 2000, "finish": "stop", "reply": "任务做完了",
+        }))
+        self.assertEqual(effects, [])
+
+        effects = reduce(state, LifecycleEvent("session_observed", "plan@1", {
+            "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "idle",
+        }))
+        self.assertEqual([effect.kind for effect in effects], ["prompt_session"])
+        self.assertIn("reply must start", effects[0].data["error"])
+        self.assertFalse(effects[0].data["include_checks"])
+
+    def test_three_recent_validation_failures_block_execution_until_host_clears_it(self):
+        state = self._active_task_state()
+        effects = []
+        for index, at in enumerate((2000, 3000, 4000), 1):
+            reduce(state, LifecycleEvent("session_observed", "plan@1", {
+                "role": "a1", "title": "a1", "backend_id": "ses_a1", "status": "idle",
+            }))
+            effects = reduce(state, LifecycleEvent("task_validation_failed", "plan@1", {
+                "role": "a1", "task_id": "a1-1000000000",
+                "turn_id": f"msg-{index}", "error": "artifact assets are incomplete",
+                "at": at,
+            }))
+            if index < 3:
+                self.assertEqual([effect.kind for effect in effects], ["prompt_session"])
+                reduce(state, LifecycleEvent("effect_succeeded", "plan@1", {
+                    "key": effects[0].key, "effect_kind": "prompt_session",
+                    "role": "a1", "title": "a1", "backend_id": "ses_a1",
+                }))
+
+        self.assertEqual([effect.kind for effect in effects], ["write_system_blocked"])
+        self.assertIsNotNone(state.executions["plan@1"].blocked_reason)
+        resumed = reduce(state, LifecycleEvent("system_blocked_observed", "plan@1", {
+            "present": False,
+        }))
+        self.assertIsNone(state.executions["plan@1"].blocked_reason)
+        self.assertEqual([effect.kind for effect in resumed], ["prompt_session"])
+
+    def test_failure_window_and_blocked_state_survive_restart(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+        execution.blocked_reason = "artifact assets are incomplete"
+        reduce(state, LifecycleEvent("task_validation_failed", "plan@1", {
+            "role": "a1", "task_id": "a1-1000000000", "turn_id": "msg-1",
+            "error": "artifact assets are incomplete", "at": 2000,
         }))
 
-        retried = reduce(state, LifecycleEvent("session_observed", "plan@1", {
-            "role": "a1", "title": "a1", "backend_id": "ses_a1",
-            "status": "idle", "completed_turn": True,
-        }))
+        restored = _state_load(_state_dump(state))
 
-        self.assertEqual(retried, [])
-        retried = reduce(state, LifecycleEvent("workflow_observed", "plan@1", {
-            "runnable": {"a1": [("output.a1", 11)]},
-        }))
-        self.assertEqual([effect.kind for effect in retried], ["prompt_session"])
-        self.assertNotEqual(prompted.key, retried[0].key)
+        restored_execution = restored.executions["plan@1"]
+        self.assertEqual(restored_execution.blocked_reason,
+                         "artifact assets are incomplete")
+        self.assertEqual(restored_execution.failures["a1"].count, 1)
 
 
 class SupervisorOwnershipTest(unittest.TestCase):

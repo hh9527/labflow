@@ -46,6 +46,7 @@ class Effect:
     title: str
     backend_id: str | None = None
     artifact: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -65,6 +66,26 @@ class SessionState:
     missing_epoch: int = 0
     observed: bool = False
     error: str | None = None
+    completed_turn_id: str | None = None
+    completed_turn_at: int = 0
+    completed_turn_reply: str = ""
+    error_kind: str | None = None
+
+
+@dataclass
+class ActiveTaskState:
+    task_id: str
+    artifact: str
+    started_at_ns: int
+
+
+@dataclass
+class FailureState:
+    task_id: str
+    kind: str
+    count: int
+    first_at: int
+    last_at: int
 
 
 @dataclass
@@ -85,6 +106,10 @@ class ExecutionState:
     sessions: dict[str, SessionState] = field(default_factory=dict)
     observed_sessions: dict[str, SessionState] = field(default_factory=dict)
     sessions_initialized: bool = False
+    active_tasks: dict[str, ActiveTaskState] = field(default_factory=dict)
+    observation_error: str | None = None
+    failures: dict[str, FailureState] = field(default_factory=dict)
+    blocked_reason: str | None = None
 
 
 @dataclass
@@ -92,6 +117,10 @@ class SupervisorState:
     executions: dict[str, ExecutionState] = field(default_factory=dict)
     effects: dict[str, EffectState] = field(default_factory=dict)
     seen_messages: set[tuple[str, str, str]] = field(default_factory=set)
+    active_mtime: int | None = None
+    applied_active_mtime: int | None = None
+    plan_error: str | None = None
+    active: bool = False
 
 
 def _session_dump(value: SessionState) -> dict[str, Any]:
@@ -99,7 +128,10 @@ def _session_dump(value: SessionState) -> dict[str, Any]:
         "role": value.role, "title": value.title, "backend_id": value.backend_id,
         "status": value.status, "idle_epoch": value.idle_epoch,
         "missing_epoch": value.missing_epoch, "observed": value.observed,
-        "error": value.error,
+        "error": value.error, "completed_turn_id": value.completed_turn_id,
+        "completed_turn_at": value.completed_turn_at,
+        "completed_turn_reply": value.completed_turn_reply,
+        "error_kind": value.error_kind,
     }
 
 
@@ -108,7 +140,10 @@ def _session_load(value: dict[str, Any]) -> SessionState:
         str(value["role"]), str(value["title"]), value.get("backend_id"),
         str(value.get("status", "missing")), int(value.get("idle_epoch", 0)),
         int(value.get("missing_epoch", 0)), bool(value.get("observed", False)),
-        value.get("error"),
+        value.get("error"), value.get("completed_turn_id"),
+        int(value.get("completed_turn_at", 0)),
+        str(value.get("completed_turn_reply", "")),
+        value.get("error_kind"),
     )
 
 
@@ -130,6 +165,23 @@ def _state_dump(state: SupervisorState) -> dict[str, Any]:
                 "observed_sessions": {identity: _session_dump(session)
                                       for identity, session in value.observed_sessions.items()},
                 "sessions_initialized": value.sessions_initialized,
+                "active_tasks": {
+                    role: {
+                        "task_id": task.task_id, "artifact": task.artifact,
+                        "started_at_ns": task.started_at_ns,
+                    }
+                    for role, task in value.active_tasks.items()
+                },
+                "observation_error": value.observation_error,
+                "failures": {
+                    role: {
+                        "task_id": failure.task_id, "kind": failure.kind,
+                        "count": failure.count, "first_at": failure.first_at,
+                        "last_at": failure.last_at,
+                    }
+                    for role, failure in value.failures.items()
+                },
+                "blocked_reason": value.blocked_reason,
             }
             for title, value in state.executions.items()
         },
@@ -139,6 +191,10 @@ def _state_dump(state: SupervisorState) -> dict[str, Any]:
             for key, value in state.effects.items()
         },
         "seen_messages": [list(value) for value in sorted(state.seen_messages)],
+        "active_mtime": state.active_mtime,
+        "applied_active_mtime": state.applied_active_mtime,
+        "plan_error": state.plan_error,
+        "active": state.active,
     }
 
 
@@ -165,6 +221,23 @@ def _state_load(value: Any) -> SupervisorState:
                 observed_sessions={str(identity): _session_load(session)
                                    for identity, session in item.get("observed_sessions", {}).items()},
                 sessions_initialized=bool(item.get("sessions_initialized", False)),
+                active_tasks={
+                    str(role): ActiveTaskState(
+                        str(task["task_id"]), str(task["artifact"]),
+                        int(task["started_at_ns"]),
+                    )
+                    for role, task in item.get("active_tasks", {}).items()
+                },
+                observation_error=item.get("observation_error"),
+                failures={
+                    str(role): FailureState(
+                        str(failure["task_id"]), str(failure["kind"]),
+                        int(failure["count"]), int(failure["first_at"]),
+                        int(failure["last_at"]),
+                    )
+                    for role, failure in item.get("failures", {}).items()
+                },
+                blocked_reason=item.get("blocked_reason"),
             )
         state.effects = {
             str(key): EffectState(str(item["status"]), str(item["execution"]), item.get("error"))
@@ -174,6 +247,10 @@ def _state_load(value: Any) -> SupervisorState:
             (str(item[0]), str(item[1]), str(item[2]))
             for item in value.get("seen_messages", ()) if len(item) == 3
         }
+        state.active_mtime = value.get("active_mtime")
+        state.applied_active_mtime = value.get("applied_active_mtime")
+        state.plan_error = value.get("plan_error")
+        state.active = bool(value.get("active", False))
     except (KeyError, TypeError, ValueError):
         return SupervisorState()
     return state
@@ -218,6 +295,13 @@ def _message_task(value: dict[str, Any], session_id: str, role: str,
     return "artifact", max(candidates)[1]
 
 
+def _message_reply(message: dict[str, Any]) -> str:
+    return "\n".join(
+        str(part.get("text", "")) for part in message.get("parts", ())
+        if part.get("type") == "text" and str(part.get("text", "")).strip()
+    )
+
+
 @contextmanager
 def supervisor_lock(root: Path) -> Iterator[None]:
     """Ensure one process owns reconciliation and Timeline writes for a Lab."""
@@ -253,7 +337,7 @@ def _requested(state: SupervisorState, effect: Effect) -> bool:
 def _reconcile_role(state: SupervisorState, execution: ExecutionState,
                     role: str) -> list[Effect]:
     if (not execution.active or not execution.dag or not execution.root_session_id
-            or not execution.sessions_initialized):
+            or not execution.sessions_initialized or execution.blocked_reason is not None):
         return []
     session = execution.sessions.setdefault(role, SessionState(role, role))
     if session.status == "missing":
@@ -262,6 +346,36 @@ def _reconcile_role(state: SupervisorState, execution: ExecutionState,
             "create_session", execution.title, role, role,
         )
         return [effect] if _requested(state, effect) else []
+    task = execution.active_tasks.get(role)
+    if task is not None:
+        if (session.status == "idle" and session.completed_turn_id is not None
+                and session.completed_turn_at >= task.started_at_ns // 1_000_000
+                and session.completed_turn_reply.lstrip().startswith("已完成任务。")):
+            effect = Effect(
+                _effect_key(
+                    "settle", execution.title, task.task_id,
+                    session.completed_turn_id,
+                ),
+                "settle_task", execution.title, role, session.title,
+                session.backend_id, task.artifact,
+                {"task_id": task.task_id, "turn_id": session.completed_turn_id},
+            )
+            return [effect] if _requested(state, effect) else []
+        if session.status == "idle" and session.error and session.backend_id:
+            failure = execution.failures.get(role)
+            effect = Effect(
+                _effect_key(
+                    "repair", execution.title, task.task_id, session.error,
+                    failure.count if failure is not None else 0,
+                ),
+                "prompt_session", execution.title, role, session.title,
+                session.backend_id, task.artifact, {
+                    "error": session.error,
+                    "include_checks": session.error_kind == "validation_failed",
+                },
+            )
+            return [effect] if _requested(state, effect) else []
+        return []
     runnable = execution.runnable.get(role, ())
     if session.status != "idle" or not runnable or not session.backend_id:
         return []
@@ -269,7 +383,10 @@ def _reconcile_role(state: SupervisorState, execution: ExecutionState,
         _effect_key("prompt", execution.title, session.title, runnable,
                     session.idle_epoch),
         "prompt_session", execution.title, role, session.title, session.backend_id,
-        runnable[0][0],
+        runnable[0][0], {
+            "error": session.error,
+            "include_checks": session.error_kind == "validation_failed",
+        },
     )
     return [effect] if _requested(state, effect) else []
 
@@ -282,8 +399,78 @@ def _reconcile_execution(state: SupervisorState,
     return effects
 
 
+def _block_execution(state: SupervisorState, execution: ExecutionState,
+                     role: str, task: ActiveTaskState, reason: str,
+                     at: int) -> list[Effect]:
+    execution.blocked_reason = reason
+    effect = Effect(
+        _effect_key("system-blocked", execution.title, task.task_id, reason),
+        "write_system_blocked", execution.title, role, role,
+        artifact=task.artifact,
+        data={
+            "execution": execution.title, "role": role,
+            "task_id": task.task_id, "artifact": task.artifact,
+            "reason": reason, "at": at,
+        },
+    )
+    return [effect] if _requested(state, effect) else []
+
+
+def _record_task_failure(state: SupervisorState, execution: ExecutionState,
+                         role: str, kind: str, reason: str, at: int) -> list[Effect]:
+    task = execution.active_tasks.get(role)
+    if task is None:
+        return []
+    previous = execution.failures.get(role)
+    if (previous is None or previous.task_id != task.task_id
+            or previous.kind != kind or at - previous.last_at > 120_000):
+        failure = FailureState(task.task_id, kind, 1, at, at)
+    else:
+        failure = FailureState(
+            task.task_id, kind, previous.count + 1, previous.first_at, at,
+        )
+    execution.failures[role] = failure
+    session = execution.sessions.setdefault(role, SessionState(role, role))
+    session.error = reason
+    session.error_kind = kind
+    session.completed_turn_id = None
+    session.completed_turn_at = 0
+    session.completed_turn_reply = ""
+    if failure.count >= 3:
+        return _block_execution(state, execution, role, task, reason, at)
+    return _reconcile_role(state, execution, role)
+
+
 def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
     """Mutate one event-loop-owned state object and return external work."""
+    if event.kind == "outputs_requested":
+        return [
+            Effect(_effect_key("persist", event.data.get("generation")),
+                   "persist_state", "", "", "", data={"state": _state_dump(state)}),
+            Effect(_effect_key("outputs", event.data.get("generation")),
+                   "write_outputs", "", "", ""),
+        ]
+    if event.kind == "active_control_observed":
+        observed = event.data.get("mtime_ns")
+        if observed == state.active_mtime:
+            return []
+        state.active_mtime = observed
+        state.active = False
+        state.plan_error = None
+        for known in state.executions.values():
+            known.active = False
+        if observed is None:
+            return [Effect(
+                _effect_key("store-active-control", observed),
+                "store_active_control", "", "", "",
+                data={"observed_mtime_ns": state.active_mtime,
+                      "applied_mtime_ns": state.applied_active_mtime,
+                      "error": state.plan_error},
+            )]
+        return [Effect(
+            _effect_key("reload-plan", observed), "reload_plan",
+            event.execution, "", "", data={"mtime_ns": observed},
+        )]
     if event.kind == "execution_deleted":
         state.executions.pop(event.execution, None)
         state.effects = {
@@ -313,11 +500,103 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
                               if previous and data.get("dag") else {}),
             observed_sessions=previous.observed_sessions if previous else {},
             sessions_initialized=previous.sessions_initialized if previous else False,
+            active_tasks=previous.active_tasks if previous else {},
+            observation_error=previous.observation_error if previous else None,
+            failures=previous.failures if previous else {},
+            blocked_reason=previous.blocked_reason if previous else None,
         )
         state.executions[event.execution] = execution
         return []
     execution = state.executions.get(event.execution)
     if execution is None:
+        return []
+    if event.kind == "session_observation_requested":
+        return [Effect(
+            _effect_key("observe", event.execution, event.data.get("generation")),
+            "observe_sessions", event.execution, "", "",
+        )]
+    if event.kind == "filesystem_observation_requested":
+        return [Effect(
+            _effect_key("observe-filesystem", event.execution, event.data.get("generation")),
+            "observe_filesystem", event.execution, "", "",
+        )]
+    if event.kind == "workflow_observation_requested":
+        return [Effect(
+            _effect_key("observe-workflow", event.execution, event.data.get("generation")),
+            "observe_workflow", event.execution, "", "",
+        )]
+    if event.kind == "root_session_requested":
+        return [Effect(
+            _effect_key("root-session", event.execution, event.data.get("generation")),
+            "ensure_root_session", event.execution, "lab-ob", execution.title,
+        )]
+    if event.kind == "root_session_observed":
+        execution.root_session_id = str(event.data["backend_id"])
+        return [
+            Effect(
+                _effect_key("store-root-session", event.execution, event.data["backend_id"]),
+                "store_root_session", event.execution, "lab-ob", execution.title,
+                data={"backend_id": event.data["backend_id"]},
+            ),
+            Effect(
+                _effect_key("observe", event.execution, event.data["backend_id"]),
+                "observe_sessions", event.execution, "", "",
+            ),
+        ]
+    if event.kind == "root_session_failed":
+        execution.observation_error = str(event.data["error"])
+        return []
+    if event.kind == "dag_loaded":
+        if event.data.get("mtime_ns") != state.active_mtime:
+            return []
+        return [Effect(
+            _effect_key("activate-plan", event.data["mtime_ns"], event.data["revision"]),
+            "activate_plan", event.execution, "", "",
+            data=dict(event.data),
+        )]
+    if event.kind == "dag_activated":
+        if event.data.get("mtime_ns") != state.active_mtime:
+            return []
+        state.applied_active_mtime = int(event.data["mtime_ns"])
+        state.plan_error = None
+        state.active = True
+        execution.active = True
+        execution.workflow = event.data["workflow"]
+        execution.roles = tuple(event.data["workflow"].get("roles", ()))
+        execution.dag_revision = str(event.data["revision"])
+        effects = [
+            Effect(
+                _effect_key("store-active-control", state.active_mtime, "applied"),
+                "store_active_control", "", "", "",
+                data={"observed_mtime_ns": state.active_mtime,
+                      "applied_mtime_ns": state.applied_active_mtime,
+                      "error": state.plan_error},
+            ),
+            Effect(
+                _effect_key("observe-workflow", execution.title, state.active_mtime),
+                "observe_workflow", execution.title, "", "",
+            ),
+        ]
+        if execution.root_session_id is None:
+            effects.append(Effect(
+                _effect_key("root-session", execution.title, state.active_mtime),
+                "ensure_root_session", execution.title, "lab-ob", execution.title,
+            ))
+        return effects
+    if event.kind == "dag_reload_failed":
+        state.active = False
+        state.plan_error = str(event.data["error"])
+        for known in state.executions.values():
+            known.active = False
+        return [Effect(
+            _effect_key("store-active-control", state.active_mtime, state.plan_error),
+            "store_active_control", "", "", "",
+            data={"observed_mtime_ns": state.active_mtime,
+                  "applied_mtime_ns": state.applied_active_mtime,
+                  "error": state.plan_error},
+        )]
+    if event.kind == "session_observation_failed":
+        execution.observation_error = str(event.data["error"])
         return []
     if event.kind == "workflow_observed":
         execution.dag_revision = event.data.get("dag_revision")
@@ -332,14 +611,55 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             for name, version in event.data.get("request_versions", {}).items()
         }
         return _reconcile_execution(state, execution)
+    if event.kind == "tasks_observed":
+        execution.active_tasks = {
+            str(item["role"]): ActiveTaskState(
+                str(item["task_id"]), str(item["artifact"]),
+                int(item["started_at_ns"]),
+            )
+            for item in event.data.get("tasks", ())
+        }
+        return _reconcile_execution(state, execution)
     if event.kind == "artifact_updated":
         execution.artifacts[str(event.data["artifact"])] = int(event.data["mtime_ns"])
         return []
     if event.kind == "artifact_deleted":
         execution.artifacts.pop(str(event.data["artifact"]), None)
         return []
+    if event.kind == "artifact_rejected":
+        name = str(event.data["artifact"])
+        return [Effect(
+            _effect_key(
+                "restore-artifact", execution.title, name,
+                event.data.get("observed_mtime_ns"), event.data.get("previous_mtime_ns"),
+            ),
+            "restore_artifact", execution.title, "", "", artifact=name,
+            data={"previous_mtime_ns": event.data.get("previous_mtime_ns")},
+        )]
+    if event.kind == "artifact_restored":
+        name = str(event.data["artifact"])
+        previous = event.data.get("previous_mtime_ns")
+        if isinstance(previous, int):
+            execution.artifacts[name] = previous
+        else:
+            execution.artifacts.pop(name, None)
+        return []
+    if event.kind == "system_blocked_observed":
+        present = bool(event.data.get("present"))
+        if present:
+            if execution.blocked_reason is None:
+                execution.blocked_reason = "system-blocked marker exists"
+            return []
+        if execution.blocked_reason is not None:
+            execution.blocked_reason = None
+            execution.failures.clear()
+            return _reconcile_execution(state, execution)
+        return []
+    if event.kind == "system_blocked_written":
+        return []
     if event.kind == "observed_sessions_updated":
         execution.sessions_initialized = True
+        execution.observation_error = None
         execution.observed_sessions = {
             str(item["backend_id"]): SessionState(
                 str(item["role"]), str(item["title"]),
@@ -353,10 +673,6 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         role = str(event.data["role"])
         status = str(event.data["status"])
         session = execution.sessions.setdefault(role, SessionState(role, role))
-        # prompt_async may be accepted just before OpenCode reports busy.
-        if (session.status == "prompted" and status == "idle"
-                and not event.data.get("completed_turn")):
-            return []
         if status == "idle" and session.status != "idle":
             session.idle_epoch += 1
         session.status = status
@@ -365,6 +681,60 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         session.observed = True
         if "error" in event.data:
             session.error = event.data.get("error")
+        return _reconcile_role(state, execution, role)
+    if event.kind == "turn_completed":
+        role = str(event.data["role"])
+        title = str(event.data["title"])
+        message_id = str(event.data["message_id"])
+        identity = (execution.title, title, message_id)
+        unseen = identity not in state.seen_messages
+        state.seen_messages.add(identity)
+        completed_at = int(event.data["completed_at"])
+        task = execution.active_tasks.get(role)
+        if task is None or completed_at < task.started_at_ns // 1_000_000:
+            return []
+        reply = str(event.data.get("reply", ""))
+        if event.data.get("finish") == "stop":
+            if reply.lstrip().startswith("无法完成任务。"):
+                if not unseen:
+                    return []
+                return _block_execution(
+                    state, execution, role, task,
+                    "Agent reported that the task cannot be completed", completed_at,
+                )
+            if reply.lstrip().startswith("已完成任务。"):
+                session = execution.sessions.setdefault(role, SessionState(role, title))
+                if completed_at >= session.completed_turn_at:
+                    session.completed_turn_id = message_id
+                    session.completed_turn_at = completed_at
+                    session.completed_turn_reply = reply
+                return _reconcile_role(state, execution, role)
+            if unseen:
+                return _record_task_failure(
+                    state, execution, role, "reply_unclassified",
+                    "reply must start with 已完成任务。 or 无法完成任务。", completed_at,
+                )
+            return []
+        if unseen:
+            return _record_task_failure(
+                state, execution, role, "turn_aborted",
+                f"Agent turn ended without stop: {event.data.get('finish')}", completed_at,
+            )
+        return []
+    if event.kind == "task_validation_failed":
+        role = str(event.data["role"])
+        task = execution.active_tasks.get(role)
+        if task is None or task.task_id != event.data.get("task_id"):
+            return []
+        return _record_task_failure(
+            state, execution, role, "validation_failed", str(event.data["error"]),
+            int(event.data["at"]),
+        )
+    if event.kind == "task_superseded":
+        role = str(event.data["role"])
+        task = execution.active_tasks.get(role)
+        if task is not None and task.task_id == event.data.get("task_id"):
+            execution.active_tasks.pop(role, None)
         return []
     if event.kind == "session_missing":
         role = str(event.data["role"])
@@ -404,6 +774,29 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             return _reconcile_role(state, execution, role)
         if event.data.get("effect_kind") == "prompt_session":
             session.status = "prompted" if event.data.get("delivered", True) else "idle"
+            session.error = None
+            session.error_kind = None
+            session.completed_turn_id = None
+            session.completed_turn_at = 0
+            session.completed_turn_reply = ""
+            task = event.data.get("task")
+            if isinstance(task, dict):
+                execution.active_tasks[role] = ActiveTaskState(
+                    str(task["task_id"]), str(task["artifact"]),
+                    int(task["started_at_ns"]),
+                )
+        if event.data.get("effect_kind") == "settle_task":
+            task = execution.active_tasks.get(role)
+            if task is not None and task.task_id == event.data.get("task_id"):
+                execution.active_tasks.pop(role, None)
+            execution.failures.pop(role, None)
+            return [Effect(
+                _effect_key(
+                    "observe-workflow", execution.title,
+                    event.data.get("task_id"), "settled",
+                ),
+                "observe_workflow", execution.title, "", "",
+            )]
         return []
     return []
 
@@ -442,6 +835,38 @@ def _observed_sessions(client: Client, root_id: str, root_title: str,
 
 
 class Supervisor:
+    @property
+    def active_mtime(self) -> int | None:
+        return self.state.active_mtime
+
+    @active_mtime.setter
+    def active_mtime(self, value: int | None) -> None:
+        self.state.active_mtime = value
+
+    @property
+    def applied_active_mtime(self) -> int | None:
+        return self.state.applied_active_mtime
+
+    @applied_active_mtime.setter
+    def applied_active_mtime(self, value: int | None) -> None:
+        self.state.applied_active_mtime = value
+
+    @property
+    def plan_error(self) -> str | None:
+        return self.state.plan_error
+
+    @plan_error.setter
+    def plan_error(self, value: str | None) -> None:
+        self.state.plan_error = value
+
+    @property
+    def active(self) -> bool:
+        return self.state.active
+
+    @active.setter
+    def active(self, value: bool) -> None:
+        self.state.active = value
+
     def __init__(self, exec_home: Path, port: int, *, poll_interval: float = .25):
         self.root = exec_home.resolve(strict=True)
         if self.root.name != ".labflow-exec":
@@ -450,6 +875,7 @@ class Supervisor:
         self.poll_interval = poll_interval
         from .project import get_state, load_execution
         _, self.manifest, self.config = load_execution(self.root.parent)
+        self.bootstrap_root_session_id = get_state(self.root, "root_session_id")
         if self.config["port"] != port:
             raise ControlError(
                 f"execution is configured for port {self.config['port']}, not {port}", 64
@@ -464,15 +890,15 @@ class Supervisor:
                 or (applied is not None and not isinstance(applied, int))
                 or (error is not None and not isinstance(error, str))):
             raise ControlError("invalid active control state")
-        self.active_mtime: int | None = observed
-        self.applied_active_mtime: int | None = applied
-        self.plan_error: str | None = error
-        current_active = control_mtime(self.root / "ctrl" / "active")
+        self.state = _state_load(get_state(self.root, "supervisor_state"))
+        self.active_mtime = observed
+        self.applied_active_mtime = applied
+        self.plan_error = error
+        current_active = control_mtime(self.root / "artifacts" / "_active")
         self.active = bool(
             current_active is not None and current_active == observed == applied
             and error is None
         )
-        self.state = _state_load(get_state(self.root, "supervisor_state"))
         self.event_error: str | None = None
         self.timeline_error: str | None = None
         self.timeline_reporter = TimelineReporter(self.root, self.manifest.plan_id)
@@ -502,52 +928,25 @@ class Supervisor:
     def _desired(self) -> dict[str, Path]:
         return {self.manifest.plan_id: self.root}
 
-    def _store_active_control(self) -> None:
-        from .project import set_state
-        set_state(self.root, "active_control", {
-            "observed_mtime_ns": self.active_mtime,
-            "applied_mtime_ns": self.applied_active_mtime,
-            "error": self.plan_error,
-        })
-
     def _sync_active(self) -> None:
-        marker = self.root / "ctrl" / "active"
-        current = control_mtime(marker)
-        if current == self.active_mtime:
-            return
-        self.active_mtime = current
-        self.active = False
-        if current is None:
-            self.plan_error = None
-            self._store_active_control()
-            return
-        try:
-            from .project import activate_plan, load_plan
-            manifest = load_plan(self.manifest.root / "labflow-plan.toml")
-            activate_plan(self.root, manifest)
-        except (ControlError, OSError, ValueError) as exc:
-            self.plan_error = str(exc)
-            self._store_active_control()
-            return
-        previous_revision = dag_hash(self.manifest)
-        current_revision = dag_hash(manifest)
-        if current_revision != previous_revision:
-            for role in set(self.manifest.workflow["roles"]) | set(manifest.workflow["roles"]):
-                supersede_role_task(self.manifest.root, role, "Plan was reloaded")
-        self.manifest = manifest
-        self.applied_active_mtime = current
-        self.plan_error = None
-        self.active = True
-        self._store_active_control()
+        if self.manifest.plan_id not in self.state.executions:
+            event, _ = self._execution_event(self.manifest.plan_id, self.root)
+            self._process([event])
+        self._process([LifecycleEvent(
+            "filesystem_observation_requested", self.manifest.plan_id,
+            {"generation": time.time_ns()},
+        )])
 
     def _execution_event(self, title: str, desired: Path) -> tuple[LifecycleEvent, dict[str, Any]]:
-        from .project import get_state
         manifest, config = self.manifest, self.config
+        known = self.state.executions.get(title)
+        current_workflow = known.workflow if known is not None else manifest.workflow
         value = {
             "title": title,
             "workspace": str(manifest.root),
-            "session_id": get_state(desired, "root_session_id"),
-            "workflow": manifest.workflow,
+            "session_id": (known.root_session_id if known is not None
+                           else self.bootstrap_root_session_id),
+            "workflow": current_workflow,
             "execution": manifest.execution,
             "phase": "active" if self.active else "idle",
             "server_url": self.server_url,
@@ -566,34 +965,6 @@ class Supervisor:
             "dag_revision": _workflow_revision(workflow),
         })
         return event, value
-
-    def _execution_path(self, title: str) -> Path:
-        return self.root
-
-    def _ensure_root_session(self) -> None:
-        from .project import get_state, set_state
-        if not self.active:
-            return
-        if get_state(self.root, "root_session_id") is not None:
-            return
-        manifest = self.manifest
-        client = Client(self.server_url, str(manifest.root))
-        client.health()
-        candidates = [
-            item for item in client.sessions()
-            if isinstance(item, dict) and item.get("title") == manifest.plan_id
-            and not item.get("parentID")
-        ]
-        if len(candidates) == 1 and isinstance(candidates[0].get("id"), str):
-            set_state(self.root, "root_session_id", candidates[0]["id"])
-            return
-        if len(candidates) > 1:
-            raise ControlError("multiple OpenCode root Sessions match this execution", 75)
-        response = client.create_session(manifest.plan_id, agent="lab-ob")
-        session_id = response.get("id") if isinstance(response, dict) else None
-        if not isinstance(session_id, str):
-            raise ControlError("OpenCode returned an invalid root Session identity", 69)
-        set_state(self.root, "root_session_id", session_id)
 
     def _workflow_event(self, title: str, value: dict[str, Any]) -> LifecycleEvent | None:
         workflow = value.get("workflow")
@@ -695,14 +1066,11 @@ class Supervisor:
                     })
         return result
 
-    def _artifact_events(self, title: str, desired: Path) -> list[LifecycleEvent]:
-        directory = desired / "artifacts"
-        previous = self.state.executions[title].artifacts
-        current = ({path.name: path.stat().st_mtime_ns for path in directory.iterdir()
-                    if path.is_file() and not path.is_symlink()}
-                   if directory.is_dir() else {})
-        execution = self.state.executions[title]
+    def _observe_artifacts(self, execution: ExecutionState,
+                           current: dict[str, int]) -> list[LifecycleEvent]:
+        previous = execution.artifacts
         workflow = execution.workflow
+        rejected: list[LifecycleEvent] = []
         if isinstance(workflow, dict):
             status = workflow_status(Path(execution.workspace), workflow)["artifacts"]
             task_publications = {
@@ -725,23 +1093,48 @@ class Supervisor:
                 )
                 if accepted:
                     continue
-                path = directory / name
-                old_mtime = previous.get(name)
-                if old_mtime is None:
-                    path.unlink(missing_ok=True)
-                    current.pop(name, None)
+                rejected.append(LifecycleEvent("artifact_rejected", execution.title, {
+                    "artifact": name, "observed_mtime_ns": mtime,
+                    "previous_mtime_ns": previous.get(name),
+                }))
+                if name in previous:
+                    current[name] = previous[name]
                 else:
-                    os.utime(path, ns=(old_mtime, old_mtime))
-                    current[name] = old_mtime
-        events = [LifecycleEvent("artifact_deleted", title, {"artifact": name})
+                    current.pop(name, None)
+        events = [LifecycleEvent("artifact_deleted", execution.title, {"artifact": name})
                   for name in previous.keys() - current.keys()]
         events.extend(
-            LifecycleEvent("artifact_updated", title, {
+            LifecycleEvent("artifact_updated", execution.title, {
                 "artifact": name, "mtime_ns": mtime,
             })
             for name, mtime in current.items()
             if previous.get(name) != mtime
         )
+        return rejected + events
+
+    def _observe_filesystem(self, execution: ExecutionState) -> list[LifecycleEvent]:
+        directory = self.root / "artifacts"
+        entries = list(directory.iterdir()) if directory.is_dir() else []
+        controls = {path.name: path for path in entries if path.name.startswith("_")}
+        active = control_mtime(controls.get("_active", directory / "_active"))
+        blocked = control_mtime(
+            controls.get("_system-blocked", directory / "_system-blocked")
+        )
+        current = {
+            path.name: path.stat().st_mtime_ns for path in entries
+            if not path.name.startswith("_") and path.is_file() and not path.is_symlink()
+        }
+        events = [LifecycleEvent(
+            "active_control_observed", execution.title, {"mtime_ns": active},
+        ), LifecycleEvent("system_blocked_observed", execution.title, {
+            "present": blocked is not None, "mtime_ns": blocked,
+        })]
+        artifact_events = self._observe_artifacts(execution, current)
+        self._events(self._artifact_records(execution.title, [
+            event for event in artifact_events
+            if event.kind in ("artifact_updated", "artifact_deleted")
+        ]))
+        events.extend(artifact_events)
         return events
 
     def _artifact_records(self, title: str,
@@ -764,25 +1157,31 @@ class Supervisor:
             })
         return result
 
-    def _observe_sessions(self, title: str, value: dict[str, Any]) -> list[Effect]:
-        root_id = value.get("session_id")
+    def _observe_sessions(self, execution: ExecutionState) -> list[LifecycleEvent]:
+        """Execute one HTTP observation effect and return immutable facts."""
+        root_id = execution.root_session_id
         if not isinstance(root_id, str):
             return []
-        root_role = "lab-ob"
-        client = Client(self.server_url, value["workspace"], root_id)
+        title = execution.title
+        client = Client(self.server_url, execution.workspace, root_id)
         statuses = client.statuses()
-        sessions = _observed_sessions(client, root_id, title, root_role)
-        observed = [{
-            **session,
-            "backend_id": session["id"],
-            "status": statuses.get(session["id"], {"type": "idle"}).get("type", "idle"),
-        } for session in sessions]
-        reduce(self.state, LifecycleEvent(
-            "observed_sessions_updated", title, {"sessions": observed},
-        ))
-        effects: list[Effect] = []
-        completed_turns: set[str] = set()
-        stopped_at: dict[str, int] = {}
+        sessions = _observed_sessions(client, root_id, title, "lab-ob")
+        events: list[LifecycleEvent] = []
+        timeline: list[dict[str, Any]] = []
+        active_tasks = []
+        records = task_records(Path(execution.workspace))
+        for task in records["active"]:
+            targets = task.get("artifacts")
+            if (isinstance(task.get("role"), str)
+                    and isinstance(task.get("task_id"), str)
+                    and isinstance(task.get("started_at_ns"), int)
+                    and isinstance(targets, list) and len(targets) == 1
+                    and isinstance(targets[0], str)):
+                active_tasks.append({
+                    "role": task["role"], "task_id": task["task_id"],
+                    "artifact": targets[0], "started_at_ns": task["started_at_ns"],
+                })
+        events.append(LifecycleEvent("tasks_observed", title, {"tasks": active_tasks}))
         disappeared: set[str] = set()
         for session in sessions:
             session_id = session["id"]
@@ -790,8 +1189,6 @@ class Supervisor:
             try:
                 messages = client.session_messages(session_id)
             except OpenCodeNotFound:
-                # A child can disappear after the tree snapshot. Exclude it
-                # from this observation so the role is reconciled as missing.
                 disappeared.add(session_id)
                 continue
             created = [
@@ -800,103 +1197,247 @@ class Supervisor:
                 if isinstance(message.get("info", {}).get("time", {}).get("created"),
                               (int, float))
             ]
-            self._events([{
+            timeline.append({
                 "id": f"session-started:{title}:{session_id}",
                 "execution": title, "session": session["title"],
                 "role": role, "type": "session_started",
                 "at": min(created, default=int(time.time() * 1000)), "duration": 0,
                 "payload": {"backend_id": session_id},
-            }])
+            })
+            value = {"workspace": execution.workspace}
             for message in messages:
                 info = message.get("info", {})
                 message_id = info.get("id")
                 completed = info.get("time", {}).get("completed")
-                identity = (title, session["title"], str(message_id))
                 if (not isinstance(message_id, str) or not isinstance(completed, (int, float))
-                        or identity in self.state.seen_messages):
+                        or info.get("role") != "assistant"):
                     continue
-                if info.get("role") == "assistant":
-                    completed_turns.add(session_id)
-                    completed = info.get("time", {}).get("completed")
-                    if info.get("finish") == "stop" and isinstance(completed, (int, float)):
-                        stopped_at[session_id] = max(
-                            stopped_at.get(session_id, 0), int(completed),
-                        )
-                records = closed_message_events(
+                timeline.extend(closed_message_events(
                     title, session["title"], role, message,
                     task=_message_task(value, session_id, role, message),
-                    dag_revision=self.state.executions[title].dag_revision,
-                )
-                if records:
-                    self._events(records)
-                self.state.seen_messages.add(identity)
-        if self.state.executions[title].dag:
-            for role in self.state.executions[title].roles:
-                matches = [session for session in sessions
-                           if session["role"] == role and session["id"] not in disappeared]
+                    dag_revision=execution.dag_revision,
+                ))
+                events.append(LifecycleEvent("turn_completed", title, {
+                    "role": role, "title": session["title"],
+                    "message_id": message_id, "completed_at": int(completed),
+                    "finish": info.get("finish"), "reply": _message_reply(message),
+                }))
+        self._events(timeline)
+        visible = [session for session in sessions if session["id"] not in disappeared]
+        events.insert(0, LifecycleEvent("observed_sessions_updated", title, {
+            "sessions": [{
+                **session, "backend_id": session["id"],
+                "status": statuses.get(session["id"], {"type": "idle"}).get("type", "idle"),
+            } for session in visible],
+        }))
+        if execution.dag:
+            for role in execution.roles:
+                matches = [session for session in visible if session["role"] == role]
                 if not matches:
-                    effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_missing", title, {
-                            "role": role,
-                            "confirmed": any(
-                                session["role"] == role and session["id"] in disappeared
-                                for session in sessions
-                            ),
-                        },
-                    )))
+                    events.append(LifecycleEvent("session_missing", title, {
+                        "role": role,
+                        "confirmed": any(
+                            session["role"] == role and session["id"] in disappeared
+                            for session in sessions
+                        ),
+                    }))
                 elif len(matches) == 1:
                     session = matches[0]
-                    runtime_status = statuses.get(
-                        session["id"], {"type": "idle"}
-                    ).get("type", "idle")
-                    active = [
-                        item for item in task_records(Path(value["workspace"]))["active"]
-                        if item.get("role") == role
-                    ]
-                    started = (active[0].get("started_at_ns")
-                               if len(active) == 1 else None)
-                    if (runtime_status == "idle" and isinstance(started, int)
-                            and stopped_at.get(session["id"], 0) >= started // 1_000_000):
-                        if active:
-                            try:
-                                submit(
-                                    Path(value["workspace"]), value["workflow"], role,
-                                    list(active[0]["artifacts"]),
-                                )
-                            except TaskError as exc:
-                                self.state.executions[title].sessions.setdefault(
-                                    role, SessionState(role, role)
-                                ).error = str(exc)
-                    effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_observed", title, {
-                            "role": role, "title": session["title"],
-                            "backend_id": session["id"],
-                            "status": runtime_status,
-                            "completed_turn": session["id"] in completed_turns,
-                        },
-                    )))
+                    events.append(LifecycleEvent("session_observed", title, {
+                        "role": role, "title": session["title"],
+                        "backend_id": session["id"],
+                        "status": statuses.get(
+                            session["id"], {"type": "idle"}
+                        ).get("type", "idle"),
+                    }))
                 else:
-                    effects.extend(reduce(self.state, LifecycleEvent(
-                        "session_observed", title, {
-                            "role": role, "title": role,
-                            "backend_id": matches[0]["id"], "status": "failed",
-                            "error": f"duplicate Session for role {role}",
-                        },
-                    )))
-        return effects
+                    events.append(LifecycleEvent("session_observed", title, {
+                        "role": role, "title": role,
+                        "backend_id": matches[0]["id"], "status": "failed",
+                        "error": f"duplicate Session for role {role}",
+                    }))
+        return events
 
-    def _execute(self, effects: list[Effect]) -> None:
-        pending = list(effects)
-        while pending:
-            effect = pending.pop(0)
-            execution = self.state.executions.get(effect.execution)
-            if execution is None:
-                continue
-            client = Client(self.server_url, execution.workspace,
-                            execution.root_session_id)
+    def _perform_effect(self, effect: Effect) -> list[LifecycleEvent]:
+        if effect.kind == "store_active_control":
+            from .project import set_state
+            set_state(self.root, "active_control", effect.data)
+            return []
+        if effect.kind == "reload_plan":
             try:
-                backend_id = effect.backend_id
-                delivered = True
+                from .project import load_plan
+                manifest = load_plan(self.manifest.root / "labflow-plan.toml")
+                return [LifecycleEvent("dag_loaded", self.manifest.plan_id, {
+                    "mtime_ns": effect.data["mtime_ns"], "manifest": manifest,
+                    "workflow": manifest.workflow, "revision": dag_hash(manifest),
+                })]
+            except (ControlError, OSError, ValueError) as exc:
+                return [LifecycleEvent("dag_reload_failed", self.manifest.plan_id, {
+                    "error": str(exc),
+                })]
+        if effect.kind == "persist_state":
+            from .project import set_state
+            set_state(self.root, "supervisor_state", effect.data["state"])
+            return []
+        if effect.kind == "write_outputs":
+            self._write_host_tasks()
+            self._display_timeline()
+            atomic_json(self.root / "supervisor-status.json", self._status())
+            return []
+        execution = self.state.executions.get(effect.execution)
+        if execution is None:
+            return []
+        if effect.kind == "write_system_blocked":
+            try:
+                atomic_json(self.root / "artifacts" / "_system-blocked", effect.data)
+                return [
+                    LifecycleEvent("system_blocked_written", effect.execution, effect.data),
+                    LifecycleEvent("effect_succeeded", effect.execution, {
+                        "key": effect.key, "effect_kind": effect.kind,
+                        "role": effect.role, "title": effect.title,
+                    }),
+                ]
+            except OSError as exc:
+                return [LifecycleEvent("effect_failed", effect.execution, {
+                    "key": effect.key, "effect_kind": effect.kind,
+                    "role": effect.role, "error": str(exc),
+                })]
+        if effect.kind == "activate_plan":
+            try:
+                from .project import activate_plan
+                manifest = effect.data["manifest"]
+                old_roles = set(execution.roles)
+                activate_plan(self.root, manifest)
+                if execution.dag_revision != effect.data["revision"]:
+                    for role in old_roles | set(manifest.workflow["roles"]):
+                        supersede_role_task(
+                            self.manifest.root, role, "Plan was reloaded"
+                        )
+                return [LifecycleEvent("dag_activated", effect.execution, {
+                    "mtime_ns": effect.data["mtime_ns"],
+                    "workflow": manifest.workflow,
+                    "revision": effect.data["revision"],
+                })]
+            except (ControlError, TaskError, OSError, ValueError) as exc:
+                return [LifecycleEvent("dag_reload_failed", effect.execution, {
+                    "error": str(exc),
+                })]
+        if effect.kind == "store_root_session":
+            from .project import set_state
+            set_state(self.root, "root_session_id", effect.data["backend_id"])
+            return []
+        if effect.kind == "restore_artifact":
+            if not effect.artifact:
+                return []
+            path = self.root / "artifacts" / effect.artifact
+            previous = effect.data.get("previous_mtime_ns")
+            if isinstance(previous, int):
+                os.utime(path, ns=(previous, previous))
+            else:
+                path.unlink(missing_ok=True)
+            return [LifecycleEvent("artifact_restored", effect.execution, {
+                "artifact": effect.artifact, "previous_mtime_ns": previous,
+            })]
+        if effect.kind == "observe_filesystem":
+            try:
+                return self._observe_filesystem(execution)
+            except (ControlError, TaskError, OSError) as exc:
+                return [LifecycleEvent("session_observation_failed", effect.execution, {
+                    "error": str(exc),
+                })]
+        if effect.kind == "observe_workflow":
+            try:
+                value = {
+                    "workspace": execution.workspace,
+                    "workflow": execution.workflow,
+                }
+                event = self._workflow_event(effect.execution, value)
+                if event is None:
+                    return []
+                previous = (
+                    set(execution.requests), set(execution.optional_requests),
+                    dict(execution.request_versions),
+                )
+                self._events([self._dag_revision_record(effect.execution, event)])
+                self._events(self._request_records(effect.execution, event, previous))
+                self._events(self._task_records(effect.execution, value))
+                return [event]
+            except (ControlError, TaskError, OSError) as exc:
+                return [LifecycleEvent("session_observation_failed", effect.execution, {
+                    "error": str(exc),
+                })]
+        if effect.kind == "ensure_root_session":
+            try:
+                client = Client(self.server_url, execution.workspace)
+                client.health()
+                candidates = [
+                    item for item in client.sessions()
+                    if isinstance(item, dict) and item.get("title") == execution.title
+                    and not item.get("parentID")
+                ]
+                if len(candidates) == 1 and isinstance(candidates[0].get("id"), str):
+                    backend_id = candidates[0]["id"]
+                elif len(candidates) > 1:
+                    raise ControlError(
+                        "multiple OpenCode root Sessions match this execution", 75
+                    )
+                else:
+                    response = client.create_session(execution.title, agent="lab-ob")
+                    backend_id = response.get("id") if isinstance(response, dict) else None
+                    if not isinstance(backend_id, str):
+                        raise ControlError(
+                            "OpenCode returned an invalid root Session identity", 69
+                        )
+                return [LifecycleEvent("root_session_observed", effect.execution, {
+                    "backend_id": backend_id,
+                })]
+            except (ControlError, OSError) as exc:
+                return [LifecycleEvent("root_session_failed", effect.execution, {
+                    "error": str(exc),
+                })]
+        if effect.kind == "observe_sessions":
+            try:
+                return self._observe_sessions(execution)
+            except (ControlError, TaskError, OSError) as exc:
+                return [LifecycleEvent("session_observation_failed", effect.execution, {
+                    "error": str(exc),
+                })]
+        try:
+            backend_id = effect.backend_id
+            delivered = True
+            task_result: dict[str, Any] | None = None
+            if effect.kind == "settle_task":
+                if execution.workflow is None or not effect.artifact:
+                    raise ControlError("task settlement effect is incomplete")
+                active = [
+                    task for task in task_records(Path(execution.workspace))["active"]
+                    if task.get("role") == effect.role
+                    and task.get("task_id") == effect.data.get("task_id")
+                ]
+                if len(active) != 1:
+                    return [LifecycleEvent("task_superseded", effect.execution, {
+                        "role": effect.role, "task_id": effect.data.get("task_id"),
+                    })]
+                try:
+                    submit(
+                        Path(execution.workspace), execution.workflow,
+                        effect.role, [effect.artifact],
+                    )
+                except TaskError as exc:
+                    remaining = any(
+                        task.get("role") == effect.role
+                        and task.get("task_id") == effect.data.get("task_id")
+                        for task in task_records(Path(execution.workspace))["active"]
+                    )
+                    kind = "task_validation_failed" if remaining else "task_superseded"
+                    return [LifecycleEvent(kind, effect.execution, {
+                        "role": effect.role, "task_id": effect.data.get("task_id"),
+                        "turn_id": effect.data.get("turn_id"), "error": str(exc),
+                        "at": time.time_ns() // 1_000_000,
+                    })]
+            else:
+                client = Client(self.server_url, execution.workspace,
+                                execution.root_session_id)
                 if effect.kind == "create_session":
                     if execution.workflow is not None:
                         clear_session_qualifications(
@@ -918,38 +1459,50 @@ class Supervisor:
                     )
                     delivered = task is not None
                     if task is not None:
-                        session = execution.sessions.setdefault(
-                            effect.role, SessionState(effect.role, effect.role)
-                        )
                         client.prompt_session(
                             backend_id,
                             resume_prompt(
                                 effect.role,
                                 execution.workflow["artifacts"][effect.artifact],
                                 task,
-                                session.error,
+                                effect.data.get("error"),
+                                include_checks=bool(effect.data.get("include_checks")),
                             ),
                             agent=effect.role,
                         )
-                        session.error = None
+                        active = [
+                            item for item in task_records(Path(execution.workspace))["active"]
+                            if item.get("role") == effect.role
+                        ]
+                        if len(active) == 1:
+                            task_result = {
+                                "task_id": active[0]["task_id"],
+                                "artifact": active[0]["artifacts"][0],
+                                "started_at_ns": active[0]["started_at_ns"],
+                            }
                 else:
                     raise ControlError(f"unknown Supervisor effect: {effect.kind}")
-                pending.extend(reduce(self.state, LifecycleEvent(
-                    "effect_succeeded", effect.execution, {
-                        "key": effect.key, "effect_kind": effect.kind,
-                        "role": effect.role, "title": effect.title,
-                        "backend_id": backend_id,
-                        "delivered": delivered,
-                    },
-                )))
-            except (ControlError, TaskError, OSError) as exc:
-                reduce(self.state, LifecycleEvent(
-                    "effect_failed", effect.execution, {
-                        "key": effect.key, "effect_kind": effect.kind,
-                        "role": effect.role, "error": str(exc),
-                    },
-                ))
-                raise
+            return [LifecycleEvent("effect_succeeded", effect.execution, {
+                "key": effect.key, "effect_kind": effect.kind,
+                "role": effect.role, "title": effect.title,
+                "backend_id": backend_id, "delivered": delivered,
+                "task": task_result, "task_id": effect.data.get("task_id"),
+            })]
+        except (ControlError, TaskError, OSError) as exc:
+            return [LifecycleEvent("effect_failed", effect.execution, {
+                "key": effect.key, "effect_kind": effect.kind,
+                "role": effect.role, "error": str(exc),
+            })]
+
+    def _process(self, events: list[LifecycleEvent]) -> None:
+        """Serialize every control event and effect response through one reducer."""
+        event_queue = list(events)
+        effect_queue: list[Effect] = []
+        while event_queue or effect_queue:
+            if event_queue:
+                effect_queue.extend(reduce(self.state, event_queue.pop(0)))
+                continue
+            event_queue.extend(self._perform_effect(effect_queue.pop(0)))
 
     def _status(self) -> dict[str, Any]:
         return {
@@ -962,6 +1515,7 @@ class Supervisor:
                 "dag": execution.dag,
                 "requests": list(execution.requests),
                 "optional_requests": list(execution.optional_requests),
+                "system_blocked": execution.blocked_reason,
                 "tasks": self._current_tasks(execution),
                 "errors": [{
                     "role": session.role,
@@ -1064,43 +1618,45 @@ class Supervisor:
             atomic_json(path, value)
 
     def step(self) -> None:
-        self._sync_active()
         if self.writer is not None:
             try:
                 self.writer.check()
             except (OSError, RuntimeError, sqlite3.Error) as exc:
                 self.event_error = str(exc)
                 self.writer = None
-        self._ensure_root_session()
         desired = self._desired()
-        for title in set(self.state.executions) - set(desired):
-            reduce(self.state, LifecycleEvent("execution_deleted", title))
         for title, path in desired.items():
-            event, value = self._execution_event(title, path)
-            effects = reduce(self.state, event)
-            artifact_events = self._artifact_events(title, path)
-            self._events(self._artifact_records(title, artifact_events))
-            for artifact_event in artifact_events:
-                effects.extend(reduce(self.state, artifact_event))
-            effects.extend(self._observe_sessions(title, value))
-            workflow = (self._workflow_event(title, value)
-                        if self.state.executions[title].dag else None)
-            if workflow is not None:
-                execution = self.state.executions[title]
-                previous = (
-                    set(execution.requests), set(execution.optional_requests),
-                    dict(execution.request_versions),
-                )
-                self._events([self._dag_revision_record(title, workflow)])
-                self._events(self._request_records(title, workflow, previous))
-                effects.extend(reduce(self.state, workflow))
-                self._events(self._task_records(title, value))
-            self._execute(effects)
-        from .project import set_state
-        set_state(self.root, "supervisor_state", _state_dump(self.state))
-        self._write_host_tasks()
-        self._display_timeline()
-        atomic_json(self.root / "supervisor-status.json", self._status())
+            event, _ = self._execution_event(title, path)
+            self._process([event])
+        self._process([
+            LifecycleEvent("execution_deleted", title)
+            for title in set(self.state.executions) - set(desired)
+        ])
+        for title, path in desired.items():
+            event, _ = self._execution_event(title, path)
+            self._process([event])
+            generation = time.time_ns()
+            control_events = [LifecycleEvent(
+                "filesystem_observation_requested", title, {"generation": generation},
+            )]
+            execution = self.state.executions[title]
+            if execution.dag:
+                control_events.append(LifecycleEvent(
+                    "workflow_observation_requested", title,
+                    {"generation": generation},
+                ))
+            if execution.root_session_id:
+                control_events.append(LifecycleEvent(
+                    "session_observation_requested", title, {"generation": generation},
+                ))
+            elif execution.active:
+                control_events.append(LifecycleEvent(
+                    "root_session_requested", title, {"generation": generation},
+                ))
+            self._process(control_events)
+        self._process([LifecycleEvent(
+            "outputs_requested", "", {"generation": time.time_ns()},
+        )])
 
     def run(self, *, once: bool = False, control_marker: Path | None = None,
             generation: int | None = None) -> None:
@@ -1145,7 +1701,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
             home, manifest, config = prepare_execution(project, lab_root, args.port)
             print(
                 f"Prepared {home}; start OpenCode on port {args.port}, then touch "
-                f"{home / 'ctrl' / 'supervisor'} and {home / 'ctrl' / 'active'}",
+                f"{home / 'artifacts' / '_supervisor'} and "
+                f"{home / 'artifacts' / '_active'}",
                 flush=True,
             )
         if args.port is not None and args.port != config["port"]:
@@ -1156,7 +1713,7 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
             raise ControlError("poll interval must be greater than 0 and at most 60 seconds", 64)
         if args.prepare_only:
             return 0
-        marker = home / "ctrl" / "supervisor"
+        marker = home / "artifacts" / "_supervisor"
         generation = control_mtime(marker)
         if generation is None:
             return 0

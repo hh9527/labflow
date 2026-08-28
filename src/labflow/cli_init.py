@@ -68,7 +68,7 @@ OPENCODE_CONFIG_DIR="$project_home/.labflow-exec/ws/.opencode" \\
 opencode_pid=$!
 
 while kill -0 "$opencode_pid" 2>/dev/null; do
-  while [ ! -f .labflow-exec/ctrl/supervisor ]; do
+  while [ ! -f .labflow-exec/artifacts/_supervisor ]; do
     if ! kill -0 "$opencode_pid" 2>/dev/null; then
       wait "$opencode_pid"
       exit $?

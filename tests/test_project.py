@@ -111,6 +111,22 @@ class ProjectPlanTest(unittest.TestCase):
 - `docs/B.md`（未改变）
 ''')
 
+    def test_validation_retry_prompt_includes_mechanical_checks(self):
+        prompt = resume_prompt("a1", {}, {
+            "target": {
+                "name": "work.a1", "goal": "goals/work.md", "goal_updated": False,
+            },
+            "requires": [], "inputs": [],
+            "checks": [
+                {"path": "src/result.txt", "status": "missing"},
+                {"path": "src/report.json", "status": "ready"},
+            ],
+        }, "artifact assets are incomplete", include_checks=True)
+
+        self.assertIn("## 机械检查项", prompt)
+        self.assertIn("- `src/result.txt`（缺失）", prompt)
+        self.assertIn("- `src/report.json`（已就绪）", prompt)
+
     def test_plan_identity_and_workflow_are_derived_from_project(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.project(Path(temporary))
@@ -173,7 +189,7 @@ class ProjectPlanTest(unittest.TestCase):
                 '"$@" serve --hostname 127.0.0.1 --port 4199 --pure',
                 serve_content,
             )
-            self.assertIn("[ ! -f .labflow-exec/ctrl/supervisor ]", serve_content)
+            self.assertIn("[ ! -f .labflow-exec/artifacts/_supervisor ]", serve_content)
             self.assertIn("labflow.cli attach", attach_content)
             subprocess.run(["sh", "-n", str(serve)], check=True)
             subprocess.run(["sh", "-n", str(attach)], check=True)
@@ -226,7 +242,7 @@ class ProjectPlanTest(unittest.TestCase):
             lab = parent / "lab"
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
-            (home / "ctrl/supervisor").touch()
+            (home / "artifacts/_supervisor").touch()
             previous = Path.cwd()
             try:
                 os.chdir(root)
@@ -450,11 +466,11 @@ commands = []
                     "OPENCODE_CONFIG": str(home / "ws/opencode.json"),
                     "OPENCODE_CONFIG_DIR": str(home / "ws/.opencode"),
                 })
-                self.assertTrue((home / "ctrl").is_dir())
-                self.assertFalse((home / "ctrl/active").exists())
-                self.assertFalse((home / "ctrl/supervisor").exists())
+                self.assertTrue((home / "artifacts").is_dir())
+                self.assertFalse((home / "artifacts/_active").exists())
+                self.assertFalse((home / "artifacts/_supervisor").exists())
                 self.assertFalse((home / "supervisor-status.json").exists())
-                (home / "ctrl/supervisor").touch()
+                (home / "artifacts/_supervisor").touch()
                 with patch("labflow.supervisor.Client", HealthyBackend):
                     self.assertEqual(supervisor_main(["--once"]), 0)
                 self.assertEqual(status()["executions"][0]["title"], execution_id(root))
@@ -471,7 +487,7 @@ commands = []
             lab = parent / "lab"
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
-            marker = home / "ctrl/supervisor"
+            marker = home / "artifacts/_supervisor"
 
             for action in ("touch", "delete"):
                 with self.subTest(action=action):
@@ -505,7 +521,7 @@ commands = []
             home, _, _ = prepare_execution(root, lab, 4199)
             supervisor = Supervisor(home, 4199)
             plan = root / "labflow-plan.toml"
-            active = home / "ctrl/active"
+            active = home / "artifacts/_active"
             try:
                 plan.write_text(PLAN + '''
 
@@ -518,7 +534,9 @@ assets = ["hot.txt"]
                 active.touch()
                 supervisor._sync_active()
                 self.assertTrue(supervisor.active)
-                self.assertIn("hot", supervisor.manifest.workflow["artifacts"])
+                self.assertIn(
+                    "hot", supervisor.state.executions[execution_id(root)].workflow["artifacts"]
+                )
                 self.assertIn("hot", load_workflow(root)["artifacts"])
 
                 plan.write_text(plan.read_text(encoding="utf-8") + '''
@@ -537,7 +555,9 @@ assets = ["later.txt"]
                 generation = active.stat().st_mtime_ns
                 os.utime(active, ns=(generation + 1, generation + 1))
                 supervisor._sync_active()
-                self.assertIn("later", supervisor.manifest.workflow["artifacts"])
+                self.assertIn(
+                    "later", supervisor.state.executions[execution_id(root)].workflow["artifacts"]
+                )
 
                 plan.write_text("invalid = true\n", encoding="utf-8")
                 generation = active.stat().st_mtime_ns
@@ -545,7 +565,9 @@ assets = ["later.txt"]
                 supervisor._sync_active()
                 self.assertFalse(supervisor.active)
                 self.assertIsNotNone(supervisor.plan_error)
-                self.assertIn("later", supervisor.manifest.workflow["artifacts"])
+                self.assertIn(
+                    "later", supervisor.state.executions[execution_id(root)].workflow["artifacts"]
+                )
 
                 supervisor.close()
                 supervisor = Supervisor(home, 4199)
@@ -578,11 +600,11 @@ assets = ["later.txt"]
                 ),
                 encoding="utf-8",
             )
-            (home / "ctrl/active").touch()
+            (home / "artifacts/_active").touch()
             supervisor = Supervisor(home, 4199)
             try:
                 supervisor._sync_active()
-                current = dag_hash(supervisor.manifest)
+                current = supervisor.state.executions[execution_id(root)].dag_revision
             finally:
                 supervisor.close()
 
@@ -632,7 +654,7 @@ assets = ["later.txt"]
             lab = parent / "lab"
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
-            (home / "ctrl/active").touch()
+            (home / "artifacts/_active").touch()
             with patch("labflow.supervisor.Client", Backend):
                 supervisor = Supervisor(home, 4199)
                 try:
@@ -701,7 +723,7 @@ assets = ["later.txt"]
             lab.mkdir()
             home, manifest, _ = prepare_execution(root, lab, 4199)
             refresh_artifact(root, manifest.workflow, "tool")
-            (home / "ctrl/active").touch()
+            (home / "artifacts/_active").touch()
 
             with patch("labflow.supervisor.Client", Backend):
                 supervisor = Supervisor(home, 4199)
@@ -767,7 +789,7 @@ assets = ["later.txt"]
                         "time": {"created": completed - 1, "completed": completed},
                         "tokens": {"output": 1},
                     },
-                    "parts": [{"type": "text", "text": "done"}],
+                    "parts": [{"type": "text", "text": "已完成任务。done"}],
                 }]
 
             def prompt_session(self, session_id, text, agent=None):
@@ -788,7 +810,7 @@ assets = ["later.txt"]
                     paused.close()
                 self.assertEqual(Backend.sessions_by_id, {})
 
-                (home / "ctrl/active").touch()
+                (home / "artifacts/_active").touch()
                 first = Supervisor(home, 4199)
                 try:
                     first.step()

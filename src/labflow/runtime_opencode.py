@@ -17,7 +17,8 @@ ENVIRONMENT = {"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "128000"}
 
 
 def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
-                  task: dict[str, Any] | None = None, error: str | None = None) -> str:
+                  task: dict[str, Any] | None = None, error: str | None = None,
+                  *, include_checks: bool = False) -> str:
     if artifact is None or task is None:
         return (
             f"继续完成 Supervisor 已经分配给 {role} 的唯一任务。完成工作或确信无法继续后直接"
@@ -37,6 +38,14 @@ def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
     ]
     file_list = "\n".join(files)
     validation = f"\n\n## 上次交付校验\n\n{error}" if error else ""
+    checks = ""
+    if error and include_checks:
+        labels = {"ready": "已就绪", "missing": "缺失", "invalid": "类型错误"}
+        check_list = "\n".join(
+            f"- `{item['path']}`（{labels.get(item['status'], item['status'])}）"
+            for item in task.get("checks", ())
+        ) or "- 无"
+        checks = f"\n\n## 机械检查项\n\n{check_list}"
     return (
         f"# 任务：`{target['name']}`\n\n"
         "## 目标\n\n"
@@ -47,7 +56,8 @@ def resume_prompt(role: str, artifact: dict[str, Any] | None = None,
         f"{requires}\n\n"
         "## 你需要的详细文件清单\n\n"
         f"{file_list}"
-        f"{validation}\n"
+        f"{validation}"
+        f"{checks}\n"
     )
 
 
