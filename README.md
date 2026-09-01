@@ -318,7 +318,8 @@ labflow query-om --explain request.json
 两个环境变量都可以使用相对于当前目录的路径。Labflow 直接 spawn：
 
 ```text
-telora -C <OM_LABFLOW_PATH> run query --source input=<file-or-stdin+json://>
+telora -C <OM_LABFLOW_PATH> eval-with @src/bin/query:main \
+  --source input=<file-or-stdin+json://>
 ```
 
 它不经过 Shell，继承 stdin 与 stderr，只捕获 stdout，并要求 Telora 成功返回且结果严格为

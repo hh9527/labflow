@@ -104,12 +104,12 @@ class CommandSurfaceTest(unittest.TestCase):
             self.assertEqual(value["rows"], [["event-1"]])
             command = run.call_args.args[0]
             self.assertEqual(command[:5], [
-                str(telora), "-C", str(ontology), "run", "query",
+                str(telora), "-C", str(ontology), "eval-with", "@src/bin/query:main",
             ])
             self.assertEqual(command[-2:], ["--source", f"input={source}"])
             self.assertNotIn("stderr", run.call_args.kwargs)
 
-    def test_query_om_preserves_relative_paths_and_inherits_stdin(self):
+    def test_query_om_resolves_relative_paths_and_inherits_stdin(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "bin").mkdir()
@@ -132,7 +132,8 @@ class CommandSurfaceTest(unittest.TestCase):
 
             self.assertEqual((sql, bindings), ("SELECT 1", []))
             self.assertEqual(run.call_args.args[0], [
-                "bin/telora", "-C", "om-labflow", "run", "query",
+                str(telora.resolve()), "-C", str((root / "om-labflow").resolve()),
+                "eval-with", "@src/bin/query:main",
                 "--source", "input=stdin+json://",
             ])
             self.assertNotIn("stdin", run.call_args.kwargs)

@@ -102,8 +102,8 @@ def lower_om(input_path: Path, *, environ: dict[str, str] | os._Environ[str] = o
         raise ControlError(
             f"query-om is unavailable; missing environment: {', '.join(missing)}", 69,
         )
-    telora = Path(environ["TELORA_BIN"])
-    ontology = Path(environ["OM_LABFLOW_PATH"])
+    telora = Path(environ["TELORA_BIN"]).resolve()
+    ontology = Path(environ["OM_LABFLOW_PATH"]).resolve()
     stdin_source = input_path == Path("-")
     if not telora.is_file() or not os.access(telora, os.X_OK):
         raise ControlError(f"TELORA_BIN is not an executable file: {telora}", 69)
@@ -111,9 +111,9 @@ def lower_om(input_path: Path, *, environ: dict[str, str] | os._Environ[str] = o
         raise ControlError(f"OM_LABFLOW_PATH is not a directory: {ontology}", 69)
     if not stdin_source and not input_path.is_file():
         raise ControlError(f"query-om input is not a file: {input_path}", 66)
-    source = "stdin+json://" if stdin_source else str(input_path)
+    source = "stdin+json://" if stdin_source else str(input_path.resolve())
     command = [
-        str(telora), "-C", str(ontology), "run", "query",
+        str(telora), "-C", str(ontology), "eval-with", "@src/bin/query:main",
         "--source", f"input={source}",
     ]
     try:
