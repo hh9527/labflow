@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
+from .benchmark import is_benchmark_role, validate_artifact
 from .config import ControlError
 
 
@@ -135,7 +136,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             raise TaskError(f"artifact {name} must be an object")
         _keys(raw, {
             "id", "desc", "requires", "inputs", "assets", "check", "goal",
-            "commands",
+            "commands", "benchmark",
         },
               f"artifact {name}")
         if raw.get("id", name) != name:
@@ -177,6 +178,9 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             raise TaskError(f"Host-owned artifact {name} cannot have a goal")
         if owner == "host" and commands:
             raise TaskError(f"Host-owned artifact {name} cannot have commands")
+        benchmark = is_benchmark_role(owner)
+        if "benchmark" in raw and raw["benchmark"] is not benchmark:
+            raise TaskError(f"artifact {name} benchmark flag disagrees with its owner")
         artifacts[name] = {
             "id": name,
             "desc": description,
@@ -188,6 +192,7 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             "check": _assets(raw.get("check", []), f"artifact {name} check"),
             "commands": commands,
             "goal": goal,
+            "benchmark": benchmark,
         }
 
     for artifact in artifacts.values():
@@ -216,6 +221,30 @@ def validate_workflow(value: Any) -> dict[str, Any]:
             for asset in artifacts[dependency["id"]]["assets"]:
                 inferred.setdefault(asset["path"], dict(asset))
         artifact["inputs"] = list(inferred.values())
+
+    for artifact in artifacts.values():
+        if not artifact["benchmark"]:
+            continue
+        inputs = artifact["inputs"]
+        assets = artifact["assets"]
+        checks = artifact["check"]
+        if len(inputs) != 1 or not inputs[0]["path"].endswith("/"):
+            raise TaskError(
+                f"benchmark artifact {artifact['id']} must have one input directory"
+            )
+        if (len(assets) != 1 or assets[0]["path"].endswith("/")
+                or not assets[0]["path"].endswith(".sqlite")):
+            raise TaskError(
+                f"benchmark artifact {artifact['id']} must have one .sqlite asset"
+            )
+        if checks != assets:
+            raise TaskError(
+                f"benchmark artifact {artifact['id']} check must equal its .sqlite asset"
+            )
+        if artifact["commands"]:
+            raise TaskError(
+                f"benchmark artifact {artifact['id']} cannot define commands"
+            )
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -820,6 +849,11 @@ def submit(root: Path, workflow: dict[str, Any], role: str, names: list[str]) ->
                 raise TaskError(f"artifact is not runnable: {name}", 75)
             if not value["assets"]["ready"] or not value["checks"]["ready"]:
                 raise TaskError(f"artifact assets are incomplete: {name}", 75)
+            if artifact.get("benchmark"):
+                try:
+                    validate_artifact(root / artifact["assets"][0]["path"])
+                except ControlError as exc:
+                    raise TaskError(f"benchmark artifact is invalid: {exc}", 75) from None
             values.append((name, value))
         refreshed = [{"artifact": name, "mtime_ns": _atomic_write(
             _artifact_path(root, name), b"", value["input_mtime_ns"]

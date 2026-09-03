@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import cli_host, cli_init, cli_lab, cli_query, supervisor, task_cli
+from . import cli_bench, cli_host, cli_init, cli_lab, cli_query, supervisor, task_cli
 
 
 def parser() -> argparse.ArgumentParser:
@@ -19,6 +19,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("query", add_help=False, help="query execution data read-only")
     commands.add_parser("query-om", add_help=False, help="query through OM-Labflow")
     commands.add_parser("agent", add_help=False, help="inspect the project Artifact graph")
+    commands.add_parser("bench", add_help=False, help="operate a benchmark Artifact task")
     commands.add_parser("supervisor", add_help=False, help="maintain Sessions and execution state")
     return root
 
@@ -43,6 +44,8 @@ def main(argv: list[str] | None = None) -> int:
         return cli_query.om_main(values, prog="labflow query-om")
     if group == "agent":
         return task_cli.main(values, prog="labflow agent")
+    if group == "bench":
+        return cli_bench.main(values, prog="labflow bench")
     if group == "supervisor":
         return supervisor.main(values, prog="labflow supervisor")
     parser().parse_args([group])

@@ -45,6 +45,51 @@ def artifact_workflow() -> dict:
 
 
 class ArtifactWorkflowTest(unittest.TestCase):
+    def test_benchmark_artifact_has_a_fixed_input_and_output_contract(self):
+        value = validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["bench-icm"],
+            "artifacts": {
+                "report.bench-icm": {
+                    "desc": "ICM report", "goal": "goal.md",
+                    "inputs": ["bench-input/"],
+                    "assets": ["report.sqlite"], "check": ["report.sqlite"],
+                },
+            },
+        })
+        self.assertTrue(value["artifacts"]["report.bench-icm"]["benchmark"])
+
+        raw = {
+            "schema": "labflow.workflow/v1", "roles": ["bench-icm"],
+            "artifacts": {
+                "report.bench-icm": {
+                    "desc": "bad", "goal": "goal.md", "inputs": ["questions.jsonl"],
+                    "assets": ["report.sqlite"], "check": ["report.sqlite"],
+                },
+            },
+        }
+        with self.assertRaisesRegex(TaskError, "one input directory"):
+            validate_workflow(raw)
+
+    def test_benchmark_submit_validates_the_sqlite_result(self):
+        workflow = validate_workflow({
+            "schema": "labflow.workflow/v1", "roles": ["bench-icm"],
+            "artifacts": {
+                "report.bench-icm": {
+                    "desc": "ICM report", "goal": "goal.md",
+                    "inputs": ["input/"], "assets": ["report.sqlite"],
+                    "check": ["report.sqlite"],
+                },
+            },
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "input").mkdir()
+            (root / "goal.md").write_text("goal", encoding="utf-8")
+            assign_task(root, workflow, "bench-icm", "report.bench-icm")
+            (root / "report.sqlite").write_text("not sqlite", encoding="utf-8")
+            with self.assertRaisesRegex(TaskError, "benchmark artifact is invalid"):
+                submit(root, workflow, "bench-icm", ["report.bench-icm"])
+
     def prepare(self, root: Path) -> dict:
         (root / "guide").mkdir()
         (root / "guide" / "GOAL.md").write_text("goal", encoding="utf-8")

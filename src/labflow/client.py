@@ -83,6 +83,8 @@ class Client:
         return self._request(f"/session/{session_id}/prompt_async", "POST", payload)
     def abort_session(self, session_id: str) -> Any:
         return self._request(f"/session/{session_id}/abort", "POST", {})
+    def delete_session(self, session_id: str) -> Any:
+        return self._request(f"/session/{session_id}", "DELETE")
 
     def events(self, timeout: float | None = None) -> Iterator[dict[str, Any]]:
         query = urllib.parse.urlencode({"directory": self.workspace})

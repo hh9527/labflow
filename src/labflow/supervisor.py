@@ -441,6 +441,18 @@ def _record_task_failure(state: SupervisorState, execution: ExecutionState,
     return _reconcile_role(state, execution, role)
 
 
+def _finalize_benchmark(
+    state: SupervisorState, execution: ExecutionState, role: str,
+    task: ActiveTaskState, reason: str,
+) -> list[Effect]:
+    effect = Effect(
+        _effect_key("finalize-benchmark", execution.title, task.task_id, reason),
+        "finalize_benchmark", execution.title, role, role,
+        artifact=task.artifact, data={"task_id": task.task_id, "reason": reason},
+    )
+    return [effect] if _requested(state, effect) else []
+
+
 def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
     """Mutate one event-loop-owned state object and return external work."""
     if event.kind == "outputs_requested":
@@ -612,6 +624,7 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         }
         return _reconcile_execution(state, execution)
     if event.kind == "tasks_observed":
+        previous_tasks = dict(execution.active_tasks)
         execution.active_tasks = {
             str(item["role"]): ActiveTaskState(
                 str(item["task_id"]), str(item["artifact"]),
@@ -619,7 +632,20 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             )
             for item in event.data.get("tasks", ())
         }
-        return _reconcile_execution(state, execution)
+        effects = []
+        for role, previous in previous_tasks.items():
+            current = execution.active_tasks.get(role)
+            if (role.startswith("bench-")
+                    and (current is None or current.task_id != previous.task_id)):
+                effect = Effect(
+                    _effect_key("discard-benchmark", execution.title, previous.task_id),
+                    "discard_benchmark", execution.title, role, role,
+                    artifact=previous.artifact, data={"task_id": previous.task_id},
+                )
+                if _requested(state, effect):
+                    effects.append(effect)
+        effects.extend(_reconcile_execution(state, execution))
+        return effects
     if event.kind == "artifact_updated":
         execution.artifacts[str(event.data["artifact"])] = int(event.data["mtime_ns"])
         return []
@@ -703,6 +729,11 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
             if reply.lstrip().startswith("无法完成任务。"):
                 if not unseen:
                     return []
+                if role.startswith("bench-"):
+                    return _finalize_benchmark(
+                        state, execution, role, task,
+                        "Agent reported that the benchmark could not be completed",
+                    )
                 return _block_execution(
                     state, execution, role, task,
                     "Agent reported that the task cannot be completed", completed_at,
@@ -715,6 +746,11 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
                     session.completed_turn_reply = reply
                 return _reconcile_role(state, execution, role)
             if unseen:
+                if role.startswith("bench-"):
+                    return _finalize_benchmark(
+                        state, execution, role, task,
+                        "benchmark reply did not use the completion protocol",
+                    )
                 return _record_task_failure(
                     state, execution, role, "reply_unclassified",
                     "reply must start with 已完成任务。 or 无法完成任务。", completed_at,
@@ -733,6 +769,11 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         if identity in state.seen_messages:
             return []
         state.seen_messages.add(identity)
+        if role.startswith("bench-"):
+            return _finalize_benchmark(
+                state, execution, role, task,
+                f"benchmark turn ended without stop: {event.data.get('finish')}",
+            )
         return _record_task_failure(
             state, execution, role, "turn_aborted",
             f"Agent turn ended without stop: {event.data.get('finish')}", completed_at,
@@ -742,6 +783,10 @@ def reduce(state: SupervisorState, event: LifecycleEvent) -> list[Effect]:
         task = execution.active_tasks.get(role)
         if task is None or task.task_id != event.data.get("task_id"):
             return []
+        if role.startswith("bench-"):
+            return _finalize_benchmark(
+                state, execution, role, task, str(event.data["error"]),
+            )
         return _record_task_failure(
             state, execution, role, "validation_failed", str(event.data["error"]),
             int(event.data["at"]),
@@ -1370,6 +1415,22 @@ class Supervisor:
             return [LifecycleEvent("artifact_restored", effect.execution, {
                 "artifact": effect.artifact, "previous_mtime_ns": previous,
             })]
+        if effect.kind == "discard_benchmark":
+            try:
+                from .cli_bench import discard
+                discard(
+                    Path(execution.workspace), str(effect.data["task_id"]),
+                    str(effect.artifact),
+                )
+                return [LifecycleEvent("effect_succeeded", effect.execution, {
+                    "key": effect.key, "effect_kind": effect.kind,
+                    "role": effect.role, "title": effect.title,
+                })]
+            except (ControlError, OSError) as exc:
+                return [LifecycleEvent("effect_failed", effect.execution, {
+                    "key": effect.key, "effect_kind": effect.kind,
+                    "role": effect.role, "error": str(exc),
+                })]
         if effect.kind == "observe_filesystem":
             try:
                 return self._observe_filesystem(execution)
@@ -1438,7 +1499,7 @@ class Supervisor:
             backend_id = effect.backend_id
             delivered = True
             task_result: dict[str, Any] | None = None
-            if effect.kind == "settle_task":
+            if effect.kind in ("settle_task", "finalize_benchmark"):
                 if execution.workflow is None or not effect.artifact:
                     raise ControlError("task settlement effect is incomplete")
                 active = [
@@ -1451,6 +1512,12 @@ class Supervisor:
                         "role": effect.role, "task_id": effect.data.get("task_id"),
                     })]
                 try:
+                    if effect.kind == "finalize_benchmark":
+                        from .cli_bench import force_finish
+                        force_finish(
+                            Path(execution.workspace), str(effect.data["task_id"]),
+                            str(effect.data["reason"]),
+                        )
                     submit(
                         Path(execution.workspace), execution.workflow,
                         effect.role, [effect.artifact],
@@ -1515,7 +1582,9 @@ class Supervisor:
                 else:
                     raise ControlError(f"unknown Supervisor effect: {effect.kind}")
             return [LifecycleEvent("effect_succeeded", effect.execution, {
-                "key": effect.key, "effect_kind": effect.kind,
+                "key": effect.key,
+                "effect_kind": ("settle_task" if effect.kind == "finalize_benchmark"
+                                else effect.kind),
                 "role": effect.role, "title": effect.title,
                 "backend_id": backend_id, "delivered": delivered,
                 "task": task_result, "task_id": effect.data.get("task_id"),
@@ -1737,6 +1806,8 @@ def main(argv: list[str] | None = None, *, prog: str = "labflow supervisor") -> 
                 f"{home / 'artifacts' / '_active'}",
                 flush=True,
             )
+        from .runtime_opencode import generate
+        generate(manifest, home)
         if args.port is not None and args.port != config["port"]:
             raise ControlError(
                 f"execution is configured for port {config['port']}, not {args.port}", 64

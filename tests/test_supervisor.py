@@ -9,8 +9,8 @@ from unittest import mock
 
 from labflow.config import ControlError
 from labflow.supervisor import (
-    EffectState, LifecycleEvent, Supervisor, SupervisorState, _state_dump, _state_load,
-    reduce, supervisor_lock,
+    ActiveTaskState, EffectState, LifecycleEvent, SessionState, Supervisor,
+    SupervisorState, _state_dump, _state_load, reduce, supervisor_lock,
 )
 from labflow.task_cli import (
     assign_task, refresh_artifact, submit, task_records, validate_workflow,
@@ -22,6 +22,46 @@ from labflow.timeline_store import TimelineWriter, read, statistics, task_statis
 
 
 class ReducerTest(unittest.TestCase):
+    def test_benchmark_failure_is_finalized_instead_of_retried_or_blocked(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+        execution.roles = ("bench-icm",)
+        execution.sessions = {
+            "bench-icm": SessionState(
+                "bench-icm", "bench-icm", "ses-bench", "idle", observed=True,
+            )
+        }
+        execution.active_tasks = {
+            "bench-icm": ActiveTaskState(
+                "bench-icm-1000000000", "report.bench-icm", 1000000000,
+            )
+        }
+
+        effects = reduce(state, LifecycleEvent("turn_completed", "plan@1", {
+            "role": "bench-icm", "title": "bench-icm", "message_id": "failed",
+            "completed_at": 2000, "finish": "stop", "reply": "无法完成任务。timeout",
+        }))
+
+        self.assertEqual([effect.kind for effect in effects], ["finalize_benchmark"])
+        self.assertIsNone(execution.blocked_reason)
+        self.assertNotIn("bench-icm", execution.failures)
+
+    def test_disappeared_benchmark_task_discards_its_private_run(self):
+        state = self._active_task_state()
+        execution = state.executions["plan@1"]
+        execution.active_tasks = {
+            "bench-icm": ActiveTaskState(
+                "bench-icm-1000000000", "report.bench-icm", 1000000000,
+            )
+        }
+
+        effects = reduce(state, LifecycleEvent("tasks_observed", "plan@1", {
+            "tasks": [],
+        }))
+
+        self.assertEqual([effect.kind for effect in effects], ["discard_benchmark"])
+        self.assertEqual(effects[0].data["task_id"], "bench-icm-1000000000")
+
     def execution(self) -> LifecycleEvent:
         return LifecycleEvent("execution_updated", "plan@1", {
             "workspace": "/tmp/ws",

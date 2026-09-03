@@ -196,6 +196,24 @@ mtime。任务开始时，Supervisor 会在统一提示词中列出依赖工件�
 名称形如 `<name>.sess.<role>` 的工件表示绑定到角色长期会话的知识资格。它只能作为同一
 角色工件的必选依赖，不能声明为可选依赖。
 
+### Benchmark 工件
+
+以 `bench-` 开头的角色生产一次性 Benchmark 工件。此类工件必须显式配置一个目录 input、
+一个 `.sqlite` asset，并令 `check` 与该 asset 相同。input 中必须包含 `questions.jsonl`、
+`selected.jsonl` 和 `public/`；Benchmark 角色能读取完整题目，私有 Resolver 只能读取稳定的
+`public/` 背景。
+
+Benchmark 角色通过 `/bench` 或 `labflow bench` 驱动固定流程。每个 batch 创建一个独立的
+顶层 OpenCode `priv-resolver` Session，可连续回答多题；结果先提交到 stage，之后 Session
+通过 OpenCode DELETE 接口物理删除。超时、失败和未作答都是报告中的正常 Case 结果，不会
+触发 DAG 任务的修复协商。
+
+同一 Benchmark Artifact 始终使用
+`.labflow-exec/bench/<artifact-id>.sqlite` 作为持久 stage。数据库中的 `iter_end` 指向当前
+未封闭迭代，所有迭代数据都显式携带 `iter`。新 Task 开始时删除 `iter >= iter_end` 的未封闭
+尾部；最终封闭时才递增 `iter_end`，并用 SQLite backup 生成 asset 快照。已封闭的历史迭代
+会保留在同一个数据库中，stage 不随 Task 或 Resolver Session 删除。
+
 ### 稳定角色权限
 
 角色权限是角色级稳定配置，不随每个任务动态切换：

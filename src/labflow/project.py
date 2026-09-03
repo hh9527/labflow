@@ -10,6 +10,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from .benchmark import load_bundle
 from .config import ControlError, Manifest
 from .state import atomic_json, atomic_write
 from .task_cli import TaskError, validate_role_permissions, validate_workflow
@@ -224,11 +225,14 @@ def load_plan(path: Path | None = None) -> Manifest:
             "write": write,
             "commands": _commands(raw_role.get("commands"), f"role {role} commands"),
         }
-
     try:
         validate_role_permissions(workflow, role_configs)
     except TaskError as exc:
         raise ControlError(str(exc), exc.code) from None
+
+    for artifact in workflow["artifacts"].values():
+        if artifact.get("benchmark"):
+            load_bundle(root / artifact["inputs"][0]["path"].rstrip("/"))
 
     identifier = execution_id(root)
     return Manifest(identifier, root, role_configs, workflow, {"kind": "dag-mode"})

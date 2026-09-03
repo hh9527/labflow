@@ -60,6 +60,53 @@ commands = []
 
 
 class ProjectPlanTest(unittest.TestCase):
+    def test_benchmark_plan_validates_bundle_and_generates_private_resolver(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "bench-project"
+            (root / "goals").mkdir(parents=True)
+            source = root / "bench-input"
+            source.mkdir(parents=True)
+            public = root / "model-docs"
+            public.mkdir()
+            (root / "goals" / "eval.md").write_text("# Eval\n", encoding="utf-8")
+            (source / "questions.jsonl").write_text(
+                '{"id":"q1","Q":"question","K":"private"}\n', encoding="utf-8",
+            )
+            (source / "selected.jsonl").write_text('"q1"\n', encoding="utf-8")
+            (public / "DOMAIN.md").write_text("public", encoding="utf-8")
+            (root / "labflow-plan.toml").write_text('''
+[artifacts."report.bench-icm"]
+goal = "goals/eval.md"
+inputs = ["bench-input/"]
+assets = ["report.sqlite"]
+check = ["report.sqlite"]
+
+[roles.bench-icm]
+read = ["goals/", "model-docs/", "bench-input/"]
+write = ["report.sqlite"]
+commands = ["bin/make-query check *"]
+''', encoding="utf-8")
+
+            manifest = load_plan(root / "labflow-plan.toml")
+            runtime = root / ".labflow-exec"
+            runtime.mkdir()
+            from labflow.runtime_opencode import generate
+            generate(manifest, runtime)
+
+            resolver = (runtime / "ws/.opencode/agents/priv-resolver.md").read_text(
+                encoding="utf-8"
+            )
+            bench_role = (runtime / "ws/.opencode/agents/bench-icm.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("model-docs/**", resolver)
+            self.assertIn('bin/make-query check *":"allow', resolver)
+            self.assertNotIn('bench-input/public/make-query', resolver)
+            self.assertNotIn('bench-input/questions.jsonl":"allow', resolver)
+            self.assertIn("未调用时不得编造工具输出", resolver)
+            self.assertIn("不得以 tool call 结束回复", resolver)
+            self.assertIn("labflow bench *", bench_role)
+
     def project(self, parent: Path) -> Path:
         root = parent / "demo"
         (root / "goals").mkdir(parents=True)
@@ -188,12 +235,14 @@ class ProjectPlanTest(unittest.TestCase):
             self.assertEqual(control.stat().st_mode & 0o777, 0o755)
             self.assertIn("supervisor --port 4199 --prepare-only", serve_content)
             self.assertIn(os.path.abspath(sys.executable), serve_content)
+            self.assertIn("PYTHONPATH=", serve_content)
             self.assertIn(
                 '"$@" serve --hostname 127.0.0.1 --port 4199 --pure',
                 serve_content,
             )
             self.assertIn("[ ! -f .labflow-exec/artifacts/_supervisor ]", serve_content)
             self.assertIn("labflow.cli attach", attach_content)
+            self.assertIn(" exec ", attach_content)
             self.assertIn('artifacts="$project_home/.labflow-exec/artifacts"', control_content)
             self.assertIn('touch "$artifacts/_active"', control_content)
             self.assertIn('touch "$artifacts/_supervisor"', control_content)
@@ -204,6 +253,26 @@ class ProjectPlanTest(unittest.TestCase):
             subprocess.run(["sh", "-n", str(serve)], check=True)
             subprocess.run(["sh", "-n", str(attach)], check=True)
             subprocess.run(["sh", "-n", str(control)], check=True)
+
+            isolated = subprocess.run(
+                ["/bin/sh", str(serve)],
+                env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(isolated.returncode, 69, isolated.stderr)
+            self.assertIn("external CLI unavailable: opencode", isolated.stderr)
+            self.assertNotIn("No module named 'labflow'", isolated.stderr)
+
+            isolated_attach = subprocess.run(
+                ["/bin/sh", str(attach)],
+                env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ""},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(isolated_attach.returncode, 69, isolated_attach.stderr)
+            self.assertIn("external CLI unavailable: opencode", isolated_attach.stderr)
+            self.assertNotIn("PYTHONPATH=", isolated_attach.stderr)
 
             serve.write_text("local change\n", encoding="utf-8")
             regenerated, _ = generate_launcher(root, 4199)
@@ -254,6 +323,9 @@ class ProjectPlanTest(unittest.TestCase):
             lab.mkdir()
             home, _, _ = prepare_execution(root, lab, 4199)
             (home / "artifacts/_supervisor").touch()
+            agent = home / "ws/.opencode/agents/a1.md"
+            agent.chmod(0o644)
+            agent.write_text("stale\n", encoding="utf-8")
             previous = Path.cwd()
             try:
                 os.chdir(root)
@@ -262,6 +334,7 @@ class ProjectPlanTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
             self.assertEqual(result, 0)
+            self.assertNotEqual(agent.read_text(encoding="utf-8"), "stale\n")
 
     def test_role_permissions_are_stable_across_all_owned_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:

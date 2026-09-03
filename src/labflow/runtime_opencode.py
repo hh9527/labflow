@@ -200,10 +200,56 @@ def _role_content(manifest: Manifest, name: str) -> bytes:
         "write": role["write"],
     }
     permission = _role_permission(role, assets)
+    if name.startswith("bench-"):
+        permission["bash"]["labflow bench *"] = "allow"
     permission["bash"]["labflow agent *"] = "deny"
     permission["bash"]["./labflow agent *"] = "deny"
+    prompt = str(role["prompt"]).rstrip()
+    if name.startswith("bench-"):
+        prompt += (
+            "\n\n本角色只通过 `/bench` 和允许的 `labflow bench` 命令运行测评。"
+            "除判断是否需要再澄清一次、依据当前题目的私有知识给出澄清外，"
+            "题目顺序、Resolver 会话、度量和报告均由 Labflow 管理。"
+        )
     return (_frontmatter(role["description"], "subagent", permission)
-            + str(role["prompt"]).rstrip() + "\n").encode()
+            + prompt + "\n").encode()
+
+
+def _private_resolver_content(manifest: Manifest) -> bytes | None:
+    public: list[str] = []
+    commands: list[str] = []
+    for artifact in manifest.workflow["artifacts"].values():
+        if not artifact.get("benchmark"):
+            continue
+        role = manifest.roles[artifact["owner"]]
+        for command in role["commands"]:
+            if command not in commands:
+                commands.append(command)
+        excluded = [
+            artifact["inputs"][0]["path"],
+            *role["write"],
+        ]
+        goal = artifact.get("goal")
+        for path in role["read"]:
+            if ((goal and (path == goal or goal.startswith(path)))
+                    or any(path == item or path.startswith(item) or item.startswith(path)
+                           for item in excluded)):
+                continue
+            if path not in public:
+                public.append(path)
+    if not public:
+        return None
+    role = {"commands": commands}
+    permission = _role_permission(role, {"read": public, "write": []})
+    body = (
+        "你是 Labflow Benchmark 的私有 Resolver。只回答当前 Session 中由 Benchmark "
+        "Broker 提供的问题；你不会获得完整题集或私有知识。可以阅读允许的稳定公共背景，"
+        "但不得尝试访问 Benchmark 输入、输出或其他 Session。只有在当前回复中真实调用"
+        "允许的工具并取得结果后，才能声称已经执行或校验；未调用时不得编造工具输出。"
+        "发起工具调用后必须等待结果并继续给出最终文本，不得以 tool call 结束回复。\n"
+    )
+    return (_frontmatter("解答 Benchmark 当前批次的问题。", "primary", permission)
+            + body).encode()
 
 
 def _write_snapshot(path: Path, content: bytes) -> Path:
@@ -233,13 +279,33 @@ def generate(manifest: Manifest, execution_home: Path) -> dict[str, str]:
     observer = agents / "lab-ob.md"
     atomic_write(observer, _observer(manifest).encode(), 0o444)
     generated.append(observer)
-    report = runtime_root / ".opencode" / "commands" / "ob.md"
+    commands = runtime_root / ".opencode" / "commands"
+    report = commands / "ob.md"
     if report.exists():
         report.unlink()
     for name in manifest.roles:
         target = agents / f"{name}.md"
         _write_snapshot(target, _role_content(manifest, name))
         generated.append(target)
+    resolver_content = _private_resolver_content(manifest)
+    if resolver_content is not None:
+        target = agents / "priv-resolver.md"
+        _write_snapshot(target, resolver_content)
+        generated.append(target)
+        command = commands / "bench.md"
+        atomic_write(command, (
+            "运行当前 Benchmark：先执行 `labflow bench start`。每批执行 "
+            "`labflow bench batch-start`，然后反复执行 `labflow bench next`；"
+            "只有确有必要时，依据命令返回的当前题私有知识执行 "
+            "`labflow bench clarify '<澄清内容>'`。批次完成后执行 "
+            "`labflow bench batch-finish`。所有批次完成后执行 "
+            "`labflow bench finish`，确认输出成功，再以“已完成任务。”回复。\n"
+        ).encode(), 0o444)
+        generated.append(command)
+    else:
+        command = commands / "bench.md"
+        if command.exists():
+            command.unlink()
     expected = set(generated)
     for path in agents.glob("*.md"):
         if path not in expected and path.is_file() and not path.is_symlink():

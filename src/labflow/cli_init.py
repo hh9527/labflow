@@ -19,6 +19,13 @@ ATTACH_NAME = "attach"
 CONTROL_NAME = "control"
 
 
+def _labflow_command(*, replace: bool = False) -> str:
+    source_root = Path(__file__).resolve().parent.parent
+    pythonpath = f"PYTHONPATH={shlex.quote(str(source_root))}${{PYTHONPATH:+:$PYTHONPATH}}"
+    command = shlex.join([os.path.abspath(sys.executable), "-m", "labflow.cli"])
+    return f"{pythonpath} {'exec ' if replace else ''}{command}"
+
+
 def parser(prog: str = "labflow init") -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         prog=prog, description="Generate the current project's Labflow control scripts."
@@ -28,7 +35,7 @@ def parser(prog: str = "labflow init") -> argparse.ArgumentParser:
 
 
 def serve_content(port: int) -> bytes:
-    labflow = shlex.join([os.path.abspath(sys.executable), "-m", "labflow.cli"])
+    labflow = _labflow_command()
     return f'''#!/bin/sh
 set -eu
 
@@ -95,13 +102,13 @@ wait "$opencode_pid"
 
 
 def attach_content() -> bytes:
-    labflow = shlex.join([os.path.abspath(sys.executable), "-m", "labflow.cli"])
+    labflow = _labflow_command(replace=True)
     return f'''#!/bin/sh
 set -eu
 
 project_home=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 cd "$project_home"
-exec {labflow} attach
+{labflow} attach
 '''.encode()
 
 
